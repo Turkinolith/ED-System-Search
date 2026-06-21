@@ -278,6 +278,21 @@ export function densityPriorityFraction(candidateCount, nearbyCount, limit) {
   return Math.min(0.97, Math.max(0.75, 0.75 + Math.log2(pressure) * 0.1));
 }
 
+export function visitedBraceGeometry(radius = 9) {
+  const height = radius;
+  const inner = radius * 0.72;
+  const outer = radius * 1.2;
+  return [-1, 1].map((side) => ({
+    start: [side * inner, -height],
+    curves: [
+      [side * outer, -height, side * outer, -height * 0.7, side * outer, -height * 0.45],
+      [side * outer, -height * 0.15, side * inner, -height * 0.15, side * inner, 0],
+      [side * inner, height * 0.15, side * outer, height * 0.15, side * outer, height * 0.45],
+      [side * outer, height * 0.7, side * outer, height, side * inner, height],
+    ],
+  }));
+}
+
 export function starVisual(typeName = '') {
   let color = [0.72, 0.78, 0.82];
   let size = 5.2;
@@ -1539,8 +1554,13 @@ export class GalaxyRenderer {
     ctx.fillStyle = search ? '#f2a541' : css;
     ctx.lineWidth = search ? 2 : 1.4;
     if (this.showVisited && (point.flags & 4)) {
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
       ctx.beginPath();
-      ctx.arc(0, 0, 8, 0, Math.PI * 2);
+      for (const brace of visitedBraceGeometry()) {
+        ctx.moveTo(...brace.start);
+        for (const curve of brace.curves) ctx.bezierCurveTo(...curve);
+      }
       ctx.stroke();
     }
     if (search) {

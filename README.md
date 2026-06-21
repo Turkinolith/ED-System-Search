@@ -21,7 +21,7 @@ history, and notes stay under `data/` and are excluded from Git.
   and supergiants.
 - Automatic star-marker scaling from a clear local view to an uncluttered
   whole-galaxy view, plus a manual scale control.
-- Persistent visited-system rings, latest-journal focus, carrier tracking, and
+- Persistent visited-system braces, latest-journal focus, carrier tracking, and
   incremental or full journal rescans.
 - Journal-only systems and discovered body data are preserved even when the
   system is absent from the current Spansh dataset.

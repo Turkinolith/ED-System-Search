@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { densityPriorityFraction, prioritizeDrawCandidates, starVisual, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
+import { densityPriorityFraction, prioritizeDrawCandidates, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
 
 const o = starVisual('O (Blue-White) Star');
 const a = starVisual('A (Blue-White) Star');
@@ -43,5 +43,11 @@ assert.ok(zoomLocalPointLimit(340) > zoomLocalPointLimit(360), 'Zooming out acro
 assert.equal(zoomLocalPointLimit(2500), 0, 'Whole-galaxy views should use the global LOD without a dense local sphere.');
 assert.ok(zoomDrawBudget(50) > zoomDrawBudget(100) && zoomDrawBudget(100) > zoomDrawBudget(250), 'Close-grid draw density should decrease continuously while zooming out.');
 assert.ok(zoomLocalPointLimit(50) > zoomLocalPointLimit(100) && zoomLocalPointLimit(100) > zoomLocalPointLimit(250), 'Close-grid local requests should decrease continuously while zooming out.');
+
+const visitedBraces = visitedBraceGeometry();
+assert.equal(visitedBraces.length, 2, 'Visited systems should draw one brace on each side.');
+assert.equal(visitedBraces[0].curves.length, 4, 'Each visited brace should use a smooth four-curve path.');
+assert.equal(visitedBraces[0].start[0], -visitedBraces[1].start[0], 'Visited braces should mirror around the star.');
+assert.equal(visitedBraces[0].start[1], visitedBraces[1].start[1], 'Visited braces should share vertical alignment.');
 
 console.log('Star visual profile test passed.');

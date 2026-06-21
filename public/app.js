@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType } from './renderer.js?v=false-color-grid-1';
+import { GalaxyRenderer, colorsForType } from './renderer.js?v=visited-braces-1';
 
 const state = {
   meta: null,
