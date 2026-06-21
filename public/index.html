@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Elite Dangerous System Search</title>
+    <link rel="stylesheet" href="/styles.css?v=murder-binaries-1">
+  </head>
+  <body>
+    <main class="app">
+      <section class="viewport">
+        <canvas id="stars"></canvas>
+        <canvas id="overlay"></canvas>
+
+        <div class="topbar">
+          <div class="search-wrap">
+            <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="11" cy="11" r="8"></circle>
+              <path d="m21 21-4.3-4.3"></path>
+            </svg>
+            <input id="search" autocomplete="off" spellcheck="false" placeholder="Search the galaxy" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="searchResults">
+            <div id="searchResults" class="search-results" role="listbox" hidden></div>
+          </div>
+          <div class="map-toolbar" aria-label="Map tools">
+            <button id="refreshJournals" class="icon-button" title="Scan latest journal files" aria-label="Scan latest journal files">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"></path><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"></path></svg>
+            </button>
+            <button id="toolbarLatest" class="icon-button" title="Return to latest journal system" aria-label="Return to latest journal system">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 11 19-9-9 19-2-8-8-2Z"></path></svg>
+            </button>
+            <button id="toolbarRecenter" class="icon-button" title="Center on current focus" aria-label="Center on current focus">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"></circle><circle cx="12" cy="12" r="2"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3"></path></svg>
+            </button>
+            <button id="resetView" class="icon-button" title="Reset orientation" aria-label="Reset orientation">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path><path d="M3 3v5h5"></path></svg>
+            </button>
+            <button id="openLayers" class="icon-button" title="Open map layers" aria-label="Open map layers">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 9 5-9 5-9-5 9-5Z"></path><path d="m3 12 9 5 9-5M3 17l9 5 9-5"></path></svg>
+            </button>
+            <button id="toggleInspector" class="icon-button inspector-toggle" title="Hide inspector" aria-label="Hide inspector" aria-expanded="true">
+              <svg class="panel-close-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M15 3v18M10 9l-3 3 3 3"></path></svg>
+              <svg class="panel-open-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M15 3v18M8 9l3 3-3 3"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="nav-pad" aria-label="Navigation controls">
+          <button data-move="up" title="Move up" aria-label="Move up">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6"></path></svg>
+          </button>
+          <button data-move="left" title="Move left" aria-label="Move left">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"></path></svg>
+          </button>
+          <button data-move="forward" title="Move forward" aria-label="Move forward">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 12l8 9 8-9-8-9Z"></path><circle cx="12" cy="12" r="2"></circle></svg>
+          </button>
+          <button data-move="right" title="Move right" aria-label="Move right">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"></path></svg>
+          </button>
+          <button data-move="down" title="Move down" aria-label="Move down">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg>
+          </button>
+        </div>
+
+        <div id="systemTooltip" class="system-tooltip" hidden></div>
+        <div id="noteMenu" class="note-menu" hidden>
+          <div class="note-menu-title">
+            <strong id="noteMenuSystem">System</strong>
+            <button id="noteMenuClose" type="button" aria-label="Close note editor">×</button>
+          </div>
+          <textarea id="noteText" maxlength="512" rows="5" spellcheck="true"></textarea>
+          <div class="note-menu-actions">
+            <span id="noteCount" class="muted">0 / 512</span>
+            <button id="noteDelete" type="button">Delete</button>
+            <button id="noteSave" type="button">Save</button>
+          </div>
+        </div>
+        <div id="status" class="status">Loading galaxy data...</div>
+      </section>
+
+      <aside id="inspector" class="panel" aria-label="Galaxy inspector">
+        <header class="inspector-header">
+          <div>
+            <span class="inspector-kicker">ED SYSTEM SEARCH</span>
+            <strong>Galaxy Navigator</strong>
+          </div>
+          <span class="live-indicator"><i></i>LOCAL</span>
+        </header>
+
+        <nav class="inspector-tabs" role="tablist" aria-label="Inspector sections">
+          <button type="button" role="tab" data-inspector-tab="system" aria-selected="true" aria-controls="inspector-system">System</button>
+          <button type="button" role="tab" data-inspector-tab="bodies" aria-selected="false" aria-controls="inspector-bodies">Bodies</button>
+          <button type="button" role="tab" data-inspector-tab="layers" aria-selected="false" aria-controls="inspector-layers">Layers</button>
+          <button type="button" role="tab" data-inspector-tab="data" aria-selected="false" aria-controls="inspector-data">Data</button>
+        </nav>
+
+        <div class="inspector-content">
+          <section id="inspector-system" class="inspector-panel" data-inspector-panel="system" role="tabpanel">
+            <div class="target-hero">
+              <div class="section-heading">
+                <span>Current target</span>
+                <span class="target-kind">FOCUS</span>
+              </div>
+              <button id="focusName" class="focus-name" type="button" title="Copy system name to clipboard" aria-label="Copy focus system name to clipboard">Sol</button>
+              <div id="focusCopyStatus" class="copy-status" aria-live="polite"></div>
+              <div class="coordinate-row">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z"></path><path d="M3.6 9h16.8M3.6 15h16.8M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"></path></svg>
+                <span id="focusCoords">0, 0, 0</span>
+              </div>
+              <div class="target-actions">
+                <button id="recenterFocus" class="panel-button panel-button-primary" type="button">Center view</button>
+                <button id="returnLatestJournal" class="panel-button panel-button-cyan" type="button">Latest journal</button>
+              </div>
+            </div>
+
+            <div class="section detail-section">
+              <div class="section-heading">
+                <span>System details</span>
+                <span class="section-rule"></span>
+              </div>
+              <div id="selected" class="selected empty">Click a visible system or choose a search result.</div>
+            </div>
+
+            <div class="section journal-glance">
+              <div class="section-heading">
+                <span>Commander data</span>
+                <span class="section-rule"></span>
+              </div>
+              <div id="journalSummary" class="muted">Journal data not loaded</div>
+            </div>
+
+            <div class="section notes-section">
+              <div class="section-heading">
+                <span>System notes</span>
+                <span class="section-rule"></span>
+              </div>
+              <div class="segmented-control notes-tabs" role="tablist" aria-label="Notes view">
+                <label><input name="notesMode" type="radio" value="all" checked><span>All notes</span></label>
+                <label><input name="notesMode" type="radio" value="search"><span>Search</span></label>
+              </div>
+              <input id="noteSearch" class="note-search" type="search" placeholder="Search note text" autocomplete="off">
+              <div id="notesSummary" class="muted">No notes yet</div>
+              <div id="notesList" class="notes-list"></div>
+            </div>
+          </section>
+
+          <section id="inspector-bodies" class="inspector-panel" data-inspector-panel="bodies" role="tabpanel" hidden>
+            <div class="section bodies-header">
+              <div class="section-heading"><span>System bodies</span><span class="section-rule"></span></div>
+              <div id="bodiesState" class="muted">Select a system to view imported or journal-scanned body data.</div>
+              <div id="bodySystemSummary" class="body-system-summary" hidden></div>
+            </div>
+            <div id="bodyList" class="body-list"></div>
+          </section>
+
+          <section id="inspector-layers" class="inspector-panel" data-inspector-panel="layers" role="tabpanel" hidden>
+            <div class="section compact-section">
+              <div class="section-heading"><span>Map overlays</span><span class="section-rule"></span></div>
+              <div class="overlay-toggles compact-overlays">
+                <label class="toggle"><input id="visitedToggle" type="checkbox" checked><span>Visited rings</span></label>
+                <label class="toggle"><input id="gridToggle" type="checkbox" checked><span>Grid plane</span></label>
+                <label class="toggle"><input id="dropLinesToggle" type="checkbox" checked><span>Drop lines</span></label>
+                <label class="toggle"><input id="landmarksToggle" type="checkbox" checked><span>Landmarks</span></label>
+                <label class="toggle"><input id="carrierRangeToggle" type="checkbox"><span>Carrier range</span></label>
+                <label class="toggle" title="Highlight systems with a secondary star 5-12 light-seconds from arrival"><input id="murderBinariesToggle" type="checkbox" disabled><span>Murder binaries</span></label>
+              </div>
+            </div>
+
+            <details class="section sidebar-disclosure" open>
+              <summary><span>Star filters</span><small>Classes rendered on map</small></summary>
+              <div class="disclosure-body">
+                <div id="filterActions" class="filter-actions" aria-label="Filter presets"></div>
+                <div id="filters" class="filters"></div>
+                <div class="star-scale-control">
+                  <span>Star size</span>
+                  <label class="star-scale-auto"><input id="starScaleAuto" type="checkbox" checked><span>Auto</span></label>
+                  <output id="starScaleValue" for="starScale">200%</output>
+                  <input id="starScale" aria-label="Star size scale" type="range" min="10" max="400" step="10" value="200">
+                </div>
+              </div>
+            </details>
+
+            <details class="section sidebar-disclosure" open>
+              <summary><span>System features</span><small>Full galaxy data</small></summary>
+              <div class="disclosure-body rich-filter-panel">
+                <div id="richFiltersSummary" class="muted">Import galaxy.json.gz to enable these filters.</div>
+                <div class="rich-filter-grid">
+                  <label class="toggle"><input id="richDataFilter" type="checkbox"><span>Has full data</span></label>
+                  <label class="toggle"><input id="stationFilter" type="checkbox"><span>Has stations</span></label>
+                  <label class="toggle"><input id="populatedFilter" type="checkbox"><span>Populated</span></label>
+                  <label class="toggle"><input id="landableFilter" type="checkbox"><span>Landable bodies</span></label>
+                  <label class="toggle"><input id="marketFilter" type="checkbox"><span>Has markets</span></label>
+                  <label class="toggle"><input id="shipyardFilter" type="checkbox"><span>Has shipyards</span></label>
+                  <label class="toggle"><input id="outfittingFilter" type="checkbox"><span>Has outfitting</span></label>
+                  <label class="toggle"><input id="signalsFilter" type="checkbox"><span>Body signals</span></label>
+                </div>
+                <label class="number-filter">
+                  <span>Minimum body count</span>
+                  <input id="minBodyCount" type="number" min="0" max="1000" step="1" value="0">
+                </label>
+                <div class="rich-category-grid">
+                  <label><span>Planet type</span><select id="bodyTypeFilter">
+                    <option value="">Any</option>
+                    <option value="earthLike">Earth-like world</option>
+                    <option value="waterWorld">Water / ocean world</option>
+                    <option value="ammoniaWorld">Ammonia world</option>
+                    <option value="icyBody">Icy body</option>
+                    <option value="rockyIce">Rocky ice world</option>
+                    <option value="highMetal">High metal content</option>
+                    <option value="metalRich">Metal-rich body</option>
+                    <option value="gasWaterLife">Gas giant with water life</option>
+                    <option value="gasAmmoniaLife">Gas giant with ammonia life</option>
+                    <option value="waterGiant">Water giant</option>
+                    <option value="terraformable">Terraformable body</option>
+                  </select></label>
+                  <label><span>Atmosphere</span><select id="atmosphereFilter">
+                    <option value="">Any</option>
+                    <option value="thinAmmonia">Thin ammonia</option>
+                    <option value="ammonia">Any ammonia</option>
+                    <option value="water">Water</option>
+                    <option value="oxygen">Oxygen</option>
+                    <option value="carbonDioxide">Carbon dioxide</option>
+                    <option value="methane">Methane</option>
+                    <option value="nitrogen">Nitrogen</option>
+                    <option value="sulphurDioxide">Sulphur dioxide</option>
+                    <option value="silicate">Silicate vapour</option>
+                    <option value="helium">Helium</option>
+                    <option value="neon">Neon</option>
+                    <option value="argon">Argon</option>
+                    <option value="thin">Any thin atmosphere</option>
+                    <option value="thick">Any thick atmosphere</option>
+                    <option value="hot">Any hot atmosphere</option>
+                    <option value="waterLife">Suitable for water life</option>
+                  </select></label>
+                  <label><span>Ring material</span><select id="ringTypeFilter">
+                    <option value="">Any</option>
+                    <option value="icy">Icy</option>
+                    <option value="rocky">Rocky</option>
+                    <option value="metalRich">Metal rich</option>
+                    <option value="metallic">Metallic</option>
+                  </select></label>
+                  <label><span>Volcanism</span><select id="volcanismFilter">
+                    <option value="">Any</option>
+                    <option value="silicate">Silicate</option>
+                    <option value="metallic">Metallic magma</option>
+                    <option value="rocky">Rocky magma</option>
+                    <option value="water">Water</option>
+                    <option value="carbonDioxide">Carbon dioxide</option>
+                    <option value="nitrogen">Nitrogen</option>
+                    <option value="methane">Methane</option>
+                    <option value="ammonia">Ammonia</option>
+                    <option value="major">Major activity</option>
+                    <option value="minor">Minor activity</option>
+                  </select></label>
+                  <label><span>Economy</span><select id="economyFilter">
+                    <option value="">Any</option>
+                    <option value="extraction">Extraction</option>
+                    <option value="refinery">Refinery</option>
+                    <option value="industrial">Industrial</option>
+                    <option value="agriculture">Agriculture</option>
+                    <option value="highTech">High Tech</option>
+                    <option value="military">Military</option>
+                    <option value="tourism">Tourism</option>
+                    <option value="service">Service</option>
+                    <option value="colony">Colony</option>
+                    <option value="other">Other</option>
+                  </select></label>
+                  <label><span>Security</span><select id="securityFilter">
+                    <option value="">Any</option>
+                    <option value="anarchy">Anarchy</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select></label>
+                  <label><span>Government</span><select id="governmentFilter">
+                    <option value="">Any</option>
+                    <option value="anarchy">Anarchy</option>
+                    <option value="communism">Communism</option>
+                    <option value="confederacy">Confederacy</option>
+                    <option value="cooperative">Cooperative</option>
+                    <option value="corporate">Corporate</option>
+                    <option value="democracy">Democracy</option>
+                    <option value="dictatorship">Dictatorship</option>
+                    <option value="feudal">Feudal</option>
+                    <option value="patronage">Patronage</option>
+                    <option value="theocracy">Theocracy</option>
+                    <option value="other">Other</option>
+                  </select></label>
+                </div>
+                <button id="clearRichFilters" class="panel-button panel-button-tertiary" type="button">Clear system filters</button>
+              </div>
+            </details>
+
+            <details class="section sidebar-disclosure">
+              <summary><span>Last updated</span><small>System data date range</small></summary>
+              <div class="date-filter disclosure-body">
+                <label><span>From</span><input id="updatedFrom" type="date"></label>
+                <label><span>Before</span><input id="updatedBefore" type="date"></label>
+                <div id="updatedRangeSummary" class="muted">Update index not loaded</div>
+              </div>
+            </details>
+
+            <details class="section sidebar-disclosure" open>
+              <summary><span>Places</span><small>Points of interest overlay</small></summary>
+              <div class="disclosure-body">
+                <div id="placesSummary" class="muted">Places not loaded</div>
+                <div class="overlay-mode places-mode">
+                  <div class="mode-label">Display</div>
+                  <div class="segmented-control" role="radiogroup" aria-label="POI overlay mode">
+                    <label><input name="poiMode" type="radio" value="off"><span>Off</span></label>
+                    <label><input name="poiMode" type="radio" value="nearby" checked><span>Nearby</span></label>
+                    <label><input name="poiMode" type="radio" value="all"><span>All</span></label>
+                  </div>
+                </div>
+                <div id="placeFilterActions" class="place-filter-actions" aria-label="Place filter presets"></div>
+                <div id="placeFilters" class="place-filters"></div>
+              </div>
+            </details>
+
+            <details class="section sidebar-disclosure">
+              <summary><span>Map controls</span><small>Mouse and keyboard</small></summary>
+              <div class="controls-help disclosure-body">
+                <div><kbd>Left drag</kbd><span>Orbit focus</span></div>
+                <div><kbd>Right drag</kbd><span>Move X/Z plane</span></div>
+                <div><kbd>Ctrl</kbd> + <kbd>Right drag</kbd><span>Move Y axis</span></div>
+                <div><kbd>Wheel</kbd><span>Zoom</span></div>
+                <div><kbd>WASD</kbd><span>Move plane</span></div>
+                <div><kbd>R</kbd> / <kbd>F</kbd><span>Move Y</span></div>
+                <div><kbd>Q</kbd> / <kbd>E</kbd><span>Rotate</span></div>
+              </div>
+            </details>
+
+            <details class="section sidebar-disclosure">
+              <summary><span>Map legend</span><small>Star and POI symbols</small></summary>
+              <div class="legend-columns disclosure-body">
+                <div class="legend">
+                  <div class="legend-title">Star icons</div>
+                  <div><span class="glyph blackhole"></span>Black hole</div>
+                  <div><span class="glyph neutron"></span>Neutron star</div>
+                  <div><span class="glyph dwarf"></span>White dwarf</div>
+                  <div><span class="glyph triangle"></span>T Tauri / Herbig</div>
+                  <div><span class="glyph giant"></span>Giant / supergiant</div>
+                </div>
+                <div class="legend">
+                  <div class="legend-title">POI icons</div>
+                  <div><span class="glyph poi nebula"></span>Nebulae</div>
+                  <div><span class="glyph poi carrier"></span>Fleet carriers</div>
+                  <div><span class="glyph poi stellar"></span>Stellar features</div>
+                  <div><span class="glyph poi bio"></span>Planetary / biological</div>
+                  <div><span class="glyph poi station"></span>Stations / megaships</div>
+                  <div><span class="glyph poi mystery"></span>Mystery / xenology</div>
+                  <div><span class="glyph poi route"></span>Routes / resources</div>
+                  <div><span class="glyph poi history"></span>Sightseeing / historical</div>
+                  <div><span class="glyph hazard"></span>Murder binaries</div>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section id="inspector-data" class="inspector-panel" data-inspector-panel="data" role="tabpanel" hidden>
+            <div class="section systems-section">
+              <div class="section-heading"><span>System data</span><span class="section-rule"></span></div>
+              <div id="systemsSummary" class="muted">System update status not loaded</div>
+              <div id="systemUpdateStatus" class="data-state"><i></i><span>Idle</span></div>
+              <div id="systemUpdateProgress" class="update-progress" hidden><span></span></div>
+              <div class="system-update-grid">
+                <button class="panel-button system-update" data-system-update="1day" type="button">Update 1 day</button>
+                <button class="panel-button system-update" data-system-update="1week" type="button">Update 1 week</button>
+                <button class="panel-button system-update" data-system-update="2weeks" type="button">Update 2 weeks</button>
+                <button class="panel-button system-update" data-system-update="1month" type="button">Update 1 month</button>
+                <button class="panel-button system-update panel-button-tertiary" data-system-update="6months" data-large-update="true" data-large-update-label="systems_6months.json.gz" type="button">Update 6 months</button>
+                <button class="panel-button system-update panel-button-tertiary" data-system-update="places" type="button">Update places</button>
+                <button class="panel-button system-update panel-button-tertiary" data-system-update="discoveries" type="button">Update discoveries</button>
+                <button class="panel-button system-update panel-button-tertiary" data-system-update="murder-binaries" data-large-update="true" data-large-update-label="the installed full-galaxy rich-data packs" type="button">Build murder binaries</button>
+                <button class="panel-button system-update panel-button-tertiary" data-system-update="galaxy" data-large-update="true" data-large-update-label="local galaxy.json.gz full-data import" type="button">Import full data</button>
+              </div>
+              <div id="systemUpdateLog" class="update-log"></div>
+            </div>
+
+            <div class="section">
+              <div class="section-heading"><span>Journal import</span><span class="section-rule"></span></div>
+              <p class="section-copy">Refresh visited systems, carrier position, and your latest location from Elite Dangerous journals.</p>
+              <button id="scanLatestJournals" class="panel-button panel-button-primary" type="button">Scan latest journals</button>
+              <button id="scanAllJournals" class="panel-button panel-button-tertiary" type="button">Scan all journals</button>
+            </div>
+
+            <div class="section">
+              <div class="section-heading"><span>Local dataset</span><span class="section-rule"></span></div>
+              <div id="datasetSummary" class="summary">No import loaded</div>
+            </div>
+          </section>
+        </div>
+      </aside>
+    </main>
+    <script type="module" src="/app.js?v=false-color-grid-1"></script>
+  </body>
+</html>
