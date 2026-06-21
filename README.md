@@ -109,10 +109,6 @@ map landmark, and the optional 500 ly range bubble. `fallbackCoords` may be
 left as `null`. You can also point to a configuration file elsewhere by setting
 `EDSS_CONFIG` to its path before importing journals or starting the server.
 
-Do not commit `config.local.json`, generated files under `data/`, journal logs,
-or downloaded dump files. These paths are ignored by the supplied
-`.gitignore`.
-
 ### 4. Start the application
 
 Double-click `Start ED System Search.bat`, or run:
@@ -210,9 +206,10 @@ map; stored and displayed coordinates are not modified.
 - Local Elite Dangerous player journal files
 
 Third-party data remains subject to its source's terms and attribution
-requirements. Elite Dangerous is a trademark of Frontier Developments plc.
+requirements. Explorarium data used with permission.
+Elite Dangerous is a trademark of Frontier Developments plc.
 This project is an unofficial community tool and is not affiliated with or
-endorsed by Frontier Developments.
+endorsed by Frontier Developments, EDAstro, Spansh, or Explorarium.
 
 ## Tests
 
@@ -223,8 +220,7 @@ npm run test:stars
 ```
 
 `test:galaxy` builds a small temporary rich-data fixture and verifies imports,
-map filters, system details, Places integration, and Murder Binaries detection.
-
+map filters, system details, Places integration.
 ## Repository Hygiene
 
 The following are intentionally excluded from Git:
