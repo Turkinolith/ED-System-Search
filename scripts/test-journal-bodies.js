@@ -28,7 +28,7 @@ writeFileSync(journalPath, [
     StarSystem: 'Journal Fixture',
     SystemAddress: systemAddress,
     StarPos: [1, 2, 3],
-    StarClass: 'G',
+    StarClass: 'A',
   }),
   event({
     timestamp: '2026-06-15T12:00:02Z',
@@ -38,17 +38,29 @@ writeFileSync(journalPath, [
     BodyID: 0,
     SystemAddress: systemAddress,
     DistanceFromArrivalLS: 0,
-    StarType: 'G',
+    StarType: 'A',
     StellarMass: 1.05,
     Radius: 700000000,
     SurfaceTemperature: 5800,
+  }),
+  event({
+    timestamp: '2026-06-15T12:00:30Z',
+    event: 'Scan',
+    ScanType: 'Detailed',
+    StarSystem: 'Journal Fixture',
+    BodyName: 'Journal Fixture B',
+    BodyID: 1,
+    SystemAddress: systemAddress,
+    DistanceFromArrivalLS: 1800,
+    StarType: 'TTS',
+    StellarMass: 0.5,
   }),
   event({
     timestamp: '2026-06-15T12:01:00Z',
     event: 'Scan',
     ScanType: 'Detailed',
     BodyName: 'Journal Fixture A 1',
-    BodyID: 1,
+    BodyID: 2,
     SystemAddress: systemAddress,
     DistanceFromArrivalLS: 950,
     PlanetClass: 'Earthlike body',
@@ -67,7 +79,7 @@ writeFileSync(journalPath, [
     timestamp: '2026-06-15T12:02:00Z',
     event: 'SAASignalsFound',
     BodyName: 'Journal Fixture A 1',
-    BodyID: 1,
+    BodyID: 2,
     SystemAddress: systemAddress,
     Signals: [{ Type: '$SAA_SignalType_Biological;', Type_Localised: 'Biological', Count: 3 }],
   }),
@@ -99,30 +111,35 @@ try {
   assert.ok(existsSync(bodyPath));
   let data = JSON.parse(readFileSync(bodyPath, 'utf8'));
   assert.equal(data.systemCount, 1);
-  assert.equal(data.bodyCount, 2);
+  assert.equal(data.bodyCount, 3);
   assert.equal(data.systems[0].id64, systemAddress);
   assert.equal(data.systems[0].name, 'Journal Fixture');
-  assert.equal(data.systems[0].bodies[1].atmosphereType, 'thin ammonia atmosphere');
-  assert.equal(data.systems[0].bodies[1].signals.Biological.count, 3);
-  assert.equal(data.systems[0].bodies[1].rings[0].type, 'Icy');
+  assert.equal(data.systems[0].bodies[2].atmosphereType, 'thin ammonia atmosphere');
+  assert.equal(data.systems[0].bodies[2].signals.Biological.count, 3);
+  assert.equal(data.systems[0].bodies[2].rings[0].type, 'Icy');
   const supplementalPath = path.join(dataDir, 'journal-systems.json');
-  const originalIndex = JSON.parse(readFileSync(supplementalPath, 'utf8')).systems
-    .find((system) => system.name === 'Journal Fixture').index;
+  const initialSupplemental = JSON.parse(readFileSync(supplementalPath, 'utf8')).systems
+    .find((system) => system.name === 'Journal Fixture');
+  assert.equal(initialSupplemental.mainStar, 'A (Blue-White) Star');
+  assert.equal(initialSupplemental.starClass, 'A');
+  const originalIndex = initialSupplemental.index;
 
   appendFileSync(journalPath, event({
     timestamp: '2026-06-15T12:03:00Z',
     event: 'SAAScanComplete',
     BodyName: 'Journal Fixture A 1',
-    BodyID: 1,
+    BodyID: 2,
     SystemAddress: systemAddress,
     ProbesUsed: 4,
     EfficiencyTarget: 6,
   }));
   await run(process.execPath, ['scripts/import-journals.js', journalDir, '--latest', '20'], { EDSS_DATA_DIR: dataDir });
   data = JSON.parse(readFileSync(bodyPath, 'utf8'));
-  assert.equal(data.bodyCount, 2);
-  assert.equal(data.systems[0].bodies[1].mapped, true);
-  assert.equal(data.systems[0].bodies[1].signals.Biological.count, 3);
+  assert.equal(data.bodyCount, 3);
+  assert.equal(data.systems[0].bodies[2].mapped, true);
+  assert.equal(data.systems[0].bodies[2].signals.Biological.count, 3);
+  assert.equal(JSON.parse(readFileSync(supplementalPath, 'utf8')).systems
+    .find((system) => system.name === 'Journal Fixture').mainStar, 'A (Blue-White) Star');
 
   appendFileSync(journalPath, event({
     timestamp: '2026-06-15T12:04:00Z',
@@ -168,8 +185,8 @@ try {
   const rich = await response.json();
   assert.equal(rich.segment.kind, 'journal');
   assert.equal(rich.system.name, 'Journal Fixture');
-  assert.equal(rich.system.bodies.length, 2);
-  assert.equal(rich.system.bodies[1].mapped, true);
+  assert.equal(rich.system.bodies.length, 3);
+  assert.equal(rich.system.bodies[2].mapped, true);
 } finally {
   if (server) {
     server.kill();

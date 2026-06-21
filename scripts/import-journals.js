@@ -155,6 +155,28 @@ function starClassToMainStar(starClass) {
   return map.get(key) ?? (key ? `${key} Star` : 'Unknown');
 }
 
+function mainStarEvidence(event) {
+  const systemStarClass = typeof event.StarClass === 'string' && event.StarClass.trim()
+    ? event.StarClass.trim()
+    : null;
+  if (systemStarClass) return { starClass: systemStarClass, priority: 3 };
+
+  const scannedStarClass = typeof event.StarType === 'string' && event.StarType.trim()
+    ? event.StarType.trim()
+    : null;
+  if (!scannedStarClass) return null;
+  const bodyId = finiteNumber(event.BodyID);
+  const distance = finiteNumber(event.DistanceFromArrivalLS);
+  const isArrivalStar = bodyId === 0 || (distance !== undefined && Math.abs(distance) < 0.001);
+  return { starClass: scannedStarClass, priority: isArrivalStar ? 2 : 1 };
+}
+
+function systemMainStarPriority(system) {
+  const explicit = Number(system?.mainStarPriority);
+  if (Number.isFinite(explicit)) return explicit;
+  return system?.starClass || (system?.mainStar && system.mainStar !== 'Unknown') ? 2 : 0;
+}
+
 function journalCoords(event) {
   const pos = event.StarPos;
   if (!Array.isArray(pos) || pos.length < 3) return null;
@@ -445,7 +467,11 @@ async function parseJournals(files) {
       const timestamp = event.timestamp ?? '';
       const previous = systems.get(key);
       const coords = journalCoords(event) ?? previous?.coords;
-      const starClass = event.StarClass ?? event.StarType ?? previous?.starClass;
+      const evidence = mainStarEvidence(event);
+      const previousPriority = systemMainStarPriority(previous);
+      const useEvidence = evidence && (evidence.priority > previousPriority || !previous?.starClass);
+      const starClass = useEvidence ? evidence.starClass : previous?.starClass;
+      const mainStarPriority = useEvidence ? evidence.priority : previousPriority;
       systems.set(key, {
         name,
         firstVisited: previous?.firstVisited ?? timestamp,
@@ -455,6 +481,7 @@ async function parseJournals(files) {
         coords,
         starClass,
         mainStar: starClassToMainStar(starClass),
+        mainStarPriority,
         lastEvent: !previous || timestamp > previous.lastVisited ? event.event : previous.lastEvent,
       });
       eventCount += 1;
@@ -548,6 +575,10 @@ function mergeSystem(existing, incoming) {
   if (!existing) return incoming;
   const lastVisited = latestTimestamp(existing.lastVisited, incoming.lastVisited);
   const incomingIsLatest = incoming.lastVisited === lastVisited;
+  const existingStarPriority = systemMainStarPriority(existing);
+  const incomingStarPriority = systemMainStarPriority(incoming);
+  const useIncomingStar = incomingStarPriority > existingStarPriority
+    || (!existing.starClass && incoming.starClass);
   return {
     ...existing,
     ...incoming,
@@ -557,8 +588,9 @@ function mergeSystem(existing, incoming) {
     count: Math.max(Number(existing.count ?? 0), Number(incoming.count ?? 0)),
     systemAddress: incoming.systemAddress ?? existing.systemAddress,
     coords: incoming.coords ?? existing.coords,
-    starClass: incoming.starClass ?? existing.starClass,
-    mainStar: incoming.mainStar && incoming.mainStar !== 'Unknown' ? incoming.mainStar : existing.mainStar,
+    starClass: useIncomingStar ? incoming.starClass : existing.starClass,
+    mainStar: useIncomingStar ? incoming.mainStar : existing.mainStar,
+    mainStarPriority: useIncomingStar ? incomingStarPriority : existingStarPriority,
     lastEvent: incomingIsLatest ? incoming.lastEvent : existing.lastEvent,
   };
 }
@@ -631,6 +663,46 @@ function makeJournalBodies(parsed, visitedSystems, existingPayload, mergeExistin
     bodyCount: output.reduce((sum, system) => sum + system.bodies.length, 0),
     systems: output,
   };
+}
+
+function primaryStarFromBodySystem(bodySystem) {
+  const stars = (bodySystem?.bodies ?? []).filter((body) => body?.type === 'Star' || body?.spectralClass);
+  if (!stars.length) return null;
+  const arrivalStars = stars.filter((body) => (
+    Number(body.bodyId) === 0
+    || (Number.isFinite(Number(body.distanceToArrival)) && Math.abs(Number(body.distanceToArrival)) < 0.001)
+  ));
+  const candidate = arrivalStars.sort((a, b) => (
+    Number(a.bodyId ?? Number.MAX_SAFE_INTEGER) - Number(b.bodyId ?? Number.MAX_SAFE_INTEGER)
+  ))[0] ?? (stars.length === 1 ? stars[0] : null);
+  if (!candidate) return null;
+  const starClass = candidate.spectralClass;
+  const mainStar = candidate.subType ?? starClassToMainStar(starClass);
+  if (!starClass && !mainStar) return null;
+  return {
+    starClass,
+    mainStar,
+    priority: arrivalStars.includes(candidate) ? 2 : 1,
+  };
+}
+
+function reconcileMainStarsFromBodies(visitedSystems, journalBodies) {
+  const byAddress = new Map();
+  const byName = new Map();
+  for (const bodySystem of journalBodies?.systems ?? []) {
+    if (bodySystem?.id64) byAddress.set(String(bodySystem.id64), bodySystem);
+    if (bodySystem?.name) byName.set(systemKey(bodySystem.name), bodySystem);
+  }
+  for (const [key, system] of visitedSystems) {
+    const bodySystem = (system.systemAddress ? byAddress.get(String(system.systemAddress)) : null) ?? byName.get(key);
+    const primary = primaryStarFromBodySystem(bodySystem);
+    if (!primary) continue;
+    const currentPriority = systemMainStarPriority(system);
+    if (primary.priority < currentPriority) continue;
+    system.starClass = primary.starClass ?? system.starClass;
+    system.mainStar = primary.mainStar ?? starClassToMainStar(system.starClass);
+    system.mainStarPriority = primary.priority;
+  }
 }
 
 function makeJournalState(journalDir, entries, previousState = null) {
@@ -1000,6 +1072,8 @@ async function main() {
     ? new Set([...previousMatchedKeys, ...imported.matchedKeys])
     : imported.matchedKeys;
   progress('writing results');
+  const journalBodies = makeJournalBodies(parsedScan, parsed.systems, existingBodies, options.mergeExisting);
+  reconcileMainStarsFromBodies(parsed.systems, journalBodies);
   const supplemental = makeSupplementalSystems(
     parsed.systems,
     matchedKeys,
@@ -1014,7 +1088,6 @@ async function main() {
     : [];
   const indexes = [...new Set([...previousIndexList, ...imported.indexes, ...supplementalIndexes])];
   const systems = [...parsed.systems.values()].sort((a, b) => a.name.localeCompare(b.name));
-  const journalBodies = makeJournalBodies(parsedScan, parsed.systems, existingBodies, options.mergeExisting);
 
   const payload = {
     journalDir: options.journalDir,
