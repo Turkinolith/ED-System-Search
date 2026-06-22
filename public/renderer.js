@@ -203,6 +203,10 @@ export function colorsForType(typeName = '') {
   return starVisual(typeName).color;
 }
 
+export function isGiantStarType(typeName = '') {
+  return /\b(?:super giant|giant)\b.*\bStar$/i.test(String(typeName));
+}
+
 export function zoomStarScalePercent(distance) {
   const nearDistance = 850;
   const farDistance = 30000;

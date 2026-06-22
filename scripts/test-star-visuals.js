@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { densityPriorityFraction, prioritizeDrawCandidates, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
+import { densityPriorityFraction, isGiantStarType, prioritizeDrawCandidates, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
 
 const o = starVisual('O (Blue-White) Star');
 const a = starVisual('A (Blue-White) Star');
@@ -18,6 +18,10 @@ assert.ok(t.size < m.size, 'T dwarfs should be more compact than M dwarfs.');
 assert.equal(young.style, 6, 'Herbig and T Tauri stars should use the young-star ray profile.');
 assert.ok(giant.size > m.size, 'Giants should be larger than their base spectral class.');
 assert.ok(supergiant.size > giant.size, 'Supergiants should be larger than giants.');
+assert.equal(isGiantStarType('M (Red giant) Star'), true, 'Giant stars should match the Giants preset.');
+assert.equal(isGiantStarType('A (Blue-White super giant) Star'), true, 'Supergiant stars should match the Giants preset.');
+assert.equal(isGiantStarType('M (Red dwarf) Star'), false, 'Main-sequence and dwarf stars should not match the Giants preset.');
+assert.equal(isGiantStarType('Class V gas giant'), false, 'Gas giants should not match the stellar Giants preset.');
 assert.equal(zoomStarScalePercent(850), 300, 'Local journal views should use 300% stars.');
 assert.equal(zoomStarScalePercent(30000), 60, 'Whole-galaxy views should use 60% stars.');
 assert.ok(zoomStarScalePercent(7500) < 300 && zoomStarScalePercent(7500) > 60, 'Intermediate zoom should scale smoothly.');

@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType } from './renderer.js?v=visited-braces-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=giant-filter-1';
 
 const state = {
   meta: null,
@@ -645,11 +645,14 @@ function filterCategory(group) {
 function applyFilterPreset(predicate) {
   state.enabledTypes.clear();
   for (const item of state.filterInputs) {
-    const enabled = predicate(item.group);
-    item.input.checked = enabled;
+    let enabledCount = 0;
     for (const code of item.group.codes) {
-      if (enabled) state.enabledTypes.add(code);
+      if (!predicate(item.group, code)) continue;
+      state.enabledTypes.add(code);
+      enabledCount += 1;
     }
+    item.input.checked = enabledCount === item.group.codes.length;
+    item.input.indeterminate = enabledCount > 0 && enabledCount < item.group.codes.length;
   }
   loadPoints();
 }
@@ -659,6 +662,7 @@ function renderFilterActions() {
     ['All', () => true],
     ['None', () => false],
     ['Main', isMainSequenceGroup],
+    ['Giants', (_group, code) => isGiantStarType(state.meta.typeNames[code])],
     ['Rare', isRareGroup],
     ['Special', isSpecialGroup],
   ];
@@ -723,6 +727,7 @@ function filterControl(group) {
     input.type = 'checkbox';
     input.checked = true;
     input.addEventListener('change', () => {
+      input.indeterminate = false;
       for (const code of group.codes) {
         if (input.checked) state.enabledTypes.add(code);
         else state.enabledTypes.delete(code);
