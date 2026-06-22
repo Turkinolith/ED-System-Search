@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=giant-filter-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=depth-emphasis-1';
 
 const state = {
   meta: null,
@@ -53,6 +53,7 @@ const el = {
   focusCoords: document.querySelector('#focusCoords'),
   journalSummary: document.querySelector('#journalSummary'),
   visitedToggle: document.querySelector('#visitedToggle'),
+  depthEmphasisToggle: document.querySelector('#depthEmphasisToggle'),
   gridToggle: document.querySelector('#gridToggle'),
   dropLinesToggle: document.querySelector('#dropLinesToggle'),
   landmarksToggle: document.querySelector('#landmarksToggle'),
@@ -1932,6 +1933,10 @@ function bindControls() {
     state.renderer.rebuildDrawBuffers(true);
     writeViewSettings({ showVisited: el.visitedToggle.checked });
   });
+  el.depthEmphasisToggle.addEventListener('change', () => {
+    state.renderer.setDepthEmphasis(el.depthEmphasisToggle.checked);
+    writeViewSettings({ showDepthEmphasis: el.depthEmphasisToggle.checked });
+  });
   el.starScale.addEventListener('input', () => {
     if (el.starScaleAuto.checked) setStarScaleAuto(false, true);
     applyStarScale(el.starScale.value);
@@ -2048,6 +2053,7 @@ async function init() {
   setInspectorCollapsed(viewSettings.inspectorCollapsed ?? false, false);
   updateLandmarks();
   el.visitedToggle.checked = viewSettings.showVisited ?? true;
+  el.depthEmphasisToggle.checked = viewSettings.showDepthEmphasis ?? true;
   el.gridToggle.checked = viewSettings.showGrid ?? true;
   el.dropLinesToggle.checked = viewSettings.showDropLines ?? true;
   el.landmarksToggle.checked = viewSettings.showLandmarks ?? true;
@@ -2056,6 +2062,7 @@ async function init() {
     && viewSettings.placeCategories.includes(murderBinariesCategory);
   el.murderBinariesToggle.checked = viewSettings.showMurderBinaries ?? savedMurderCategory ?? false;
   state.renderer.showVisited = el.visitedToggle.checked;
+  state.renderer.setDepthEmphasis(el.depthEmphasisToggle.checked);
   state.renderer.showGrid = el.gridToggle.checked;
   state.renderer.showDropLines = el.dropLinesToggle.checked;
   state.renderer.showLandmarks = el.landmarksToggle.checked;

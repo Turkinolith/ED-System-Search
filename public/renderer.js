@@ -282,6 +282,20 @@ export function densityPriorityFraction(candidateCount, nearbyCount, limit) {
   return Math.min(0.97, Math.max(0.75, 0.75 + Math.log2(pressure) * 0.1));
 }
 
+export function gridDepthEmphasis(height, step) {
+  const gridStep = Math.max(1, Number(step) || 1);
+  const distance = Math.abs(Number(height) || 0);
+  const fullBand = gridStep * 2;
+  const fadeEnd = gridStep * 8;
+  const progress = clamp((distance - fullBand) / Math.max(1, fadeEnd - fullBand), 0, 1);
+  const eased = progress * progress * (3 - 2 * progress);
+  const nearBoost = 1 - clamp(distance / fullBand, 0, 1);
+  return {
+    alpha: 1 - eased * 0.78,
+    size: 1 + nearBoost * 0.15 - eased * 0.26,
+  };
+}
+
 export function visitedBraceGeometry(radius = 9) {
   const height = radius;
   const inner = radius * 0.72;
@@ -398,6 +412,7 @@ export class GalaxyRenderer {
     this.distance = 2500;
     this.showVisited = true;
     this.showGrid = true;
+    this.showDepthEmphasis = true;
     this.showDropLines = true;
     this.showLandmarks = true;
     this.showPlaces = true;
@@ -413,6 +428,7 @@ export class GalaxyRenderer {
     this.hoverIndex = null;
     this.hoverPlaceId = null;
     this.hoverScreen = null;
+    this.hoverPoint = null;
     this.lastHoverAt = 0;
     this.keys = new Set();
     this.onSelect = null;
@@ -474,6 +490,7 @@ export class GalaxyRenderer {
       this.hoverIndex = null;
       this.hoverPlaceId = null;
       this.hoverScreen = null;
+      this.hoverPoint = null;
       this.onHover?.(null);
       this.onPlaceHover?.(null);
     });
@@ -545,6 +562,12 @@ export class GalaxyRenderer {
   setAutoStarScale(enabled) {
     this.autoStarScale = Boolean(enabled);
     this.lastReportedStarScale = null;
+    this.rebuildDrawBuffers(true);
+  }
+
+  setDepthEmphasis(enabled) {
+    this.showDepthEmphasis = Boolean(enabled);
+    this.lastBufferKey = '';
     this.rebuildDrawBuffers(true);
   }
 
@@ -681,7 +704,8 @@ export class GalaxyRenderer {
     const now = performance.now();
     const budget = this.drawBudget();
     const maxDistance = this.maxDrawDistance();
-    const key = `${Math.round(this.target[0] / 25)}:${Math.round(this.target[1] / 25)}:${Math.round(this.target[2] / 25)}:${Math.round(this.distance)}:${budget}:${maxDistance}`;
+    const gridStep = this.gridStep();
+    const key = `${Math.round(this.target[0] / 25)}:${Math.round(this.target[1] / gridStep)}:${Math.round(this.target[2] / 25)}:${Math.round(this.distance)}:${budget}:${maxDistance}:${this.showDepthEmphasis ? 1 : 0}`;
     if (!force && key === this.lastBufferKey && now - this.lastBufferBuild < 250) return;
 
     this.lastBufferKey = key;
@@ -730,12 +754,17 @@ export class GalaxyRenderer {
       const visual = starVisual(point.typeName);
       const distanceAlpha = this.starDistanceAlpha(this.distanceFromTarget(point));
       const gridAnchor = gridAnchorIndexes.has(point.index);
+      const depthExempt = required.has(point.index) || (this.showVisited && (point.flags & 4));
+      const depth = this.showDepthEmphasis && !depthExempt
+        ? gridDepthEmphasis(point.y - this.target[1], gridStep)
+        : { alpha: 1, size: 1 };
+      const combinedAlpha = distanceAlpha * depth.alpha;
       positions.push(point.x, point.y, point.z);
       colors.push(...visual.color);
-      sizes.push(visual.size * sizeScale * (0.62 + distanceAlpha * 0.38) * (gridAnchor ? 1.5 : 1));
+      sizes.push(visual.size * sizeScale * (0.62 + distanceAlpha * 0.38) * depth.size * (gridAnchor ? 1.5 : 1));
       styles.push(visual.style);
       phases.push((point.bucket % 4096) / 4096);
-      alphas.push(gridAnchor ? Math.max(0.9, distanceAlpha) : distanceAlpha);
+      alphas.push(gridAnchor ? Math.max(0.9, combinedAlpha) : combinedAlpha);
     }
     this.points = drawPoints;
     this.count = drawPoints.length;
@@ -1339,10 +1368,10 @@ export class GalaxyRenderer {
       const center = index === 0;
       ctx.lineWidth = center ? 2 : major ? 1.4 : 0.9;
       ctx.strokeStyle = center
-        ? 'rgba(72, 220, 230, 0.62)'
+        ? `rgba(72, 220, 230, ${this.showDepthEmphasis ? 0.72 : 0.62})`
         : major
-          ? `rgba(124, 180, 194, ${0.2 + edgeFade * 0.2})`
-          : `rgba(105, 149, 162, ${0.08 + edgeFade * 0.12})`;
+          ? `rgba(124, 180, 194, ${(this.showDepthEmphasis ? 0.25 : 0.2) + edgeFade * (this.showDepthEmphasis ? 0.23 : 0.2)})`
+          : `rgba(105, 149, 162, ${(this.showDepthEmphasis ? 0.12 : 0.08) + edgeFade * (this.showDepthEmphasis ? 0.15 : 0.12)})`;
       this.drawWorldLine({ x, y: grid.y, z: grid.minZ }, { x, y: grid.y, z: grid.maxZ });
     }
     for (let index = -lineCount; index <= lineCount; index += 1) {
@@ -1352,10 +1381,10 @@ export class GalaxyRenderer {
       const center = index === 0;
       ctx.lineWidth = center ? 2 : major ? 1.4 : 0.9;
       ctx.strokeStyle = center
-        ? 'rgba(255, 177, 76, 0.58)'
+        ? `rgba(255, 177, 76, ${this.showDepthEmphasis ? 0.68 : 0.58})`
         : major
-          ? `rgba(124, 180, 194, ${0.2 + edgeFade * 0.2})`
-          : `rgba(105, 149, 162, ${0.08 + edgeFade * 0.12})`;
+          ? `rgba(124, 180, 194, ${(this.showDepthEmphasis ? 0.25 : 0.2) + edgeFade * (this.showDepthEmphasis ? 0.23 : 0.2)})`
+          : `rgba(105, 149, 162, ${(this.showDepthEmphasis ? 0.12 : 0.08) + edgeFade * (this.showDepthEmphasis ? 0.15 : 0.12)})`;
       this.drawWorldLine({ x: grid.minX, y: grid.y, z }, { x: grid.maxX, y: grid.y, z });
     }
 
@@ -1384,7 +1413,7 @@ export class GalaxyRenderer {
     if (corners.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return;
     const ctx = this.ctx;
     ctx.save();
-    ctx.fillStyle = 'rgba(8, 96, 108, 0.22)';
+    ctx.fillStyle = `rgba(8, 96, 108, ${this.showDepthEmphasis ? 0.3 : 0.22})`;
     ctx.beginPath();
     ctx.moveTo(corners[0].x, corners[0].y);
     for (const corner of corners.slice(1)) ctx.lineTo(corner.x, corner.y);
@@ -1451,14 +1480,29 @@ export class GalaxyRenderer {
       ctx.lineTo(end.x, end.y);
       ctx.stroke();
 
-      ctx.fillStyle = `rgba(${colorText}, ${0.58 + prominence * 0.3})`;
-      const footSize = 2 + prominence * 1.2;
+      const groundedStart = {
+        x: start.x + (end.x - start.x) * 0.68,
+        y: start.y + (end.y - start.y) * 0.68,
+      };
+      ctx.strokeStyle = `rgba(99, 231, 235, ${0.46 + prominence * 0.38})`;
+      ctx.lineWidth = 1.2 + prominence;
       ctx.beginPath();
-      ctx.moveTo(end.x, end.y - footSize);
+      ctx.moveTo(groundedStart.x, groundedStart.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+
+      const footSize = 3 + prominence * 1.4;
+      ctx.strokeStyle = `rgba(128, 242, 244, ${0.66 + prominence * 0.28})`;
+      ctx.lineWidth = 1 + prominence * 0.5;
+      ctx.beginPath();
+      ctx.moveTo(end.x - footSize, end.y);
       ctx.lineTo(end.x + footSize, end.y);
+      ctx.moveTo(end.x, end.y - footSize);
       ctx.lineTo(end.x, end.y + footSize);
-      ctx.lineTo(end.x - footSize, end.y);
-      ctx.closePath();
+      ctx.stroke();
+      ctx.fillStyle = `rgba(224, 255, 255, ${0.72 + prominence * 0.24})`;
+      ctx.beginPath();
+      ctx.arc(end.x, end.y, 1.2 + prominence * 0.7, 0, Math.PI * 2);
       ctx.fill();
 
       ctx.strokeStyle = `rgba(${colorText}, ${0.62 + prominence * 0.32})`;
@@ -1471,6 +1515,37 @@ export class GalaxyRenderer {
       ctx.arc(start.x, start.y, 1.4 + prominence, 0, Math.PI * 2);
       ctx.fill();
     }
+    this.drawHoverDepthCue(grid);
+    ctx.restore();
+  }
+
+  drawHoverDepthCue(grid) {
+    const point = this.hoverPoint;
+    if (!this.showDepthEmphasis || !point
+      || point.x < grid.minX || point.x > grid.maxX
+      || point.z < grid.minZ || point.z > grid.maxZ
+      || Math.abs(point.y - grid.y) < 0.5) return;
+    const start = this.screen(point);
+    const end = this.screen({ x: point.x, y: grid.y, z: point.z });
+    if (!start || !end) return;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(151, 249, 250, 0.86)';
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    ctx.moveTo(start.x, start.y);
+    ctx.lineTo(end.x, end.y);
+    ctx.stroke();
+
+    const phase = (performance.now() % 1100) / 1100;
+    const pulseX = start.x + (end.x - start.x) * phase;
+    const pulseY = start.y + (end.y - start.y) * phase;
+    ctx.fillStyle = 'rgba(224, 255, 255, 0.96)';
+    ctx.shadowColor = 'rgba(88, 238, 242, 0.95)';
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.arc(pulseX, pulseY, 2.6, 0, Math.PI * 2);
+    ctx.fill();
     ctx.restore();
   }
 
@@ -1638,6 +1713,7 @@ export class GalaxyRenderer {
       this.hoverIndex = null;
       this.hoverPlaceId = placeHit.place.id ?? placeHit.place.name ?? '';
       this.hoverScreen = placeHit.screen;
+      this.hoverPoint = null;
       this.onHover?.(null);
       this.onPlaceHover?.({ place: placeHit.place, x: placeHit.screen.x, y: placeHit.screen.y });
       return;
@@ -1649,11 +1725,15 @@ export class GalaxyRenderer {
     }
     const nextIndex = hit?.point?.index ?? null;
     if (nextIndex === this.hoverIndex) {
-      if (hit?.screen) this.hoverScreen = hit.screen;
+      if (hit?.screen) {
+        this.hoverScreen = hit.screen;
+        this.hoverPoint = hit.point;
+      }
       return;
     }
     this.hoverIndex = nextIndex;
     this.hoverScreen = hit?.screen ?? null;
+    this.hoverPoint = hit?.point ?? null;
     this.onHover?.(hit ? { index: hit.point.index, x: hit.screen.x, y: hit.screen.y } : null);
   }
 

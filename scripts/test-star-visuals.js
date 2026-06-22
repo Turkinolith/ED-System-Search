@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { densityPriorityFraction, isGiantStarType, prioritizeDrawCandidates, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
+import { densityPriorityFraction, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
 
 const o = starVisual('O (Blue-White) Star');
 const a = starVisual('A (Blue-White) Star');
@@ -53,5 +53,14 @@ assert.equal(visitedBraces.length, 2, 'Visited systems should draw one brace on 
 assert.equal(visitedBraces[0].curves.length, 4, 'Each visited brace should use a smooth four-curve path.');
 assert.equal(visitedBraces[0].start[0], -visitedBraces[1].start[0], 'Visited braces should mirror around the star.');
 assert.equal(visitedBraces[0].start[1], visitedBraces[1].start[1], 'Visited braces should share vertical alignment.');
+
+const onGrid = gridDepthEmphasis(0, 5);
+const bandEdge = gridDepthEmphasis(10, 5);
+const farOffGrid = gridDepthEmphasis(40, 5);
+assert.equal(onGrid.alpha, 1, 'Stars on the grid plane should remain fully opaque.');
+assert.ok(onGrid.size > 1, 'Stars on the grid plane should receive a modest size boost.');
+assert.equal(bandEdge.alpha, 1, 'Stars inside two grid cells should retain full opacity.');
+assert.ok(farOffGrid.alpha <= 0.23 && farOffGrid.size < 0.8, 'Stars beyond eight grid cells should recede strongly.');
+assert.deepEqual(gridDepthEmphasis(-40, 5), farOffGrid, 'Depth emphasis should be symmetric above and below the grid.');
 
 console.log('Star visual profile test passed.');
