@@ -226,11 +226,11 @@ function clampNote(value) {
   return String(value ?? '').trim().slice(0, 512);
 }
 
-async function readRequestJson(req) {
+async function readRequestJson(req, maxBytes = 4096) {
   let body = '';
   for await (const chunk of req) {
     body += chunk;
-    if (body.length > 4096) throw new Error('Request body is too large.');
+    if (body.length > maxBytes) throw new Error('Request body is too large.');
   }
   return body ? JSON.parse(body) : {};
 }
@@ -697,6 +697,499 @@ async function readRichSystem(reqUrl, res) {
       governmentTypes: entry?.governmentTypes ?? 0,
     },
     system,
+  });
+}
+
+function cleanLlmText(value, maxLength = 4000) {
+  return String(value ?? '').trim().slice(0, maxLength);
+}
+
+function llmBaseUrl(provider, configured) {
+  const value = cleanLlmText(configured, 400).replace(/\/+$/, '');
+  if (value) return provider === 'kobold' && !/\/v1$/i.test(value) ? `${value}/v1` : value;
+  if (provider === 'anthropic') return 'https://api.anthropic.com';
+  if (provider === 'kobold') return 'http://localhost:5001/v1';
+  return 'https://api.openai.com/v1';
+}
+
+function jsonFromText(text) {
+  const raw = String(text ?? '').trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) return JSON.parse(fenced[1]);
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start >= 0 && end > start) return JSON.parse(raw.slice(start, end + 1));
+    throw new Error('The LLM did not return JSON.');
+  }
+}
+
+async function callLlmText(config, systemPrompt, userPrompt, maxTokens = 900) {
+  const provider = cleanLlmText(config?.provider, 40) || 'openai';
+  const model = cleanLlmText(config?.model, 120);
+  const apiKey = cleanLlmText(config?.apiKey, 400);
+  const baseUrl = llmBaseUrl(provider, config?.baseUrl);
+  if (!model) throw new Error('Choose an LLM model before running augmented search.');
+  if (provider !== 'kobold' && !apiKey) throw new Error('Add an API key before running augmented search.');
+
+  if (provider === 'anthropic') {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: maxTokens,
+        temperature: 0.1,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userPrompt }],
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error?.message ?? `Claude request failed with HTTP ${response.status}.`);
+    return (data.content ?? []).map((part) => part.text ?? '').join('\n').trim();
+  }
+
+  if (provider === 'kobold') {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.1,
+        max_tokens: maxTokens,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error?.message ?? `KoboldCPP request failed with HTTP ${response.status}.`);
+    return String(data.choices?.[0]?.message?.content ?? '').trim();
+  }
+
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.1,
+      max_output_tokens: maxTokens,
+      input: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error?.message ?? `OpenAI request failed with HTTP ${response.status}.`);
+  if (data.output_text) return String(data.output_text).trim();
+  return (data.output ?? [])
+    .flatMap((item) => item.content ?? [])
+    .map((part) => part.text ?? '')
+    .join('\n')
+    .trim();
+}
+
+function heuristicLlmSearchPlan(query) {
+  const text = String(query ?? '').toLowerCase();
+  const ringTypes = [];
+  const bodyTypes = [];
+  const keywords = [];
+  if (/\bicy\b|ice ring|icy ring/.test(text)) ringTypes.push('icy');
+  if (/rocky ice|rocky-ice/.test(text)) bodyTypes.push('rockyIce');
+  if (/\btritium\b/.test(text)) keywords.push('tritium');
+  if (/hotspot|hot spot/.test(text)) keywords.push('hotspot');
+  const radiusMatch = text.match(/(?:within|inside|under|less than)\s+(\d+(?:\.\d+)?)\s*(?:ly|light years?|light-years?)/);
+  const radiusLy = radiusMatch ? Number(radiusMatch[1]) : 1000;
+  return {
+    intent: 'Find nearby systems matching the natural-language request.',
+    radiusLy,
+    limit: 10,
+    scanLimit: 160,
+    filters: {
+      ringTypes,
+      bodyTypes,
+      requireSignals: /\bsignal|hotspot|hot spot|tritium/.test(text) && !/\bprefer|preferably|bonus|ideally/.test(text),
+    },
+    preferences: keywords.length ? ['Prefer exact mentions of requested hotspot/material keywords.'] : [],
+    keywords,
+  };
+}
+
+function sanitizeLlmSearchPlan(value, fallback) {
+  const plan = value && typeof value === 'object' ? value : {};
+  const cleanList = (items, allowed) => Array.isArray(items)
+    ? items.map((item) => String(item ?? '').trim()).filter((item) => allowed.includes(item))
+    : [];
+  const radiusLy = Number(plan.radiusLy ?? fallback.radiusLy);
+  const limit = Number(plan.limit ?? fallback.limit);
+  const scanLimit = Number(plan.scanLimit ?? fallback.scanLimit);
+  const filters = plan.filters && typeof plan.filters === 'object' ? plan.filters : {};
+  const keywords = Array.isArray(plan.keywords)
+    ? plan.keywords.map((item) => cleanLlmText(item, 40).toLowerCase()).filter(Boolean).slice(0, 8)
+    : fallback.keywords;
+  return {
+    intent: cleanLlmText(plan.intent, 240) || fallback.intent,
+    radiusLy: Number.isFinite(radiusLy) ? Math.max(25, Math.min(5000, radiusLy)) : fallback.radiusLy,
+    limit: Number.isFinite(limit) ? Math.max(3, Math.min(20, Math.floor(limit))) : fallback.limit,
+    scanLimit: Number.isFinite(scanLimit) ? Math.max(30, Math.min(400, Math.floor(scanLimit))) : fallback.scanLimit,
+    filters: {
+      ringTypes: [...new Set([...fallback.filters.ringTypes, ...cleanList(filters.ringTypes, Object.keys(richCategoryMasks.ring))])],
+      bodyTypes: [...new Set([...fallback.filters.bodyTypes, ...cleanList(filters.bodyTypes, Object.keys(richCategoryMasks.body))])],
+      requireSignals: Boolean(filters.requireSignals ?? fallback.filters.requireSignals),
+    },
+    preferences: Array.isArray(plan.preferences)
+      ? plan.preferences.map((item) => cleanLlmText(item, 120)).filter(Boolean).slice(0, 5)
+      : fallback.preferences,
+    keywords,
+  };
+}
+
+async function llmSearchPlan(query, config) {
+  const fallback = heuristicLlmSearchPlan(query);
+  if (!config?.enabled) return { plan: fallback, source: 'heuristic', warning: 'LLM settings are not configured; used local keyword planning.' };
+  const systemPrompt = [
+    'You translate Elite Dangerous galaxy search requests into constrained JSON search plans.',
+    'Use only these filter values:',
+    `ringTypes: ${Object.keys(richCategoryMasks.ring).join(', ')}`,
+    `bodyTypes: ${Object.keys(richCategoryMasks.body).join(', ')}`,
+    'Return JSON only. No prose.',
+  ].join('\n');
+  const userPrompt = JSON.stringify({
+    request: query,
+    currentTargetUsage: 'Search should be ranked by distance from the current target unless the request says otherwise.',
+    schema: {
+      intent: 'short sentence',
+      radiusLy: 'number, default 1000',
+      limit: 'number 3-20',
+      scanLimit: 'number 30-400',
+      filters: {
+        ringTypes: ['icy'],
+        bodyTypes: [],
+        requireSignals: true,
+      },
+      preferences: ['prefer tritium hotspots if present'],
+      keywords: ['tritium', 'hotspot'],
+    },
+  });
+  const text = await callLlmText(config, systemPrompt, userPrompt, 700);
+  return { plan: sanitizeLlmSearchPlan(jsonFromText(text), fallback), source: config.provider };
+}
+
+async function collectNearestSpatialPoints(center, limit, maximumRadius) {
+  const index = await getSpatialIndex();
+  if (!index) throw new Error('Local spatial detail is not built. Run npm run import:spatial-index.');
+  const x = Number(center?.x);
+  const y = Number(center?.y);
+  const z = Number(center?.z);
+  if (![x, y, z].every(Number.isFinite)) throw new Error('A finite current target is required.');
+  const cellSize = Number(index.meta.cellSizeLy ?? 100);
+  const radius = Math.max(25, Math.min(5000, Number(maximumRadius) || 1000));
+  const cellXMin = Math.floor((x - radius) / cellSize);
+  const cellXMax = Math.floor((x + radius) / cellSize);
+  const cellYMin = Math.floor((y - radius) / cellSize);
+  const cellYMax = Math.floor((y + radius) / cellSize);
+  const cellZMin = Math.floor((z - radius) / cellSize);
+  const cellZMax = Math.floor((z + radius) / cellSize);
+  const cells = [];
+  for (let cellX = cellXMin; cellX <= cellXMax; cellX += 1) {
+    for (let cellY = cellYMin; cellY <= cellYMax; cellY += 1) {
+      const first = spatialIndexLowerBound(index, spatialCellKey(cellX, cellY, cellZMin));
+      const last = spatialIndexLowerBound(index, spatialCellKey(cellX, cellY, cellZMax) + 1n);
+      for (let cellIndex = first; cellIndex < last; cellIndex += 1) {
+        const indexOffset = spatialHeaderBytes + cellIndex * spatialIndexRecordBytes;
+        const key = index.buffer.readBigUInt64LE(indexOffset);
+        const cellZ = Number(key & spatialCellMask) - spatialCellBias;
+        const dx = distanceToCellAxis(x, cellX, cellSize);
+        const dy = distanceToCellAxis(y, cellY, cellSize);
+        const dz = distanceToCellAxis(z, cellZ, cellSize);
+        const minimumDistanceSq = dx * dx + dy * dy + dz * dz;
+        if (minimumDistanceSq > radius * radius) continue;
+        cells.push({
+          offset: Number(index.buffer.readBigUInt64LE(indexOffset + 8)),
+          count: index.buffer.readUInt32LE(indexOffset + 16),
+          minimumDistanceSq,
+        });
+      }
+    }
+  }
+  cells.sort((a, b) => a.minimumDistanceSq - b.minimumDistanceSq);
+  const selectedCells = [];
+  let selectedPointCount = 0;
+  for (const cell of cells) {
+    selectedCells.push(cell);
+    selectedPointCount += cell.count;
+    if (selectedPointCount >= limit * 8) break;
+  }
+  selectedCells.sort((a, b) => a.offset - b.offset);
+  const candidates = [];
+  const dataFd = await fs.open(spatialDataPath, 'r');
+  try {
+    for (const cell of selectedCells) {
+      const bytes = Buffer.allocUnsafe(cell.count * spatialPointBytes);
+      const { bytesRead } = await dataFd.read(bytes, 0, bytes.length, cell.offset);
+      for (let offset = 0; offset + spatialPointBytes <= bytesRead; offset += spatialPointBytes) {
+        const px = bytes.readFloatLE(offset);
+        const py = bytes.readFloatLE(offset + 4);
+        const pz = bytes.readFloatLE(offset + 8);
+        const distanceSq = (px - x) ** 2 + (py - y) ** 2 + (pz - z) ** 2;
+        if (distanceSq > radius * radius) continue;
+        candidates.push({
+          index: bytes.readUInt32LE(offset + 16),
+          typeCode: bytes.readUInt16LE(offset + 12),
+          coords: { x: px, y: py, z: pz },
+          distance: Math.sqrt(distanceSq),
+        });
+      }
+    }
+  } finally {
+    await dataFd.close();
+  }
+  return candidates.sort((a, b) => a.distance - b.distance).slice(0, limit);
+}
+
+async function readImportedSystemAtIndex(index, meta) {
+  const importedCount = meta?.importedCount ?? meta?.count ?? 0;
+  if (!Number.isInteger(index) || index < 0 || index >= importedCount) return null;
+  const fd = await fs.open(recordsPath, 'r');
+  const buffer = Buffer.allocUnsafe(recordBytes);
+  try {
+    const { bytesRead } = await fd.read(buffer, 0, recordBytes, index * recordBytes);
+    if (bytesRead !== recordBytes) return null;
+  } finally {
+    await fd.close();
+  }
+  const nameOffset = buffer.readUInt32LE(16);
+  const nameLength = buffer.readUInt16LE(20);
+  const namesFd = await fs.open(path.join(dataDir, 'systems-names.txt'), 'r');
+  const nameBuffer = Buffer.allocUnsafe(nameLength);
+  try {
+    await namesFd.read(nameBuffer, 0, nameLength, nameOffset);
+  } finally {
+    await namesFd.close();
+  }
+  const typeCode = buffer.readUInt16LE(12);
+  return {
+    index,
+    id64: buffer.readBigUInt64LE(24).toString(),
+    name: nameBuffer.toString('utf8'),
+    typeCode,
+    mainStar: meta?.typeNames?.[typeCode] ?? 'Unknown',
+    coords: {
+      x: buffer.readFloatLE(0),
+      y: buffer.readFloatLE(4),
+      z: buffer.readFloatLE(8),
+    },
+  };
+}
+
+async function richIndexResultById64(id64Text) {
+  const id64 = parseId64(id64Text);
+  if (id64 === null) return null;
+  const manifest = await getGalaxyManifest();
+  for (const segment of manifest?.segments ?? []) {
+    const entry = await richIndexEntry(segment, id64);
+    if (!entry) continue;
+    return { entry, segment };
+  }
+  return null;
+}
+
+async function readRichSystemFromIndexResult(richIndexResult) {
+  if (!richIndexResult?.entry || !richIndexResult?.segment) return null;
+  const { entry, segment } = richIndexResult;
+  if (entry.offset > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Rich galaxy pack offset exceeds the Node.js safe file-position range.');
+  const dataPath = galaxyDataPath(segment.dataFile);
+  const fd = await fs.open(dataPath, 'r');
+  try {
+    const compressed = Buffer.allocUnsafe(entry.compressedLength);
+    const result = await fd.read(compressed, 0, compressed.length, Number(entry.offset));
+    if (result.bytesRead !== compressed.length) throw new Error(`Truncated rich galaxy pack ${segment.dataFile}`);
+    const raw = zstdDecompressSync(compressed, { maxOutputLength: entry.rawLength });
+    return {
+      entry,
+      segment,
+      system: JSON.parse(raw.toString('utf8'), (key, value, context) => (
+        key === 'id64' && context?.source ? context.source : value
+      )),
+    };
+  } finally {
+    await fd.close();
+  }
+}
+
+async function readRichSystemById64(id64Text) {
+  const richIndexResult = await richIndexResultById64(id64Text);
+  if (!richIndexResult) return null;
+  return readRichSystemFromIndexResult(richIndexResult);
+}
+
+function richSummaryMatches(entry, plan) {
+  if (!entry) return false;
+  for (const ringType of plan.filters.ringTypes) {
+    if (!(entry.ringTypes & (richCategoryMasks.ring[ringType] ?? 0))) return false;
+  }
+  for (const bodyType of plan.filters.bodyTypes) {
+    if (!(entry.bodyTypes & (richCategoryMasks.body[bodyType] ?? 0))) return false;
+  }
+  if (plan.filters.requireSignals && !(entry.flags & richFlags.signals)) return false;
+  return true;
+}
+
+function candidateEvidence(system, rich, plan) {
+  const ringEvidence = [];
+  const bodyEvidence = [];
+  const signalEvidence = [];
+  const keywordEvidence = [];
+  let score = 0;
+  const bodies = Array.isArray(rich?.system?.bodies) ? rich.system.bodies : [];
+  const requiredRingTypes = new Set(plan.filters.ringTypes.map((item) => item.toLowerCase()));
+  const requiredBodyTypes = new Set(plan.filters.bodyTypes.map((item) => item.toLowerCase()));
+  const keywords = plan.keywords.map((item) => item.toLowerCase());
+  let hasRequiredRing = requiredRingTypes.size === 0;
+  let hasRequiredBody = requiredBodyTypes.size === 0;
+  let hasSignals = !plan.filters.requireSignals;
+  let hasKeyword = keywords.length === 0;
+  let signalScoreApplied = false;
+  for (const body of bodies) {
+    const bodyTypeText = String(body.subType ?? body.type ?? '').toLowerCase();
+    if ([...requiredBodyTypes].some((type) => bodyTypeText.includes(type.replace(/[A-Z]/g, (char) => ` ${char.toLowerCase()}`).trim()))) {
+      hasRequiredBody = true;
+      score += 8;
+      bodyEvidence.push(`${body.name ?? 'Body'} matches requested body type.`);
+    }
+    for (const ring of body.rings ?? []) {
+      const ringText = `${ring.name ?? ''} ${ring.type ?? ''}`.toLowerCase();
+      if ([...requiredRingTypes].some((type) => ringText.includes(type))) {
+        hasRequiredRing = true;
+        score += 14;
+        ringEvidence.push(`${body.name ?? 'Body'} has ${ring.type ?? 'matching'} ring ${ring.name ?? ''}`.trim());
+      }
+    }
+    const signalKeys = Object.keys(body.signals ?? {})
+      .filter((key) => !['signals', 'updatetime', 'genuses'].includes(key.toLowerCase()));
+    if (signalKeys.length) {
+      hasSignals = true;
+      if (!signalScoreApplied) {
+        score += 6;
+        signalScoreApplied = true;
+      }
+      signalEvidence.push(`${body.name ?? 'Body'} has ${signalKeys.join(', ')} signals.`);
+    }
+    const searchable = JSON.stringify({
+      name: body.name,
+      subType: body.subType,
+      type: body.type,
+      rings: body.rings,
+      signals: body.signals,
+      reserveLevel: body.reserveLevel,
+    }).toLowerCase();
+    const matchedKeywords = keywords.filter((keyword) => searchable.includes(keyword));
+    if (matchedKeywords.length) {
+      hasKeyword = true;
+      score += matchedKeywords.length * 20;
+      keywordEvidence.push(`${body.name ?? 'Body'} mentions ${matchedKeywords.join(', ')}.`);
+    }
+  }
+  const matches = hasRequiredRing && hasRequiredBody && hasSignals;
+  const evidence = [...keywordEvidence, ...ringEvidence, ...bodyEvidence, ...signalEvidence];
+  return {
+    matches,
+    score: score + (hasKeyword ? 20 : 0),
+    evidence: [...new Set(evidence)].slice(0, 5),
+    confidence: hasKeyword ? 'high' : matches ? 'medium' : 'low',
+  };
+}
+
+async function summarizeLlmSearch(query, target, plan, results, config) {
+  if (!config?.enabled || !results.length) return '';
+  const systemPrompt = 'Summarize grounded Elite Dangerous search results. Only use the provided candidates. Be concise.';
+  const userPrompt = JSON.stringify({
+    query,
+    currentTarget: target,
+    plan,
+    candidates: results.map((result) => ({
+      name: result.name,
+      distanceLy: Number(result.distanceLy.toFixed(2)),
+      mainStar: result.mainStar,
+      evidence: result.evidence,
+      confidence: result.confidence,
+    })),
+  });
+  return callLlmText(config, systemPrompt, userPrompt, 600).catch(() => '');
+}
+
+async function llmAugmentedSearch(req, res) {
+  const payload = await readRequestJson(req, 20000);
+  const query = cleanLlmText(payload.query, 1200);
+  if (query.length < 8) return badRequest(res, 'Enter a longer augmented-search request.');
+  const target = payload.target && typeof payload.target === 'object' ? payload.target : {};
+  const targetCoords = {
+    x: Number(target.coords?.x),
+    y: Number(target.coords?.y),
+    z: Number(target.coords?.z),
+  };
+  if (!Object.values(targetCoords).every(Number.isFinite)) return badRequest(res, 'A current target with finite coordinates is required.');
+  const llmConfig = payload.llm && typeof payload.llm === 'object' ? {
+    enabled: Boolean(payload.llm.enabled),
+    provider: cleanLlmText(payload.llm.provider, 40) || localConfig.llmSearch?.provider,
+    model: cleanLlmText(payload.llm.model, 120) || localConfig.llmSearch?.model,
+    apiKey: cleanLlmText(payload.llm.apiKey, 400) || localConfig.llmSearch?.apiKey,
+    baseUrl: cleanLlmText(payload.llm.baseUrl, 400) || localConfig.llmSearch?.baseUrl,
+  } : { enabled: false };
+
+  const meta = await getMeta();
+  if (!meta) return sendJson(res, { error: 'Systems have not been imported yet.' }, 409);
+  const planResult = await llmSearchPlan(query, llmConfig);
+  const plan = planResult.plan;
+  const nearest = await collectNearestSpatialPoints(targetCoords, plan.scanLimit, plan.radiusLy);
+  const results = [];
+  for (const point of nearest) {
+    const system = await readImportedSystemAtIndex(point.index, meta);
+    if (!system?.id64) continue;
+    const richIndexResult = await richIndexResultById64(system.id64).catch(() => null);
+    if (!richSummaryMatches(richIndexResult?.entry, plan)) continue;
+    const rich = await readRichSystemFromIndexResult(richIndexResult).catch(() => null);
+    if (!rich) continue;
+    const evidence = candidateEvidence(system, rich, plan);
+    if (!evidence.matches) continue;
+    results.push({
+      ...system,
+      source: 'LLM search',
+      matchType: 'llm',
+      distanceLy: point.distance,
+      score: evidence.score - point.distance / 100,
+      evidence: evidence.evidence,
+      confidence: evidence.confidence,
+    });
+    if (results.length >= plan.limit * 3) break;
+  }
+  results.sort((a, b) => b.score - a.score || a.distanceLy - b.distanceLy);
+  const trimmed = results.slice(0, plan.limit);
+  const answer = await summarizeLlmSearch(query, { name: target.name ?? 'Current target', coords: targetCoords }, plan, trimmed, llmConfig);
+  return sendJson(res, {
+    query,
+    target: { name: target.name ?? null, coords: targetCoords },
+    plan,
+    planner: planResult.source,
+    warning: planResult.warning ?? null,
+    answer,
+    count: trimmed.length,
+    results: trimmed,
   });
 }
 
@@ -2291,6 +2784,12 @@ const server = http.createServer(async (req, res) => {
         },
         runtimeConfig: {
           trackedCarrier: localConfig.trackedCarrier,
+          llmSearch: localConfig.llmSearch ? {
+            provider: localConfig.llmSearch.provider,
+            model: localConfig.llmSearch.model,
+            baseUrl: localConfig.llmSearch.baseUrl,
+            hasApiKey: Boolean(localConfig.llmSearch.apiKey),
+          } : null,
         },
         journalPath: journalDir,
       });
@@ -2298,6 +2797,7 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/points') return readPoints(reqUrl, res);
     if (reqUrl.pathname === '/api/local-points') return queryLocalPoints(reqUrl, res);
     if (reqUrl.pathname === '/api/search') return searchSystems(reqUrl, res);
+    if (reqUrl.pathname === '/api/llm-search' && req.method === 'POST') return llmAugmentedSearch(req, res);
     if (reqUrl.pathname === '/api/system') return readSystemDetail(reqUrl, res);
     if (reqUrl.pathname === '/api/system-rich') return readRichSystem(reqUrl, res);
     if (reqUrl.pathname === '/api/notes' && req.method === 'GET') return listSystemNotes(reqUrl, res);

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Elite Dangerous System Search</title>
-    <link rel="stylesheet" href="/styles.css?v=giant-filter-1">
+    <link rel="stylesheet" href="/styles.css?v=llm-search-1">
   </head>
   <body>
     <main class="app">
@@ -21,6 +21,10 @@
             <input id="search" autocomplete="off" spellcheck="false" placeholder="Search the galaxy" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="searchResults">
             <div id="searchResults" class="search-results" role="listbox" hidden></div>
           </div>
+          <button id="llmSearchButton" class="llm-search-trigger" type="button" title="LLM Augmented Search" aria-label="LLM Augmented Search" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z"></path><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16Z"></path></svg>
+            <span>LLM</span>
+          </button>
           <div class="map-toolbar" aria-label="Map tools">
             <button id="refreshJournals" class="icon-button" title="Scan latest journal files" aria-label="Scan latest journal files">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"></path><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"></path></svg>
@@ -42,6 +46,35 @@
               <svg class="panel-open-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M15 3v18M8 9l3 3-3 3"></path></svg>
             </button>
           </div>
+        </div>
+
+        <div id="llmSearchPanel" class="llm-search-panel" hidden>
+          <div class="llm-panel-header">
+            <div>
+              <strong>LLM Augmented Search</strong>
+              <span id="llmSearchProviderLabel">Local keyword planner</span>
+            </div>
+            <button id="llmSearchClose" type="button" aria-label="Close LLM search">×</button>
+          </div>
+          <textarea id="llmSearchPrompt" rows="3" spellcheck="true">Based on the current target, find the nearest systems with icy ring planets, preferably those with tritium hotspots.</textarea>
+          <div class="llm-settings-grid">
+            <label><span>Provider</span><select id="llmProvider">
+              <option value="openai">ChatGPT</option>
+              <option value="anthropic">Claude</option>
+              <option value="kobold">KoboldCPP</option>
+            </select></label>
+            <label><span>Model</span><input id="llmModel" type="text" list="llmModelOptions" placeholder="gpt-5.4-mini"></label>
+            <datalist id="llmModelOptions"></datalist>
+            <label><span>API key</span><input id="llmApiKey" type="password" autocomplete="off" placeholder="Stored in this browser"></label>
+            <label><span>Base URL</span><input id="llmBaseUrl" type="url" placeholder="Default for provider"></label>
+          </div>
+          <div class="llm-panel-actions">
+            <label class="toggle"><input id="llmEnabled" type="checkbox"><span>Use LLM planner and summary</span></label>
+            <button id="llmSearchRun" class="panel-button panel-button-cyan" type="button">Search</button>
+          </div>
+          <div id="llmSearchStatus" class="muted">Configure a provider, or leave LLM off to use the local keyword planner.</div>
+          <div id="llmSearchAnswer" class="llm-search-answer" hidden></div>
+          <div id="llmSearchResults" class="llm-search-results"></div>
         </div>
 
         <div class="nav-pad" aria-label="Navigation controls">
@@ -393,6 +426,6 @@
         </div>
       </aside>
     </main>
-    <script type="module" src="/app.js?v=depth-emphasis-1"></script>
+    <script type="module" src="/app.js?v=llm-search-1"></script>
   </body>
 </html>

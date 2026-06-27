@@ -3,6 +3,7 @@ import { normalizeLocalConfig } from '../local-config.js';
 
 assert.deepEqual(normalizeLocalConfig(), {
   trackedCarrier: null,
+  llmSearch: null,
 });
 
 const configured = normalizeLocalConfig({
@@ -20,6 +21,21 @@ assert.deepEqual(configured.trackedCarrier, {
   callsign: 'ABC-123',
   label: 'EXAMPLE CARRIER [ABC-123]',
   fallbackCoords: { x: 1, y: 2, z: 3 },
+});
+assert.equal(configured.llmSearch, null);
+
+assert.deepEqual(normalizeLocalConfig({
+  llmSearch: {
+    provider: 'kobold',
+    model: 'local',
+    baseUrl: 'http://localhost:5001',
+    apiKey: '',
+  },
+}).llmSearch, {
+  provider: 'kobold',
+  model: 'local',
+  baseUrl: 'http://localhost:5001',
+  apiKey: null,
 });
 
 assert.equal(normalizeLocalConfig({ trackedCarrier: { id: 'not-a-number' } }).trackedCarrier, null);

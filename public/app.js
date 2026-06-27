@@ -12,6 +12,7 @@ const state = {
   placesMeta: null,
   carrierLocation: null,
   trackedCarrier: null,
+  llmSearchDefaults: null,
   notes: [],
   notesMode: 'all',
   activeNoteSystem: null,
@@ -40,6 +41,21 @@ const el = {
   overlay: document.querySelector('#overlay'),
   search: document.querySelector('#search'),
   results: document.querySelector('#searchResults'),
+  llmSearchButton: document.querySelector('#llmSearchButton'),
+  llmSearchPanel: document.querySelector('#llmSearchPanel'),
+  llmSearchClose: document.querySelector('#llmSearchClose'),
+  llmSearchPrompt: document.querySelector('#llmSearchPrompt'),
+  llmSearchRun: document.querySelector('#llmSearchRun'),
+  llmSearchStatus: document.querySelector('#llmSearchStatus'),
+  llmSearchAnswer: document.querySelector('#llmSearchAnswer'),
+  llmSearchResults: document.querySelector('#llmSearchResults'),
+  llmSearchProviderLabel: document.querySelector('#llmSearchProviderLabel'),
+  llmEnabled: document.querySelector('#llmEnabled'),
+  llmProvider: document.querySelector('#llmProvider'),
+  llmModel: document.querySelector('#llmModel'),
+  llmModelOptions: document.querySelector('#llmModelOptions'),
+  llmApiKey: document.querySelector('#llmApiKey'),
+  llmBaseUrl: document.querySelector('#llmBaseUrl'),
   filters: document.querySelector('#filters'),
   filterActions: document.querySelector('#filterActions'),
   starScale: document.querySelector('#starScale'),
@@ -246,6 +262,111 @@ function readViewSettings() {
 function writeViewSettings(patch) {
   const next = { ...readViewSettings(), ...patch };
   localStorage.setItem(viewSettingsKey, JSON.stringify(next));
+}
+
+const llmModelPresets = {
+  openai: [
+    { id: 'gpt-5.5', label: 'GPT-5.5 - highest capability' },
+    { id: 'gpt-5.4', label: 'GPT-5.4 - strong general search' },
+    { id: 'gpt-5.4-mini', label: 'GPT-5.4 mini - balanced default' },
+    { id: 'gpt-5.4-nano', label: 'GPT-5.4 nano - lowest latency/cost' },
+  ],
+  anthropic: [
+    { id: 'claude-fable-5', label: 'Claude Fable 5 - highest capability' },
+    { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 - complex reasoning' },
+    { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 - balanced default' },
+    { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5 - fastest' },
+  ],
+  kobold: [
+    { id: 'local-model', label: 'KoboldCPP local model' },
+  ],
+};
+const legacyDefaultLlmModels = new Set(['gpt-4.1-mini', 'claude-3-5-sonnet-latest']);
+
+function knownLlmModelIds() {
+  return new Set([
+    ...legacyDefaultLlmModels,
+    ...Object.values(llmModelPresets).flatMap((items) => items.map((item) => item.id)),
+  ]);
+}
+
+function defaultLlmModel(provider) {
+  if (provider === 'anthropic') return 'claude-sonnet-4-6';
+  if (provider === 'kobold') return 'local-model';
+  return 'gpt-5.4-mini';
+}
+
+function defaultLlmBaseUrl(provider) {
+  if (provider === 'kobold') return 'http://localhost:5001/v1';
+  return '';
+}
+
+function llmProviderLabel(provider) {
+  if (provider === 'anthropic') return 'Claude';
+  if (provider === 'kobold') return 'KoboldCPP';
+  return 'ChatGPT';
+}
+
+function updateLlmModelOptions(provider) {
+  el.llmModel.placeholder = defaultLlmModel(provider);
+  const options = llmModelPresets[provider] ?? llmModelPresets.openai;
+  el.llmModelOptions.replaceChildren(...options.map((item) => {
+    const option = document.createElement('option');
+    option.value = item.id;
+    option.label = item.label;
+    return option;
+  }));
+}
+
+function readLlmSettings() {
+  const settings = readViewSettings().llmSearch ?? {};
+  const defaults = state.llmSearchDefaults ?? {};
+  const provider = ['openai', 'anthropic', 'kobold'].includes(settings.provider)
+    ? settings.provider
+    : ['openai', 'anthropic', 'kobold'].includes(defaults.provider)
+      ? defaults.provider
+      : 'openai';
+  return {
+    enabled: Boolean(settings.enabled),
+    provider,
+    model: settings.model || defaults.model || defaultLlmModel(provider),
+    apiKey: settings.apiKey || '',
+    baseUrl: settings.baseUrl ?? defaults.baseUrl ?? defaultLlmBaseUrl(provider),
+    serverHasApiKey: Boolean(defaults.hasApiKey),
+  };
+}
+
+function writeLlmSettings(settings) {
+  writeViewSettings({ llmSearch: settings });
+}
+
+function applyLlmSettingsToForm(settings = readLlmSettings()) {
+  el.llmEnabled.checked = Boolean(settings.enabled);
+  el.llmProvider.value = settings.provider;
+  updateLlmModelOptions(settings.provider);
+  el.llmModel.value = settings.model || defaultLlmModel(settings.provider);
+  el.llmApiKey.value = settings.apiKey || '';
+  el.llmBaseUrl.value = settings.baseUrl ?? defaultLlmBaseUrl(settings.provider);
+  el.llmSearchProviderLabel.textContent = settings.enabled
+    ? `${llmProviderLabel(settings.provider)} planner${settings.serverHasApiKey && !settings.apiKey ? ' · config key' : ''}`
+    : 'Local keyword planner';
+}
+
+function llmSettingsFromForm() {
+  return {
+    enabled: el.llmEnabled.checked,
+    provider: el.llmProvider.value,
+    model: el.llmModel.value.trim() || defaultLlmModel(el.llmProvider.value),
+    apiKey: el.llmApiKey.value.trim(),
+    baseUrl: el.llmBaseUrl.value.trim(),
+  };
+}
+
+function persistLlmSettings() {
+  const settings = llmSettingsFromForm();
+  writeLlmSettings(settings);
+  applyLlmSettingsToForm(settings);
+  return settings;
 }
 
 function applyStarScale(percent, persist = false) {
@@ -497,6 +618,7 @@ async function loadStatus() {
   state.latestJournal = data.visited?.latestSystem ?? null;
   state.carrierLocation = data.visited?.carrierLocation ?? null;
   state.trackedCarrier = data.runtimeConfig?.trackedCarrier ?? null;
+  state.llmSearchDefaults = data.runtimeConfig?.llmSearch ?? null;
   state.systemUpdates = data.systemUpdates ?? null;
   state.galaxyDetails = data.galaxyDetails ?? null;
   state.spatialIndex = data.spatialIndex ?? null;
@@ -1823,6 +1945,12 @@ function chooseSearchResult(result) {
   selectSystem(result.index);
 }
 
+function chooseLlmResult(result) {
+  el.llmSearchPanel.hidden = true;
+  el.llmSearchButton.setAttribute('aria-expanded', 'false');
+  chooseSearchResult(result);
+}
+
 function renderSearchResults(results, message = '') {
   state.searchResults = results;
   state.activeSearchIndex = -1;
@@ -1854,7 +1982,7 @@ function renderSearchResults(results, message = '') {
     name.textContent = result.name;
     const badges = document.createElement('span');
     badges.className = 'result-badges';
-    const match = result.matchType === 'startsWith' ? 'Starts' : result.matchType === 'contains' ? 'Contains' : 'Fuzzy';
+    const match = result.matchType === 'llm' ? 'LLM' : result.matchType === 'startsWith' ? 'Starts' : result.matchType === 'contains' ? 'Contains' : 'Fuzzy';
     badges.append(resultBadge(match, 'match'));
     if (result.overridesFilters) badges.append(resultBadge('Filtered', 'filtered'));
     if (result.source) badges.append(resultBadge(result.source, 'source'));
@@ -1870,6 +1998,90 @@ function renderSearchResults(results, message = '') {
   }
   setSearchResultsHidden(false);
   state.renderer.setSearchResults(results, state.meta);
+}
+
+function setLlmSearchOpen(open) {
+  el.llmSearchPanel.hidden = !open;
+  el.llmSearchButton.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) {
+    applyLlmSettingsToForm();
+    if (el.search.value.trim().length > 8 && !el.llmSearchPrompt.value.trim()) {
+      el.llmSearchPrompt.value = el.search.value.trim();
+    }
+    el.llmSearchPrompt.focus();
+  }
+}
+
+function renderLlmResults(data) {
+  el.llmSearchResults.replaceChildren();
+  el.llmSearchAnswer.hidden = !data.answer;
+  el.llmSearchAnswer.textContent = data.answer || '';
+  if (!data.results?.length) {
+    const empty = document.createElement('div');
+    empty.className = 'llm-result';
+    empty.innerHTML = '<strong>No matching systems found</strong><small>Try widening the request or using fewer hard requirements.</small>';
+    el.llmSearchResults.append(empty);
+    state.renderer.setSearchResults([]);
+    return;
+  }
+  state.renderer.setSearchResults(data.results, state.meta);
+  for (const result of data.results) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'llm-result';
+    const evidence = Array.isArray(result.evidence) && result.evidence.length
+      ? `<ul>${result.evidence.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+      : '';
+    button.innerHTML = `
+      <strong>${escapeHtml(result.name)}</strong>
+      <small>${escapeHtml(state.meta.typeNames[result.typeCode] ?? result.mainStar ?? 'Unknown')} · ${fmt(result.distanceLy)} ly from ${escapeHtml(state.focus?.name ?? 'focus')} · ${escapeHtml(result.confidence ?? 'medium')} confidence</small>
+      ${evidence}
+    `;
+    button.addEventListener('click', () => chooseLlmResult(result));
+    el.llmSearchResults.append(button);
+  }
+}
+
+async function runLlmSearch() {
+  const query = el.llmSearchPrompt.value.trim();
+  if (query.length < 8) {
+    el.llmSearchStatus.textContent = 'Enter a longer natural-language search.';
+    return;
+  }
+  const llm = persistLlmSettings();
+  el.llmSearchRun.disabled = true;
+  el.llmSearchStatus.textContent = llm.enabled
+    ? `Asking ${llmProviderLabel(llm.provider)} for a search plan...`
+    : 'Using local keyword planner...';
+  el.llmSearchAnswer.hidden = true;
+  el.llmSearchResults.replaceChildren();
+  try {
+    const response = await api('/api/llm-search', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        target: state.focus,
+        llm,
+      }),
+    });
+    const data = await response.json();
+    const planner = data.planner === 'heuristic' ? 'local keyword planner' : llmProviderLabel(llm.provider);
+    const filterText = [
+      data.plan?.filters?.ringTypes?.length ? `rings: ${data.plan.filters.ringTypes.join(', ')}` : '',
+      data.plan?.filters?.requireSignals ? 'signals required' : '',
+      data.plan?.keywords?.length ? `keywords: ${data.plan.keywords.join(', ')}` : '',
+    ].filter(Boolean).join(' · ');
+    el.llmSearchStatus.textContent = `${fmt(data.count)} result${data.count === 1 ? '' : 's'} · ${planner}${filterText ? ` · ${filterText}` : ''}`;
+    if (data.warning) el.llmSearchStatus.textContent += ` · ${data.warning}`;
+    renderLlmResults(data);
+  } catch (error) {
+    console.error(error);
+    el.llmSearchStatus.textContent = `LLM search failed: ${error.message}`;
+    state.renderer.setSearchResults([]);
+  } finally {
+    el.llmSearchRun.disabled = false;
+  }
 }
 
 async function search() {
@@ -1910,6 +2122,30 @@ function bindControls() {
   el.search.addEventListener('input', () => {
     clearTimeout(state.searchTimer);
     state.searchTimer = setTimeout(search, 180);
+  });
+  el.llmSearchButton.addEventListener('click', () => setLlmSearchOpen(el.llmSearchPanel.hidden));
+  el.llmSearchClose.addEventListener('click', () => setLlmSearchOpen(false));
+  el.llmSearchRun.addEventListener('click', () => runLlmSearch());
+  el.llmProvider.addEventListener('change', () => {
+    const provider = el.llmProvider.value;
+    const currentModel = el.llmModel.value.trim();
+    updateLlmModelOptions(provider);
+    if (!currentModel || knownLlmModelIds().has(currentModel)) {
+      el.llmModel.value = defaultLlmModel(provider);
+    }
+    if (!el.llmBaseUrl.value.trim() || el.llmBaseUrl.value.trim() === 'http://localhost:5001/v1') {
+      el.llmBaseUrl.value = defaultLlmBaseUrl(provider);
+    }
+    persistLlmSettings();
+  });
+  for (const input of [el.llmEnabled, el.llmModel, el.llmApiKey, el.llmBaseUrl]) {
+    input.addEventListener('change', persistLlmSettings);
+  }
+  el.llmSearchPrompt.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      runLlmSearch();
+    }
   });
   el.search.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
@@ -1986,6 +2222,7 @@ function bindControls() {
   }
   window.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !el.noteMenu.hidden) closeNoteMenu();
+    else if (event.key === 'Escape' && !el.llmSearchPanel.hidden) setLlmSearchOpen(false);
   });
   el.recenterFocus.addEventListener('click', recenterFocus);
   el.returnLatestJournal.addEventListener('click', returnToLatestJournal);
@@ -2077,11 +2314,13 @@ async function init() {
       ? migratedStarScale
       : 200, false);
   setStarScaleAuto(viewSettings.starScaleAuto ?? true, false);
+  applyLlmSettingsToForm(readLlmSettings());
   setPoiMode(poiModeFromSettings(viewSettings), false);
   setNotesMode(viewSettings.notesMode, false);
   bindControls();
   const ready = await loadStatus();
   if (!ready) return;
+  applyLlmSettingsToForm(readLlmSettings());
   updateLandmarks();
   resumeJournalScanIfRunning();
   resumeSystemUpdateIfRunning();

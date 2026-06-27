@@ -19,6 +19,21 @@ function cleanCoords(value) {
   return Object.values(coords).every(Number.isFinite) ? coords : null;
 }
 
+function cleanLlmSearch(value) {
+  if (!value || typeof value !== 'object') return null;
+  const provider = ['openai', 'anthropic', 'kobold'].includes(value.provider) ? value.provider : null;
+  const model = cleanString(value.model);
+  const baseUrl = cleanString(value.baseUrl);
+  const apiKey = cleanString(value.apiKey);
+  if (!provider && !model && !baseUrl && !apiKey) return null;
+  return {
+    provider: provider ?? 'openai',
+    model,
+    baseUrl,
+    apiKey,
+  };
+}
+
 export function normalizeLocalConfig(value = {}) {
   const carrierValue = value.trackedCarrier && typeof value.trackedCarrier === 'object'
     ? value.trackedCarrier
@@ -37,6 +52,7 @@ export function normalizeLocalConfig(value = {}) {
 
   return {
     trackedCarrier,
+    llmSearch: cleanLlmSearch(value.llmSearch),
   };
 }
 
