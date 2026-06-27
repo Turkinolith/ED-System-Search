@@ -2794,23 +2794,23 @@ const server = http.createServer(async (req, res) => {
         journalPath: journalDir,
       });
     }
-    if (reqUrl.pathname === '/api/points') return readPoints(reqUrl, res);
-    if (reqUrl.pathname === '/api/local-points') return queryLocalPoints(reqUrl, res);
-    if (reqUrl.pathname === '/api/search') return searchSystems(reqUrl, res);
-    if (reqUrl.pathname === '/api/llm-search' && req.method === 'POST') return llmAugmentedSearch(req, res);
-    if (reqUrl.pathname === '/api/system') return readSystemDetail(reqUrl, res);
-    if (reqUrl.pathname === '/api/system-rich') return readRichSystem(reqUrl, res);
-    if (reqUrl.pathname === '/api/notes' && req.method === 'GET') return listSystemNotes(reqUrl, res);
-    if (reqUrl.pathname === '/api/notes' && req.method === 'POST') return saveSystemNote(req, res);
+    if (reqUrl.pathname === '/api/points') return await readPoints(reqUrl, res);
+    if (reqUrl.pathname === '/api/local-points') return await queryLocalPoints(reqUrl, res);
+    if (reqUrl.pathname === '/api/search') return await searchSystems(reqUrl, res);
+    if (reqUrl.pathname === '/api/llm-search' && req.method === 'POST') return await llmAugmentedSearch(req, res);
+    if (reqUrl.pathname === '/api/system') return await readSystemDetail(reqUrl, res);
+    if (reqUrl.pathname === '/api/system-rich') return await readRichSystem(reqUrl, res);
+    if (reqUrl.pathname === '/api/notes' && req.method === 'GET') return await listSystemNotes(reqUrl, res);
+    if (reqUrl.pathname === '/api/notes' && req.method === 'POST') return await saveSystemNote(req, res);
     if (reqUrl.pathname === '/api/places') return sendJson(res, await getPlaces());
     if (reqUrl.pathname === '/api/murder-binaries') return queryMurderBinaries(reqUrl, res);
     if (reqUrl.pathname === '/api/discoveries') return sendJson(res, await getDiscoveries() ?? { imported: false, places: [] });
     if (reqUrl.pathname === '/api/visited') return sendJson(res, await getVisited());
     if (reqUrl.pathname === '/api/journal-scan-status') return sendJson(res, journalScanStatus);
-    if (reqUrl.pathname === '/api/refresh-journals' && req.method === 'POST') return runJournalRefresh(reqUrl, res);
+    if (reqUrl.pathname === '/api/refresh-journals' && req.method === 'POST') return await runJournalRefresh(reqUrl, res);
     if (reqUrl.pathname === '/api/system-update-status') return sendJson(res, { ...systemUpdateStatus, log: await getSystemUpdateLog() });
-    if (reqUrl.pathname === '/api/system-update' && req.method === 'POST') return runSystemUpdate(reqUrl, res);
-    return serveStatic(reqUrl, res);
+    if (reqUrl.pathname === '/api/system-update' && req.method === 'POST') return await runSystemUpdate(reqUrl, res);
+    return await serveStatic(reqUrl, res);
   } catch (error) {
     console.error(error);
     sendJson(res, { error: error.message }, 500);

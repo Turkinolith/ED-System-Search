@@ -65,17 +65,19 @@
             </select></label>
             <label><span>Model</span><input id="llmModel" type="text" list="llmModelOptions" placeholder="gpt-5.4-mini"></label>
             <datalist id="llmModelOptions"></datalist>
-            <label><span>API key</span><input id="llmApiKey" type="password" autocomplete="off" placeholder="Stored in this browser"></label>
-            <label><span>Base URL</span><input id="llmBaseUrl" type="url" placeholder="Default for provider"></label>
+            <label><span>API key</span><input id="llmApiKey" type="password" autocomplete="off" placeholder="Stored in this browser"><small id="llmApiKeyHint"></small></label>
+            <label><span>Base URL</span><input id="llmBaseUrl" type="url" placeholder="Default for provider"><small id="llmBaseUrlHint"></small></label>
           </div>
           <div class="llm-panel-actions">
-            <label class="toggle"><input id="llmEnabled" type="checkbox"><span>Use LLM planner and summary</span></label>
+            <label class="toggle llm-mode-toggle"><input id="llmEnabled" type="checkbox"><span>Use LLM planner and summary<small id="llmModeHint">Off uses the local keyword planner only.</small></span></label>
             <button id="llmSearchRun" class="panel-button panel-button-cyan" type="button">Search</button>
           </div>
           <div id="llmSearchStatus" class="muted">Configure a provider, or leave LLM off to use the local keyword planner.</div>
           <div id="llmSearchAnswer" class="llm-search-answer" hidden></div>
           <div id="llmSearchResults" class="llm-search-results"></div>
         </div>
+
+        <div id="clientToast" class="client-toast" role="alert" aria-live="assertive" hidden></div>
 
         <div class="nav-pad" aria-label="Navigation controls">
           <button data-move="up" title="Move up" aria-label="Move up">

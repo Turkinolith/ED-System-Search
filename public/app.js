@@ -55,7 +55,11 @@ const el = {
   llmModel: document.querySelector('#llmModel'),
   llmModelOptions: document.querySelector('#llmModelOptions'),
   llmApiKey: document.querySelector('#llmApiKey'),
+  llmApiKeyHint: document.querySelector('#llmApiKeyHint'),
   llmBaseUrl: document.querySelector('#llmBaseUrl'),
+  llmBaseUrlHint: document.querySelector('#llmBaseUrlHint'),
+  llmModeHint: document.querySelector('#llmModeHint'),
+  clientToast: document.querySelector('#clientToast'),
   filters: document.querySelector('#filters'),
   filterActions: document.querySelector('#filterActions'),
   starScale: document.querySelector('#starScale'),
@@ -150,6 +154,7 @@ let localPointsRefreshTimer = null;
 let localPointsRequestId = 0;
 let starScaleFrame = null;
 let tooltipOwner = null;
+let clientToastTimer = null;
 const tooltipCacheLimit = 180;
 const tooltipCacheTtlMs = 5 * 60 * 1000;
 const tooltipFetchDelayMs = 120;
@@ -251,6 +256,16 @@ function setStatus(message, title = message) {
   el.status.title = title;
 }
 
+function showClientToast(message, timeoutMs = 9000) {
+  if (!el.clientToast) return;
+  clearTimeout(clientToastTimer);
+  el.clientToast.textContent = message;
+  el.clientToast.hidden = false;
+  clientToastTimer = setTimeout(() => {
+    el.clientToast.hidden = true;
+  }, timeoutMs);
+}
+
 function readViewSettings() {
   try {
     return JSON.parse(localStorage.getItem(viewSettingsKey) ?? '{}');
@@ -281,14 +296,7 @@ const llmModelPresets = {
     { id: 'local-model', label: 'KoboldCPP local model' },
   ],
 };
-const legacyDefaultLlmModels = new Set(['gpt-4.1-mini', 'claude-3-5-sonnet-latest']);
-
-function knownLlmModelIds() {
-  return new Set([
-    ...legacyDefaultLlmModels,
-    ...Object.values(llmModelPresets).flatMap((items) => items.map((item) => item.id)),
-  ]);
-}
+const llmProviders = ['openai', 'anthropic', 'kobold'];
 
 function defaultLlmModel(provider) {
   if (provider === 'anthropic') return 'claude-sonnet-4-6';
@@ -301,10 +309,26 @@ function defaultLlmBaseUrl(provider) {
   return '';
 }
 
+function llmBaseUrlPlaceholder(provider) {
+  if (provider === 'anthropic') return 'https://api.anthropic.com';
+  if (provider === 'kobold') return 'http://localhost:5001/v1';
+  return 'https://api.openai.com/v1';
+}
+
 function llmProviderLabel(provider) {
   if (provider === 'anthropic') return 'Claude';
   if (provider === 'kobold') return 'KoboldCPP';
   return 'ChatGPT';
+}
+
+function llmApiKeyHint(provider) {
+  if (provider === 'kobold') return 'Usually blank unless your local endpoint requires a token.';
+  return `${llmProviderLabel(provider)} uses its own API key. Keys are stored separately in this browser.`;
+}
+
+function llmBaseUrlHint(provider) {
+  if (provider === 'kobold') return 'Your local OpenAI-compatible KoboldCPP endpoint.';
+  return `Leave blank for ${llmProviderLabel(provider)}'s official API. Set only for a proxy, gateway, or compatible custom endpoint.`;
 }
 
 function updateLlmModelOptions(provider) {
@@ -318,21 +342,32 @@ function updateLlmModelOptions(provider) {
   }));
 }
 
+function llmProviderConfigFrom(settings, defaults, provider) {
+  const configured = settings.providers?.[provider] ?? {};
+  const legacyConfigured = settings.provider === provider ? settings : {};
+  const serverDefaults = defaults?.provider === provider ? defaults : {};
+  return {
+    model: configured.model || legacyConfigured.model || serverDefaults.model || defaultLlmModel(provider),
+    apiKey: configured.apiKey ?? legacyConfigured.apiKey ?? '',
+    baseUrl: configured.baseUrl ?? legacyConfigured.baseUrl ?? serverDefaults.baseUrl ?? defaultLlmBaseUrl(provider),
+    serverHasApiKey: Boolean(serverDefaults.hasApiKey),
+  };
+}
+
 function readLlmSettings() {
   const settings = readViewSettings().llmSearch ?? {};
   const defaults = state.llmSearchDefaults ?? {};
-  const provider = ['openai', 'anthropic', 'kobold'].includes(settings.provider)
+  const provider = llmProviders.includes(settings.provider)
     ? settings.provider
-    : ['openai', 'anthropic', 'kobold'].includes(defaults.provider)
+    : llmProviders.includes(defaults.provider)
       ? defaults.provider
       : 'openai';
+  const providerConfig = llmProviderConfigFrom(settings, defaults, provider);
   return {
     enabled: Boolean(settings.enabled),
     provider,
-    model: settings.model || defaults.model || defaultLlmModel(provider),
-    apiKey: settings.apiKey || '',
-    baseUrl: settings.baseUrl ?? defaults.baseUrl ?? defaultLlmBaseUrl(provider),
-    serverHasApiKey: Boolean(defaults.hasApiKey),
+    providers: settings.providers ?? {},
+    ...providerConfig,
   };
 }
 
@@ -346,19 +381,40 @@ function applyLlmSettingsToForm(settings = readLlmSettings()) {
   updateLlmModelOptions(settings.provider);
   el.llmModel.value = settings.model || defaultLlmModel(settings.provider);
   el.llmApiKey.value = settings.apiKey || '';
+  el.llmApiKey.placeholder = settings.provider === 'kobold' ? 'Optional token' : `${llmProviderLabel(settings.provider)} API key`;
+  el.llmApiKeyHint.textContent = llmApiKeyHint(settings.provider);
   el.llmBaseUrl.value = settings.baseUrl ?? defaultLlmBaseUrl(settings.provider);
+  el.llmBaseUrl.placeholder = llmBaseUrlPlaceholder(settings.provider);
+  el.llmBaseUrlHint.textContent = llmBaseUrlHint(settings.provider);
+  el.llmModeHint.textContent = settings.enabled
+    ? 'On asks the selected model to plan filters and write a short summary.'
+    : 'Off uses the local keyword planner only; no provider request is sent.';
   el.llmSearchProviderLabel.textContent = settings.enabled
     ? `${llmProviderLabel(settings.provider)} planner${settings.serverHasApiKey && !settings.apiKey ? ' · config key' : ''}`
     : 'Local keyword planner';
 }
 
 function llmSettingsFromForm() {
-  return {
-    enabled: el.llmEnabled.checked,
-    provider: el.llmProvider.value,
-    model: el.llmModel.value.trim() || defaultLlmModel(el.llmProvider.value),
+  const existing = readViewSettings().llmSearch ?? {};
+  const provider = llmProviders.includes(el.llmProvider.value) ? el.llmProvider.value : 'openai';
+  return llmSettingsWithProviderFromForm(provider, existing);
+}
+
+function llmSettingsWithProviderFromForm(provider, existing = readViewSettings().llmSearch ?? {}) {
+  const providerConfig = {
+    model: el.llmModel.value.trim() || defaultLlmModel(provider),
     apiKey: el.llmApiKey.value.trim(),
     baseUrl: el.llmBaseUrl.value.trim(),
+  };
+  const providers = {
+    ...(existing.providers ?? {}),
+    [provider]: providerConfig,
+  };
+  return {
+    enabled: el.llmEnabled.checked,
+    provider,
+    providers,
+    ...providerConfig,
   };
 }
 
@@ -2077,7 +2133,9 @@ async function runLlmSearch() {
     renderLlmResults(data);
   } catch (error) {
     console.error(error);
-    el.llmSearchStatus.textContent = `LLM search failed: ${error.message}`;
+    const message = `LLM search failed: ${error.message}`;
+    el.llmSearchStatus.textContent = message;
+    showClientToast(message);
     state.renderer.setSearchResults([]);
   } finally {
     el.llmSearchRun.disabled = false;
@@ -2126,17 +2184,19 @@ function bindControls() {
   el.llmSearchButton.addEventListener('click', () => setLlmSearchOpen(el.llmSearchPanel.hidden));
   el.llmSearchClose.addEventListener('click', () => setLlmSearchOpen(false));
   el.llmSearchRun.addEventListener('click', () => runLlmSearch());
+  el.llmProvider.addEventListener('focus', () => {
+    el.llmProvider.dataset.previousProvider = el.llmProvider.value;
+  });
   el.llmProvider.addEventListener('change', () => {
-    const provider = el.llmProvider.value;
-    const currentModel = el.llmModel.value.trim();
-    updateLlmModelOptions(provider);
-    if (!currentModel || knownLlmModelIds().has(currentModel)) {
-      el.llmModel.value = defaultLlmModel(provider);
-    }
-    if (!el.llmBaseUrl.value.trim() || el.llmBaseUrl.value.trim() === 'http://localhost:5001/v1') {
-      el.llmBaseUrl.value = defaultLlmBaseUrl(provider);
-    }
-    persistLlmSettings();
+    const previousProvider = llmProviders.includes(el.llmProvider.dataset.previousProvider)
+      ? el.llmProvider.dataset.previousProvider
+      : readLlmSettings().provider;
+    const provider = llmProviders.includes(el.llmProvider.value) ? el.llmProvider.value : 'openai';
+    const currentSettings = llmSettingsWithProviderFromForm(previousProvider);
+    currentSettings.provider = provider;
+    writeLlmSettings(currentSettings);
+    applyLlmSettingsToForm(readLlmSettings());
+    el.llmProvider.dataset.previousProvider = provider;
   });
   for (const input of [el.llmEnabled, el.llmModel, el.llmApiKey, el.llmBaseUrl]) {
     input.addEventListener('change', persistLlmSettings);
