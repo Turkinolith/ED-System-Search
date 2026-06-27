@@ -296,6 +296,21 @@ export function gridDepthEmphasis(height, step) {
   };
 }
 
+export function dropLineAnchorRange(points, target) {
+  if (!Array.isArray(points) || points.length === 0 || !Array.isArray(target)) return 0;
+  return points.reduce((max, point) => Math.max(
+    max,
+    Math.hypot(point.x - target[0], point.y - target[1], point.z - target[2]),
+  ), 0);
+}
+
+export function formatDistanceBadge(value) {
+  const distance = Number(value);
+  if (!Number.isFinite(distance) || distance <= 0) return '0';
+  if (distance < 100) return distance.toFixed(1);
+  return Math.round(distance).toLocaleString();
+}
+
 export function visitedBraceGeometry(radius = 9) {
   const height = radius;
   const inner = radius * 0.72;
@@ -939,6 +954,7 @@ export class GalaxyRenderer {
     const grid = this.showGrid ? this.drawGrid() : this.gridSpec();
     this.labeledPlaceNames.clear();
     if (this.showDropLines) this.drawDropLines(grid);
+    this.drawGridIndicators(grid);
     if (this.showCarrierRange) this.drawCarrierRange();
     const drawList = this.overlayMarkers()
       .sort((a, b) => a.distance - b.distance)
@@ -1388,19 +1404,45 @@ export class GalaxyRenderer {
       this.drawWorldLine({ x: grid.minX, y: grid.y, z }, { x: grid.maxX, y: grid.y, z });
     }
 
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = 'rgba(4, 10, 14, 0.9)';
-    ctx.strokeStyle = 'rgba(72, 220, 230, 0.5)';
-    ctx.lineWidth = 1;
-    roundedRect(ctx, clip.x + 10, clip.y + 10, 92, 24, 4);
-    ctx.fill();
-    ctx.stroke();
-    ctx.fillStyle = 'rgba(184, 210, 219, 0.86)';
-    ctx.font = '600 11px Segoe UI, sans-serif';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(`${grid.step.toLocaleString()} ly grid`, clip.x + 20, clip.y + 22);
     ctx.restore();
     return grid;
+  }
+
+  drawGridIndicators(grid) {
+    const clip = this.centerClipRect();
+    let y = clip.y + 10;
+    if (this.showGrid) {
+      this.drawMapBadge(`${grid.step.toLocaleString()} ly grid`, clip.x + 10, y, {
+        stroke: 'rgba(72, 220, 230, 0.5)',
+        text: 'rgba(184, 210, 219, 0.86)',
+      });
+      y += 28;
+    }
+    if (this.showDropLines && this.gridAnchorPoints.length > 0) {
+      const range = dropLineAnchorRange(this.gridAnchorPoints, this.target);
+      this.drawMapBadge(`Drop lines max ${formatDistanceBadge(range)} ly`, clip.x + 10, y, {
+        stroke: 'rgba(99, 231, 235, 0.5)',
+        text: 'rgba(199, 244, 245, 0.9)',
+      });
+    }
+  }
+
+  drawMapBadge(text, x, y, options = {}) {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.shadowBlur = 0;
+    ctx.font = '600 11px Segoe UI, sans-serif';
+    ctx.textBaseline = 'middle';
+    const width = Math.ceil(ctx.measureText(text).width) + 20;
+    ctx.fillStyle = options.fill ?? 'rgba(4, 10, 14, 0.9)';
+    ctx.strokeStyle = options.stroke ?? 'rgba(72, 220, 230, 0.5)';
+    ctx.lineWidth = 1;
+    roundedRect(ctx, x, y, Math.max(64, width), 24, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = options.text ?? 'rgba(184, 210, 219, 0.86)';
+    ctx.fillText(text, x + 10, y + 12);
+    ctx.restore();
   }
 
   drawGridPlaneFill(grid) {

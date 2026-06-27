@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { densityPriorityFraction, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
+import { densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
 
 const o = starVisual('O (Blue-White) Star');
 const a = starVisual('A (Blue-White) Star');
@@ -62,5 +62,14 @@ assert.ok(onGrid.size > 1, 'Stars on the grid plane should receive a modest size
 assert.equal(bandEdge.alpha, 1, 'Stars inside two grid cells should retain full opacity.');
 assert.ok(farOffGrid.alpha <= 0.23 && farOffGrid.size < 0.8, 'Stars beyond eight grid cells should recede strongly.');
 assert.deepEqual(gridDepthEmphasis(-40, 5), farOffGrid, 'Depth emphasis should be symmetric above and below the grid.');
+
+const dropLineRange = dropLineAnchorRange([
+  { x: 3, y: 4, z: 0 },
+  { x: -6, y: 0, z: 8 },
+  { x: 1, y: 1, z: 1 },
+], [0, 0, 0]);
+assert.equal(dropLineRange, 10, 'Drop-line range should describe the farthest active anchor.');
+assert.equal(formatDistanceBadge(14.74), '14.7', 'Drop-line badges should keep local ranges compact but readable.');
+assert.equal(formatDistanceBadge(1234.4), '1,234', 'Drop-line badges should group large distances.');
 
 console.log('Star visual profile test passed.');
