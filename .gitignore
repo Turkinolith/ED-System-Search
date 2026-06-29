@@ -7,6 +7,10 @@ data/*
 *.csv.gz
 systemsWithCoordinates.json.gz
 
+# Local region-map source inputs
+regionID_numsort.csv
+regionMAP.csv
+
 # Native and JavaScript build output
 native/ed-data-importer/target/
 node_modules/

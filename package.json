@@ -34,6 +34,7 @@
     "import:suggestions": "node scripts/import-suggestions.js",
     "import:places": "node scripts/import-places.js",
     "import:discoveries": "node scripts/import-discoveries.js",
+    "import:regions": "node scripts/import-region-vectors.js",
     "refresh:journals": "node scripts/import-journals.js"
   }
 }

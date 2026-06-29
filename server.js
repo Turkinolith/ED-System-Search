@@ -30,6 +30,7 @@ const murderBinariesMetaPath = path.join(dataDir, 'murder-binaries-meta.json');
 const murderBinariesDataPath = path.join(dataDir, 'murder-binaries.bin');
 const murderBinariesNamesPath = path.join(dataDir, 'murder-binaries-names.txt');
 const notesPath = path.join(dataDir, 'system-notes.json');
+const regionMapPath = path.join(dataDir, 'region-map-vectors.json');
 const systemUpdateLogPath = path.join(dataDir, 'system-update-log.json');
 const updatesPath = path.join(dataDir, 'systems-updates.u32');
 const updatesMetaPath = path.join(dataDir, 'systems-updates-meta.json');
@@ -2735,6 +2736,22 @@ async function runSystemUpdate(reqUrl, res) {
   return sendJson(res, { started: true, update: systemUpdateStatus }, 202);
 }
 
+async function serveRegionMap(res) {
+  if (!existsSync(regionMapPath)) {
+    return sendJson(res, {
+      imported: false,
+      error: 'Region vector map is not built. Run npm run import:regions after adding regionID_numsort.csv and regionMAP.csv.',
+    }, 409);
+  }
+  const stat = await fs.stat(regionMapPath);
+  if (!stat.isFile()) return notFound(res);
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+  return createReadStream(regionMapPath).pipe(res);
+}
+
 async function serveStatic(reqUrl, res) {
   const decoded = decodeURIComponent(reqUrl.pathname === '/' ? '/index.html' : reqUrl.pathname);
   const requested = path.normalize(decoded).replace(/^(\.\.[/\\])+/, '');
@@ -2803,6 +2820,7 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/notes' && req.method === 'GET') return await listSystemNotes(reqUrl, res);
     if (reqUrl.pathname === '/api/notes' && req.method === 'POST') return await saveSystemNote(req, res);
     if (reqUrl.pathname === '/api/places') return sendJson(res, await getPlaces());
+    if (reqUrl.pathname === '/api/regions') return await serveRegionMap(res);
     if (reqUrl.pathname === '/api/murder-binaries') return queryMurderBinaries(reqUrl, res);
     if (reqUrl.pathname === '/api/discoveries') return sendJson(res, await getDiscoveries() ?? { imported: false, places: [] });
     if (reqUrl.pathname === '/api/visited') return sendJson(res, await getVisited());

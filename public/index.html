@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Elite Dangerous System Search</title>
-    <link rel="stylesheet" href="/styles.css?v=llm-search-1">
+    <link rel="stylesheet" href="/styles.css?v=region-map-1">
   </head>
   <body>
     <main class="app">
@@ -196,6 +196,7 @@
                 <label class="toggle" title="Emphasize stars near the current grid plane"><input id="depthEmphasisToggle" type="checkbox" checked><span>Depth emphasis</span></label>
                 <label class="toggle"><input id="gridToggle" type="checkbox" checked><span>Grid plane</span></label>
                 <label class="toggle"><input id="dropLinesToggle" type="checkbox" checked><span>Drop lines</span></label>
+                <label class="toggle" title="Show Elite-style indexed region lines at galaxy-scale zoom"><input id="sectorMapToggle" type="checkbox"><span>Sector map</span></label>
                 <label class="toggle"><input id="landmarksToggle" type="checkbox" checked><span>Landmarks</span></label>
                 <label class="toggle"><input id="carrierRangeToggle" type="checkbox"><span>Carrier range</span></label>
                 <label class="toggle" title="Highlight systems with a secondary star 5-12 light-seconds from arrival"><input id="murderBinariesToggle" type="checkbox" disabled><span>Murder binaries</span></label>
@@ -428,6 +429,6 @@
         </div>
       </aside>
     </main>
-    <script type="module" src="/app.js?v=llm-search-1"></script>
+    <script type="module" src="/app.js?v=region-map-perf-1"></script>
   </body>
 </html>

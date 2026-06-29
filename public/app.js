@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=depth-emphasis-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=region-map-perf-1';
 
 const state = {
   meta: null,
@@ -76,6 +76,7 @@ const el = {
   depthEmphasisToggle: document.querySelector('#depthEmphasisToggle'),
   gridToggle: document.querySelector('#gridToggle'),
   dropLinesToggle: document.querySelector('#dropLinesToggle'),
+  sectorMapToggle: document.querySelector('#sectorMapToggle'),
   landmarksToggle: document.querySelector('#landmarksToggle'),
   carrierRangeToggle: document.querySelector('#carrierRangeToggle'),
   murderBinariesToggle: document.querySelector('#murderBinariesToggle'),
@@ -2247,6 +2248,10 @@ function bindControls() {
     state.renderer.showDropLines = el.dropLinesToggle.checked;
     writeViewSettings({ showDropLines: el.dropLinesToggle.checked });
   });
+  el.sectorMapToggle.addEventListener('change', () => {
+    state.renderer.showSectorMap = el.sectorMapToggle.checked;
+    writeViewSettings({ showSectorMap: el.sectorMapToggle.checked });
+  });
   el.landmarksToggle.addEventListener('change', () => {
     state.renderer.showLandmarks = el.landmarksToggle.checked;
     writeViewSettings({ showLandmarks: el.landmarksToggle.checked });
@@ -2353,6 +2358,7 @@ async function init() {
   el.depthEmphasisToggle.checked = viewSettings.showDepthEmphasis ?? true;
   el.gridToggle.checked = viewSettings.showGrid ?? true;
   el.dropLinesToggle.checked = viewSettings.showDropLines ?? true;
+  el.sectorMapToggle.checked = viewSettings.showSectorMap ?? false;
   el.landmarksToggle.checked = viewSettings.showLandmarks ?? true;
   el.carrierRangeToggle.checked = viewSettings.showCarrierRange ?? false;
   const savedMurderCategory = Array.isArray(viewSettings.placeCategories)
@@ -2362,6 +2368,7 @@ async function init() {
   state.renderer.setDepthEmphasis(el.depthEmphasisToggle.checked);
   state.renderer.showGrid = el.gridToggle.checked;
   state.renderer.showDropLines = el.dropLinesToggle.checked;
+  state.renderer.showSectorMap = el.sectorMapToggle.checked;
   state.renderer.showLandmarks = el.landmarksToggle.checked;
   state.renderer.showCarrierRange = el.carrierRangeToggle.checked;
   state.renderer.showMurderBinaries = el.murderBinariesToggle.checked;
