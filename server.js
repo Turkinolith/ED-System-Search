@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, promises as fs } from 'node:fs';
+import { closeSync, createReadStream, existsSync, openSync, promises as fs, readSync } from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -912,17 +912,17 @@ async function collectNearestSpatialPoints(center, limit, maximumRadius) {
       const first = spatialIndexLowerBound(index, spatialCellKey(cellX, cellY, cellZMin));
       const last = spatialIndexLowerBound(index, spatialCellKey(cellX, cellY, cellZMax) + 1n);
       for (let cellIndex = first; cellIndex < last; cellIndex += 1) {
-        const indexOffset = spatialHeaderBytes + cellIndex * spatialIndexRecordBytes;
-        const key = index.buffer.readBigUInt64LE(indexOffset);
-        const cellZ = Number(key & spatialCellMask) - spatialCellBias;
+        const indexRecord = readSpatialIndexRecord(index, cellIndex);
+        if (!indexRecord) continue;
+        const cellZ = Number(indexRecord.key & spatialCellMask) - spatialCellBias;
         const dx = distanceToCellAxis(x, cellX, cellSize);
         const dy = distanceToCellAxis(y, cellY, cellSize);
         const dz = distanceToCellAxis(z, cellZ, cellSize);
         const minimumDistanceSq = dx * dx + dy * dy + dz * dz;
         if (minimumDistanceSq > radius * radius) continue;
         cells.push({
-          offset: Number(index.buffer.readBigUInt64LE(indexOffset + 8)),
-          count: index.buffer.readUInt32LE(indexOffset + 16),
+          offset: indexRecord.offset,
+          count: indexRecord.count,
           minimumDistanceSq,
         });
       }
@@ -1207,31 +1207,27 @@ async function getUpdateIndex() {
   const stat = existsSync(updatesPath) ? await fs.stat(updatesPath) : null;
   if (!stat) return null;
   if (!updateIndexCache || updateIndexCache.mtimeMs !== stat.mtimeMs) {
-    const buffer = await fs.readFile(updatesPath);
+    closeCachedFd(updateIndexCache);
     updateIndexCache = {
       mtimeMs: stat.mtimeMs,
-      view: new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength),
+      fd: openSync(updatesPath, 'r'),
+      count: Math.floor(stat.size / 4),
+      size: stat.size,
+      headerBytes: 0,
+      pages: new Map(),
     };
   }
-  return updateIndexCache.view;
+  return updateIndexCache;
 }
 
-function updateSecondsAt(view, index) {
-  if (!view || index < 0 || index * 4 + 4 > view.byteLength) return unknownUpdateSeconds;
-  return view.getUint32(index * 4, true);
+function updateSecondsAt(indexCache, index) {
+  const record = readPagedRecord(indexCache, index, 4, updateIndexPageRecords);
+  if (!record || record.length < 4) return unknownUpdateSeconds;
+  return record.readUInt32LE(0);
 }
 
 async function readUpdateSecondsAt(index) {
-  if (!existsSync(updatesPath)) return unknownUpdateSeconds;
-  const fd = await fs.open(updatesPath, 'r');
-  const buffer = Buffer.allocUnsafe(4);
-  try {
-    const { bytesRead } = await fd.read(buffer, 0, 4, index * 4);
-    if (bytesRead !== 4) return unknownUpdateSeconds;
-    return buffer.readUInt32LE(0);
-  } finally {
-    await fd.close();
-  }
+  return updateSecondsAt(await getUpdateIndex(), index);
 }
 
 function updateRange(reqUrl) {
@@ -1448,6 +1444,44 @@ const spatialIndexRecordBytes = 24;
 const spatialPointBytes = 20;
 const spatialCellBias = 1 << 20;
 const spatialCellMask = (1n << 21n) - 1n;
+const spatialIndexPageRecords = 65536;
+const updateIndexPageRecords = 1 << 20;
+const maxIndexPages = 16;
+
+function closeCachedFd(cache) {
+  if (!cache?.fd) return;
+  try {
+    closeSync(cache.fd);
+  } catch {
+    // Ignore close errors during cache replacement.
+  }
+}
+
+function readPagedRecord(cache, recordIndex, recordBytes, pageRecords) {
+  if (!cache || recordIndex < 0 || recordIndex >= cache.count) return null;
+  const pageIndex = Math.floor(recordIndex / pageRecords);
+  const pageRecordStart = pageIndex * pageRecords;
+  const pageByteStart = cache.headerBytes + pageRecordStart * recordBytes;
+  const maxBytes = Math.min(pageRecords * recordBytes, cache.size - pageByteStart);
+  if (maxBytes <= 0) return null;
+  let page = cache.pages.get(pageIndex);
+  if (!page) {
+    const buffer = Buffer.allocUnsafe(maxBytes);
+    const bytesRead = readSync(cache.fd, buffer, 0, maxBytes, pageByteStart);
+    page = buffer.subarray(0, bytesRead);
+    cache.pages.set(pageIndex, page);
+    if (cache.pages.size > maxIndexPages) {
+      const oldest = cache.pages.keys().next().value;
+      cache.pages.delete(oldest);
+    }
+  } else {
+    cache.pages.delete(pageIndex);
+    cache.pages.set(pageIndex, page);
+  }
+  const offset = (recordIndex - pageRecordStart) * recordBytes;
+  if (offset < 0 || offset + recordBytes > page.length) return null;
+  return page.subarray(offset, offset + recordBytes);
+}
 
 function spatialCellKey(x, y, z) {
   return (BigInt(x + spatialCellBias) << 42n)
@@ -1460,11 +1494,21 @@ function spatialIndexLowerBound(index, key) {
   let high = index.count;
   while (low < high) {
     const middle = Math.floor((low + high) / 2);
-    const candidate = index.buffer.readBigUInt64LE(spatialHeaderBytes + middle * spatialIndexRecordBytes);
+    const candidate = readSpatialIndexRecord(index, middle)?.key ?? 0n;
     if (candidate < key) low = middle + 1;
     else high = middle;
   }
   return low;
+}
+
+function readSpatialIndexRecord(index, recordIndex) {
+  const record = readPagedRecord(index, recordIndex, spatialIndexRecordBytes, spatialIndexPageRecords);
+  if (!record) return null;
+  return {
+    key: record.readBigUInt64LE(0),
+    offset: Number(record.readBigUInt64LE(8)),
+    count: record.readUInt32LE(16),
+  };
 }
 
 function distanceToCellAxis(value, cell, cellSize) {
@@ -1484,20 +1528,31 @@ async function getSpatialIndex() {
   ]);
   const cacheKey = `${metaStat.mtimeMs}:${dataStat.mtimeMs}:${indexStat.mtimeMs}`;
   if (spatialIndexCache?.cacheKey === cacheKey) return spatialIndexCache;
-  const [meta, buffer] = await Promise.all([
-    readJson(spatialMetaPath, null),
-    fs.readFile(spatialIndexPath),
-  ]);
-  if (!meta || buffer.length < spatialHeaderBytes || buffer.subarray(0, 8).toString('ascii') !== 'EDSPLIDX') {
+  closeCachedFd(spatialIndexCache);
+  const meta = await readJson(spatialMetaPath, null);
+  const fd = openSync(spatialIndexPath, 'r');
+  const header = Buffer.allocUnsafe(spatialHeaderBytes);
+  const headerBytes = readSync(fd, header, 0, spatialHeaderBytes, 0);
+  if (!meta || headerBytes < spatialHeaderBytes || header.subarray(0, 8).toString('ascii') !== 'EDSPLIDX') {
+    closeSync(fd);
     throw new Error('Invalid local spatial index. Rebuild it with npm run import:spatial-index.');
   }
-  const version = buffer.readUInt32LE(8);
-  const recordBytes = buffer.readUInt32LE(12);
-  const count = Number(buffer.readBigUInt64LE(16));
-  if (version !== 1 || recordBytes !== spatialIndexRecordBytes || buffer.length < spatialHeaderBytes + count * recordBytes) {
+  const version = header.readUInt32LE(8);
+  const recordBytes = header.readUInt32LE(12);
+  const count = Number(header.readBigUInt64LE(16));
+  if (version !== 1 || recordBytes !== spatialIndexRecordBytes || indexStat.size < spatialHeaderBytes + count * recordBytes) {
+    closeSync(fd);
     throw new Error('Unsupported or truncated local spatial index.');
   }
-  spatialIndexCache = { cacheKey, meta, buffer, count };
+  spatialIndexCache = {
+    cacheKey,
+    meta,
+    fd,
+    count,
+    size: indexStat.size,
+    headerBytes: spatialHeaderBytes,
+    pages: new Map(),
+  };
   return spatialIndexCache;
 }
 
@@ -1541,24 +1596,23 @@ async function queryLocalPoints(reqUrl, res) {
       const first = spatialIndexLowerBound(index, spatialCellKey(cellX, cellY, cellZMin));
       const last = spatialIndexLowerBound(index, spatialCellKey(cellX, cellY, cellZMax) + 1n);
       for (let cellIndex = first; cellIndex < last; cellIndex += 1) {
-        const indexOffset = spatialHeaderBytes + cellIndex * spatialIndexRecordBytes;
-        const key = index.buffer.readBigUInt64LE(indexOffset);
-        const cellZ = Number(key & spatialCellMask) - spatialCellBias;
+        const indexRecord = readSpatialIndexRecord(index, cellIndex);
+        if (!indexRecord) continue;
+        const cellZ = Number(indexRecord.key & spatialCellMask) - spatialCellBias;
         const dx = distanceToCellAxis(x, cellX, cellSize);
         const dy = distanceToCellAxis(y, cellY, cellSize);
         const dz = distanceToCellAxis(z, cellZ, cellSize);
         const minimumDistanceSq = dx * dx + dy * dy + dz * dz;
         if (minimumDistanceSq > maximumRadius * maximumRadius) continue;
-        const count = index.buffer.readUInt32LE(indexOffset + 16);
         const cell = {
-          offset: Number(index.buffer.readBigUInt64LE(indexOffset + 8)),
-          count,
+          offset: indexRecord.offset,
+          count: indexRecord.count,
           minimumDistanceSq,
         };
         cells.push(cell);
         for (const densityRadius of densityRadii) {
           if (minimumDistanceSq <= densityRadius * densityRadius) {
-            densityCounts.set(densityRadius, densityCounts.get(densityRadius) + count);
+            densityCounts.set(densityRadius, densityCounts.get(densityRadius) + indexRecord.count);
           }
         }
       }
@@ -2669,11 +2723,13 @@ async function runSystemUpdate(reqUrl, res) {
     placesCache = null;
     discoveriesCache = null;
     murderBinariesIndexCache = null;
+    closeCachedFd(spatialIndexCache);
     spatialIndexCache = null;
     supplementalCache = null;
     visitedCache = null;
     journalBodiesCache = null;
     updateMetaCache = null;
+    closeCachedFd(updateIndexCache);
     updateIndexCache = null;
     suggestOverlayCache = null;
     galaxyManifestCache = null;

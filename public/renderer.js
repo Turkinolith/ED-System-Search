@@ -415,6 +415,11 @@ export class GalaxyRenderer {
     this.basePoints = [];
     this.localPoints = [];
     this.allPoints = [];
+    this.pointByIndex = new Map();
+    this.pointSpatialBuckets = new Map();
+    this.pointSpatialCellSize = 2500;
+    this.alwaysPriorityPoints = [];
+    this.visitedPriorityPoints = [];
     this.points = [];
     this.searchResults = [];
     this.selectedSystem = null;
@@ -462,8 +467,16 @@ export class GalaxyRenderer {
     this.matrix = identity();
     this.lastBufferKey = '';
     this.lastBufferBuild = 0;
+    this.renderRequested = false;
+    this.frameHandle = null;
+    this.continuousUntil = 0;
+    this.frameCostMs = 16;
+    this.performanceScale = 1;
+    this.lastQualityUpdate = 0;
     this.regionMap = null;
     this.regionBoundaryLods = null;
+    this.regionPathCacheKey = '';
+    this.regionPathCache = null;
     this.regionMapLoading = false;
     this.regionMapError = null;
     this.bind();
@@ -471,11 +484,15 @@ export class GalaxyRenderer {
   }
 
   bind() {
-    window.addEventListener('resize', () => this.resize());
+    window.addEventListener('resize', () => {
+      this.resize();
+      this.requestRender();
+    });
     this.canvas.addEventListener('wheel', (event) => {
       event.preventDefault();
       this.distance = Math.max(8, this.distance * (event.deltaY > 0 ? 1.12 : 0.88));
       this.notifyTargetChange();
+      this.requestRender(240);
     }, { passive: false });
     this.canvas.addEventListener('contextmenu', (event) => event.preventDefault());
     this.canvas.addEventListener('pointerdown', (event) => {
@@ -504,6 +521,7 @@ export class GalaxyRenderer {
       } else {
         this.yaw += dx * 0.005;
         this.pitch = Math.max(-1.45, Math.min(1.45, this.pitch + dy * 0.004));
+        this.requestRender(240);
       }
     });
     this.canvas.addEventListener('pointerup', (event) => {
@@ -521,12 +539,17 @@ export class GalaxyRenderer {
       this.hoverPoint = null;
       this.onHover?.(null);
       this.onPlaceHover?.(null);
+      this.requestRender();
     });
     window.addEventListener('keydown', (event) => {
       if (isTextInputActive()) return;
       this.keys.add(event.key.toLowerCase());
+      this.requestRender(180);
     });
-    window.addEventListener('keyup', (event) => this.keys.delete(event.key.toLowerCase()));
+    window.addEventListener('keyup', (event) => {
+      this.keys.delete(event.key.toLowerCase());
+      this.requestRender();
+    });
     this.resize();
   }
 
@@ -543,6 +566,7 @@ export class GalaxyRenderer {
       }
       this.regionMap = data;
       this.regionBoundaryLods = this.buildRegionBoundaryLods(data.boundaries);
+      this.requestRender();
     } catch (error) {
       this.regionMapError = error.message;
       console.warn(error);
@@ -576,6 +600,7 @@ export class GalaxyRenderer {
   notifyTargetChange() {
     this.placeDrawKey = '';
     this.onTargetChange?.(this.targetCoords());
+    this.requestRender(120);
   }
 
   setLandmarks(landmarks) {
@@ -583,6 +608,7 @@ export class GalaxyRenderer {
       ...landmark,
       ...toRenderCoords(landmark.coords),
     }));
+    this.requestRender();
   }
 
   setPlaces(places) {
@@ -591,6 +617,7 @@ export class GalaxyRenderer {
       ...toRenderCoords(place.coords),
     }));
     this.placeDrawKey = '';
+    this.requestRender();
   }
 
   setCarrierRange(range) {
@@ -601,23 +628,27 @@ export class GalaxyRenderer {
         radius: Number(range.radius ?? 500),
       }
       : null;
+    this.requestRender();
   }
 
   setStarScale(scale) {
     this.starScale = clamp(Number(scale) || 4, 0.2, 8);
     this.rebuildDrawBuffers(true);
+    this.requestRender();
   }
 
   setAutoStarScale(enabled) {
     this.autoStarScale = Boolean(enabled);
     this.lastReportedStarScale = null;
     this.rebuildDrawBuffers(true);
+    this.requestRender();
   }
 
   setDepthEmphasis(enabled) {
     this.showDepthEmphasis = Boolean(enabled);
     this.lastBufferKey = '';
     this.rebuildDrawBuffers(true);
+    this.requestRender();
   }
 
   autoStarScalePercent() {
@@ -640,6 +671,7 @@ export class GalaxyRenderer {
       }
       : null;
     if (system) this.selectedPlace = null;
+    this.requestRender();
   }
 
   setSelectedPlace(place) {
@@ -651,11 +683,13 @@ export class GalaxyRenderer {
       : null;
     if (place) this.selectedSystem = null;
     this.placeDrawKey = '';
+    this.requestRender();
   }
 
   resetOrientation() {
     this.yaw = 0.55;
     this.pitch = -0.48;
+    this.requestRender();
   }
 
   move(direction) {
@@ -701,6 +735,7 @@ export class GalaxyRenderer {
       this.keys.clear();
       return;
     }
+    const before = `${this.target.join(':')}:${this.yaw}:${this.pitch}`;
     if (this.keys.has('w')) this.move('forward');
     if (this.keys.has('s')) this.move('backward');
     if (this.keys.has('a')) this.move('left');
@@ -709,6 +744,7 @@ export class GalaxyRenderer {
     if (this.keys.has('f')) this.move('down');
     if (this.keys.has('q')) this.yaw -= 0.025;
     if (this.keys.has('e')) this.yaw += 0.025;
+    if (before !== `${this.target.join(':')}:${this.yaw}:${this.pitch}`) this.requestRender(80);
   }
 
   setPoints(buffer, meta) {
@@ -745,8 +781,68 @@ export class GalaxyRenderer {
       indexes.add(point.index);
       this.allPoints.push(point);
     }
+    this.buildPointSpatialIndex();
     this.lastBufferKey = '';
     this.rebuildDrawBuffers(true);
+    this.requestRender();
+  }
+
+  buildPointSpatialIndex() {
+    const buckets = new Map();
+    const byIndex = new Map();
+    const alwaysPriority = [];
+    const visitedPriority = [];
+    const cellSize = this.pointSpatialCellSize;
+    for (const point of this.allPoints) {
+      byIndex.set(point.index, point);
+      const key = `${Math.floor(point.x / cellSize)}:${Math.floor(point.y / cellSize)}:${Math.floor(point.z / cellSize)}`;
+      let bucket = buckets.get(key);
+      if (!bucket) {
+        bucket = [];
+        buckets.set(key, bucket);
+      }
+      bucket.push(point);
+      if (point.special || (point.flags & 2)) alwaysPriority.push(point);
+      if (point.flags & 4) visitedPriority.push(point);
+    }
+    this.pointByIndex = byIndex;
+    this.pointSpatialBuckets = buckets;
+    this.alwaysPriorityPoints = alwaysPriority;
+    this.visitedPriorityPoints = visitedPriority;
+  }
+
+  addPointCandidate(out, seen, point) {
+    if (!point || seen.has(point.index)) return;
+    seen.add(point.index);
+    out.push(point);
+  }
+
+  pointCandidatesForBuffer(maxDistance, requiredIndexes) {
+    if (!Number.isFinite(maxDistance) || !this.pointSpatialBuckets.size) return this.allPoints;
+    const out = [];
+    const seen = new Set();
+    const cellSize = this.pointSpatialCellSize;
+    const minX = Math.floor((this.target[0] - maxDistance) / cellSize);
+    const maxX = Math.floor((this.target[0] + maxDistance) / cellSize);
+    const minY = Math.floor((this.target[1] - maxDistance) / cellSize);
+    const maxY = Math.floor((this.target[1] + maxDistance) / cellSize);
+    const minZ = Math.floor((this.target[2] - maxDistance) / cellSize);
+    const maxZ = Math.floor((this.target[2] + maxDistance) / cellSize);
+    for (let x = minX; x <= maxX; x += 1) {
+      for (let y = minY; y <= maxY; y += 1) {
+        for (let z = minZ; z <= maxZ; z += 1) {
+          const bucket = this.pointSpatialBuckets.get(`${x}:${y}:${z}`);
+          if (!bucket) continue;
+          for (const point of bucket) this.addPointCandidate(out, seen, point);
+        }
+      }
+    }
+    for (const point of this.alwaysPriorityPoints) this.addPointCandidate(out, seen, point);
+    if (this.showVisited) {
+      for (const point of this.visitedPriorityPoints) this.addPointCandidate(out, seen, point);
+    }
+    for (const index of requiredIndexes) this.addPointCandidate(out, seen, this.pointByIndex.get(index));
+    return out;
   }
 
   rebuildDrawBuffers(force = false) {
@@ -763,6 +859,7 @@ export class GalaxyRenderer {
       ...this.searchResults.map((result) => result.index),
       this.selectedSystem?.index,
     ].filter((index) => Number.isInteger(index) && index >= 0));
+    const pointCandidates = this.pointCandidatesForBuffer(maxDistance, required);
     const positions = [];
     const colors = [];
     const sizes = [];
@@ -774,7 +871,7 @@ export class GalaxyRenderer {
     const densityRadiusSq = this.priorityDensityRadius() ** 2;
     let nearbyCandidateCount = 0;
 
-    for (const point of this.allPoints) {
+    for (const point of pointCandidates) {
       const dx = point.x - this.target[0];
       const dy = point.y - this.target[1];
       const dz = point.z - this.target[2];
@@ -841,11 +938,11 @@ export class GalaxyRenderer {
   }
 
   drawBudget() {
-    return zoomDrawBudget(this.distance);
+    return Math.max(3000, Math.round(zoomDrawBudget(this.distance) * this.performanceScale));
   }
 
   localPointLimit() {
-    return zoomLocalPointLimit(this.distance);
+    return Math.max(0, Math.round(zoomLocalPointLimit(this.distance) * this.performanceScale));
   }
 
   priorityDensityRadius() {
@@ -896,6 +993,7 @@ export class GalaxyRenderer {
       special: specialKind(meta.typeNames[result.typeCode] ?? ''),
     }));
     this.rebuildDrawBuffers(true);
+    this.requestRender();
   }
 
   upload(buffer, data) {
@@ -1365,11 +1463,12 @@ export class GalaxyRenderer {
 
   overlayMarkerBudget() {
     const step = this.gridStep();
-    if (step <= 5) return 300;
-    if (step <= 10) return 450;
-    if (step <= 25) return 700;
-    if (step <= 50) return 1000;
-    return 1400;
+    let budget = 1400;
+    if (step <= 5) budget = 300;
+    else if (step <= 10) budget = 450;
+    else if (step <= 25) budget = 700;
+    else if (step <= 50) budget = 1000;
+    return Math.max(120, Math.round(budget * this.performanceScale));
   }
 
   distanceFromTarget(point) {
@@ -1622,34 +1721,53 @@ export class GalaxyRenderer {
     const rect = this.overlay.getBoundingClientRect();
     const margin = 120;
     const worldRadius = this.sectorMapWorldRadius();
-    const internalPath = new Path2D();
-    const outerPath = new Path2D();
-    let internalCount = 0;
-    let outerCount = 0;
+    const cacheKey = [
+      boundaries.length,
+      rect.width.toFixed(0),
+      rect.height.toFixed(0),
+      this.target.map((value) => value.toFixed(1)).join(':'),
+      this.yaw.toFixed(4),
+      this.pitch.toFixed(4),
+      this.distance.toFixed(1),
+      y.toFixed(1),
+      String(worldRadius),
+    ].join('|');
+    let paths = this.regionPathCacheKey === cacheKey ? this.regionPathCache : null;
 
-    const appendSegment = (segment, path) => {
-      if (!this.isRegionSegmentNearView(segment, worldRadius)) return false;
-      const [x1, z1, x2, z2] = segment;
-      const start = this.regionMapPoint(x1, z1);
-      const end = this.regionMapPoint(x2, z2);
-      const a = this.screen({ x: start.x, y, z: start.z }, rect);
-      const b = this.screen({ x: end.x, y, z: end.z }, rect);
-      if (!a || !b) return false;
-      if ((a.x < -margin && b.x < -margin)
-        || (a.x > rect.width + margin && b.x > rect.width + margin)
-        || (a.y < -margin && b.y < -margin)
-        || (a.y > rect.height + margin && b.y > rect.height + margin)) return false;
-      path.moveTo(a.x, a.y);
-      path.lineTo(b.x, b.y);
-      return true;
-    };
+    if (!paths) {
+      const internalPath = new Path2D();
+      const outerPath = new Path2D();
+      let internalCount = 0;
+      let outerCount = 0;
 
-    for (const segment of boundaries) {
-      const isOuter = segment[4] === 0 || segment[5] === 0;
-      if (appendSegment(segment, isOuter ? outerPath : internalPath)) {
-        if (isOuter) outerCount += 1;
-        else internalCount += 1;
+      const appendSegment = (segment, path) => {
+        if (!this.isRegionSegmentNearView(segment, worldRadius)) return false;
+        const [x1, z1, x2, z2] = segment;
+        const start = this.regionMapPoint(x1, z1);
+        const end = this.regionMapPoint(x2, z2);
+        const a = this.screen({ x: start.x, y, z: start.z }, rect);
+        const b = this.screen({ x: end.x, y, z: end.z }, rect);
+        if (!a || !b) return false;
+        if ((a.x < -margin && b.x < -margin)
+          || (a.x > rect.width + margin && b.x > rect.width + margin)
+          || (a.y < -margin && b.y < -margin)
+          || (a.y > rect.height + margin && b.y > rect.height + margin)) return false;
+        path.moveTo(a.x, a.y);
+        path.lineTo(b.x, b.y);
+        return true;
+      };
+
+      for (const segment of boundaries) {
+        const isOuter = segment[4] === 0 || segment[5] === 0;
+        if (appendSegment(segment, isOuter ? outerPath : internalPath)) {
+          if (isOuter) outerCount += 1;
+          else internalCount += 1;
+        }
       }
+
+      paths = { internalPath, outerPath, internalCount, outerCount };
+      this.regionPathCacheKey = cacheKey;
+      this.regionPathCache = paths;
     }
 
     const baseWidth = this.distance > 42000 ? 3.4 : this.distance > 22000 ? 2.8 : 2.2;
@@ -1675,25 +1793,25 @@ export class GalaxyRenderer {
       ctx.restore();
     };
 
-    strokePath(internalPath, internalCount, {
+    strokePath(paths.internalPath, paths.internalCount, {
       color: 'rgba(1, 6, 8, 0.92)',
       lineWidth: baseWidth + 3.4,
       lineAlpha: 0.92,
     });
-    strokePath(outerPath, outerCount, {
+    strokePath(paths.outerPath, paths.outerCount, {
       color: 'rgba(1, 6, 8, 0.86)',
       lineWidth: baseWidth + 2.8,
       lineAlpha: 0.74,
       dash: [12, 8],
     });
-    strokePath(internalPath, internalCount, {
+    strokePath(paths.internalPath, paths.internalCount, {
       color: 'rgba(255, 176, 62, 0.82)',
       lineWidth: baseWidth,
       lineAlpha: 0.9,
       shadowColor: 'rgba(255, 151, 34, 0.32)',
       shadowBlur: 6,
     });
-    strokePath(outerPath, outerCount, {
+    strokePath(paths.outerPath, paths.outerCount, {
       color: 'rgba(255, 207, 124, 0.68)',
       lineWidth: Math.max(1.8, baseWidth - 0.3),
       lineAlpha: 0.7,
@@ -2045,6 +2163,7 @@ export class GalaxyRenderer {
       if (hit?.screen) {
         this.hoverScreen = hit.screen;
         this.hoverPoint = hit.point;
+        this.requestRender();
       }
       return;
     }
@@ -2052,6 +2171,7 @@ export class GalaxyRenderer {
     this.hoverScreen = hit?.screen ?? null;
     this.hoverPoint = hit?.point ?? null;
     this.onHover?.(hit ? { index: hit.point.index, x: hit.screen.x, y: hit.screen.y } : null);
+    this.requestRender();
   }
 
   findPointNear(x, y, radius) {
@@ -2105,15 +2225,42 @@ export class GalaxyRenderer {
     return fallback;
   }
 
+  requestRender(continuousMs = 0) {
+    const now = performance.now();
+    if (continuousMs > 0) this.continuousUntil = Math.max(this.continuousUntil, now + continuousMs);
+    if (this.frameHandle !== null) return;
+    this.frameHandle = requestAnimationFrame(() => this.renderFrame());
+  }
+
+  updatePerformanceQuality(frameCost) {
+    this.frameCostMs = this.frameCostMs * 0.86 + frameCost * 0.14;
+    const now = performance.now();
+    if (now - this.lastQualityUpdate < 450) return;
+    this.lastQualityUpdate = now;
+    if (this.frameCostMs > 28) {
+      this.performanceScale = Math.max(0.55, this.performanceScale * 0.9);
+      this.lastBufferKey = '';
+    } else if (this.frameCostMs < 15 && this.performanceScale < 1) {
+      this.performanceScale = Math.min(1, this.performanceScale * 1.06 + 0.02);
+      this.lastBufferKey = '';
+    }
+  }
+
+  renderFrame() {
+    this.frameHandle = null;
+    const started = performance.now();
+    this.keyboardMove();
+    this.rebuildDrawBuffers();
+    const matrix = this.camera();
+    this.drawStars(matrix);
+    this.drawOverlay();
+    this.updatePerformanceQuality(performance.now() - started);
+    if (this.keys.size > 0 || this.drag || performance.now() < this.continuousUntil) {
+      this.requestRender();
+    }
+  }
+
   start() {
-    const frame = () => {
-      this.keyboardMove();
-      this.rebuildDrawBuffers();
-      const matrix = this.camera();
-      this.drawStars(matrix);
-      this.drawOverlay();
-      requestAnimationFrame(frame);
-    };
-    requestAnimationFrame(frame);
+    this.requestRender(120);
   }
 }

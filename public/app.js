@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=region-map-lod-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=perf-overhaul-1';
 
 const state = {
   meta: null,
@@ -33,6 +33,7 @@ const state = {
   baseLod: null,
   localPointCount: 0,
   localRadius: null,
+  localPointRequestKey: null,
   richPointFiltersActive: false,
 };
 
@@ -1720,6 +1721,7 @@ async function loadPoints() {
   if (richFiltersActive || !state.spatialIndex) {
     state.localPointCount = 0;
     state.localRadius = null;
+    state.localPointRequestKey = null;
     state.renderer.setLocalPoints(new ArrayBuffer(0), state.meta);
   } else {
     scheduleLocalPointsRefresh(0);
@@ -1748,6 +1750,7 @@ function scheduleLocalPointsRefresh(delay = 450) {
     if (state.localPointCount > 0) {
       state.localPointCount = 0;
       state.localRadius = null;
+      state.localPointRequestKey = null;
       state.renderer.setLocalPoints(new ArrayBuffer(0), state.meta);
       updatePointStatus();
     }
@@ -1761,6 +1764,18 @@ function scheduleLocalPointsRefresh(delay = 450) {
 
 async function refreshLocalPoints(requestId, limit) {
   const coords = state.renderer.targetCoords();
+  const tileSize = Math.max(200, Math.min(1000, state.renderer.gridStep?.() ?? 250));
+  const tileKey = [
+    Math.floor(coords.x / tileSize),
+    Math.floor(coords.y / tileSize),
+    Math.floor(coords.z / tileSize),
+    tileSize,
+    limit,
+    [...state.enabledTypes].join(','),
+    el.updatedFrom.disabled ? '' : el.updatedFrom.value,
+    el.updatedBefore.disabled ? '' : el.updatedBefore.value,
+  ].join(':');
+  if (state.localPointRequestKey === tileKey && state.localPointCount > 0) return;
   const params = new URLSearchParams({
     x: String(coords.x),
     y: String(coords.y),
@@ -1775,6 +1790,7 @@ async function refreshLocalPoints(requestId, limit) {
   if (requestId !== localPointsRequestId) return;
   state.localPointCount = buffer.byteLength / 20;
   state.localRadius = Number(response.headers.get('x-local-radius') ?? 0);
+  state.localPointRequestKey = tileKey;
   state.renderer.setLocalPoints(buffer, state.meta);
   updatePointStatus();
 }
@@ -2228,6 +2244,7 @@ function bindControls() {
   el.visitedToggle.addEventListener('change', () => {
     state.renderer.showVisited = el.visitedToggle.checked;
     state.renderer.rebuildDrawBuffers(true);
+    state.renderer.requestRender();
     writeViewSettings({ showVisited: el.visitedToggle.checked });
   });
   el.depthEmphasisToggle.addEventListener('change', () => {
@@ -2242,22 +2259,27 @@ function bindControls() {
   el.starScaleAuto.addEventListener('change', () => setStarScaleAuto(el.starScaleAuto.checked, true));
   el.gridToggle.addEventListener('change', () => {
     state.renderer.showGrid = el.gridToggle.checked;
+    state.renderer.requestRender();
     writeViewSettings({ showGrid: el.gridToggle.checked });
   });
   el.dropLinesToggle.addEventListener('change', () => {
     state.renderer.showDropLines = el.dropLinesToggle.checked;
+    state.renderer.requestRender();
     writeViewSettings({ showDropLines: el.dropLinesToggle.checked });
   });
   el.sectorMapToggle.addEventListener('change', () => {
     state.renderer.showSectorMap = el.sectorMapToggle.checked;
+    state.renderer.requestRender();
     writeViewSettings({ showSectorMap: el.sectorMapToggle.checked });
   });
   el.landmarksToggle.addEventListener('change', () => {
     state.renderer.showLandmarks = el.landmarksToggle.checked;
+    state.renderer.requestRender();
     writeViewSettings({ showLandmarks: el.landmarksToggle.checked });
   });
   el.carrierRangeToggle.addEventListener('change', () => {
     state.renderer.showCarrierRange = el.carrierRangeToggle.checked;
+    state.renderer.requestRender();
     writeViewSettings({ showCarrierRange: el.carrierRangeToggle.checked });
   });
   el.murderBinariesToggle.addEventListener('change', () => {
