@@ -1552,51 +1552,55 @@ export class GalaxyRenderer {
   }
 
   sectorMapAlpha() {
-    return smoothstep(4500, 14000, this.distance);
+    const step = this.gridStep();
+    if (step < 1000) return 0;
+    if (step === 1000) return 0.38;
+    if (step === 2500) return 1;
+    if (step === 5000) return 0.76;
+    return 0.42;
   }
 
   buildRegionBoundaryLods(boundaries) {
     const longEnough = (minLength) => boundaries.filter((segment) => (
       Math.hypot(segment[2] - segment[0], segment[3] - segment[1]) >= minLength
     ));
-    return [
-      { distance: 0, segments: boundaries },
-      { distance: 10000, segments: longEnough(20) },
-      { distance: 22000, segments: longEnough(40) },
-      { distance: 36000, segments: longEnough(80) },
-      { distance: 52000, segments: longEnough(120) },
-    ];
+    return {
+      all: boundaries,
+      min20: longEnough(20),
+      min30: longEnough(30),
+    };
   }
 
   regionBoundarySegmentsForDistance() {
     const lods = this.regionBoundaryLods;
-    if (!lods?.length) return this.regionMap?.boundaries ?? [];
-    let selected = lods[0].segments;
-    for (const lod of lods) {
-      if (this.distance >= lod.distance) selected = lod.segments;
-      else break;
-    }
-    return selected;
+    if (!lods) return this.regionMap?.boundaries ?? [];
+    const step = this.gridStep();
+    if (step <= 2500) return lods.all ?? [];
+    if (step <= 5000) return lods.min20 ?? lods.all ?? [];
+    return lods.min30 ?? lods.min20 ?? lods.all ?? [];
   }
 
   sectorMapWorldRadius() {
-    if (this.distance >= 30000) return Infinity;
-    return clamp(this.distance * 3.2, 9000, 96000);
+    if (this.gridStep() >= 10000) return Infinity;
+    return clamp(this.distance * 4.8, 18000, 144000);
+  }
+
+  regionMapPoint(x, z) {
+    return { x: -Number(x ?? 0), z: Number(z ?? 0) };
   }
 
   isRegionSegmentNearView(segment, radius) {
     if (!Number.isFinite(radius)) return true;
-    const minX = Math.min(segment[0], segment[2]);
-    const maxX = Math.max(segment[0], segment[2]);
+    const a = this.regionMapPoint(segment[0], segment[1]);
+    const b = this.regionMapPoint(segment[2], segment[3]);
+    const minX = Math.min(a.x, b.x);
+    const maxX = Math.max(a.x, b.x);
     const minZ = Math.min(segment[1], segment[3]);
     const maxZ = Math.max(segment[1], segment[3]);
     const targetZ = this.target[2];
     if (maxZ < targetZ - radius || minZ > targetZ + radius) return false;
     const targetX = this.target[0];
-    const mirroredTargetX = -targetX;
-    const nearTarget = !(maxX < targetX - radius || minX > targetX + radius);
-    const nearMirroredTarget = !(maxX < mirroredTargetX - radius || minX > mirroredTargetX + radius);
-    return nearTarget || nearMirroredTarget;
+    return !(maxX < targetX - radius || minX > targetX + radius);
   }
 
   drawSectorMapOverlay() {
@@ -1618,65 +1622,119 @@ export class GalaxyRenderer {
     const rect = this.overlay.getBoundingClientRect();
     const margin = 120;
     const worldRadius = this.sectorMapWorldRadius();
+    const internalPath = new Path2D();
+    const outerPath = new Path2D();
+    let internalCount = 0;
+    let outerCount = 0;
 
-    const appendSegment = (segment) => {
+    const appendSegment = (segment, path) => {
       if (!this.isRegionSegmentNearView(segment, worldRadius)) return false;
       const [x1, z1, x2, z2] = segment;
-      const a = this.screen({ x: x1, y, z: z1 }, rect);
-      const b = this.screen({ x: x2, y, z: z2 }, rect);
+      const start = this.regionMapPoint(x1, z1);
+      const end = this.regionMapPoint(x2, z2);
+      const a = this.screen({ x: start.x, y, z: start.z }, rect);
+      const b = this.screen({ x: end.x, y, z: end.z }, rect);
       if (!a || !b) return false;
       if ((a.x < -margin && b.x < -margin)
         || (a.x > rect.width + margin && b.x > rect.width + margin)
         || (a.y < -margin && b.y < -margin)
         || (a.y > rect.height + margin && b.y > rect.height + margin)) return false;
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
+      path.moveTo(a.x, a.y);
+      path.lineTo(b.x, b.y);
       return true;
     };
 
-    ctx.save();
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.globalAlpha = alpha * 0.68;
-    ctx.strokeStyle = 'rgba(242, 165, 65, 0.46)';
-    ctx.lineWidth = this.distance > 40000 ? 1.8 : 1.25;
-    ctx.beginPath();
     for (const segment of boundaries) {
-      if (segment[4] === 0 || segment[5] === 0) continue;
-      appendSegment(segment);
+      const isOuter = segment[4] === 0 || segment[5] === 0;
+      if (appendSegment(segment, isOuter ? outerPath : internalPath)) {
+        if (isOuter) outerCount += 1;
+        else internalCount += 1;
+      }
     }
-    ctx.stroke();
 
-    ctx.globalAlpha = alpha * 0.42;
-    ctx.strokeStyle = 'rgba(242, 165, 65, 0.34)';
-    ctx.lineWidth = this.distance > 40000 ? 1.4 : 1;
-    ctx.beginPath();
-    for (const segment of boundaries) {
-      if (segment[4] !== 0 && segment[5] !== 0) continue;
-      appendSegment(segment);
-    }
-    ctx.stroke();
-    ctx.restore();
+    const baseWidth = this.distance > 42000 ? 3.4 : this.distance > 22000 ? 2.8 : 2.2;
+    const strokePath = (path, count, {
+      color,
+      lineWidth,
+      lineAlpha,
+      dash = null,
+      shadowColor = 'transparent',
+      shadowBlur = 0,
+    }) => {
+      if (!count) return;
+      ctx.save();
+      ctx.globalAlpha = alpha * lineAlpha;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lineWidth;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.shadowColor = shadowColor;
+      ctx.shadowBlur = shadowBlur;
+      ctx.setLineDash(dash ?? []);
+      ctx.stroke(path);
+      ctx.restore();
+    };
+
+    strokePath(internalPath, internalCount, {
+      color: 'rgba(1, 6, 8, 0.92)',
+      lineWidth: baseWidth + 3.4,
+      lineAlpha: 0.92,
+    });
+    strokePath(outerPath, outerCount, {
+      color: 'rgba(1, 6, 8, 0.86)',
+      lineWidth: baseWidth + 2.8,
+      lineAlpha: 0.74,
+      dash: [12, 8],
+    });
+    strokePath(internalPath, internalCount, {
+      color: 'rgba(255, 176, 62, 0.82)',
+      lineWidth: baseWidth,
+      lineAlpha: 0.9,
+      shadowColor: 'rgba(255, 151, 34, 0.32)',
+      shadowBlur: 6,
+    });
+    strokePath(outerPath, outerCount, {
+      color: 'rgba(255, 207, 124, 0.68)',
+      lineWidth: Math.max(1.8, baseWidth - 0.3),
+      lineAlpha: 0.7,
+      dash: [12, 8],
+      shadowColor: 'rgba(255, 151, 34, 0.22)',
+      shadowBlur: 4,
+    });
   }
 
   drawRegionLabels(y, alpha) {
     const regions = this.regionMap?.regions ?? [];
     if (!regions.length) return;
     const ctx = this.ctx;
-    const fontSize = this.distance > 42000 ? 13 : 11;
+    const fontSize = this.distance > 42000 ? 15 : 12;
     ctx.save();
     ctx.font = `700 ${fontSize}px "Segoe UI", system-ui, sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = `rgba(255, 202, 139, ${0.58 * alpha})`;
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.72)';
+    ctx.lineJoin = 'round';
+    ctx.shadowColor = 'rgba(255, 151, 34, 0.16)';
     ctx.shadowBlur = 8;
     for (const region of regions) {
       const [x, z] = region.label ?? [];
       if (!Number.isFinite(x) || !Number.isFinite(z)) continue;
-      const screen = this.screen({ x, y, z });
+      const point = this.regionMapPoint(x, z);
+      const screen = this.screen({ x: point.x, y, z: point.z });
       if (!screen) continue;
-      ctx.fillText(String(region.name ?? '').toUpperCase(), screen.x, screen.y);
+      const label = String(region.name ?? '').toUpperCase();
+      const metrics = ctx.measureText(label);
+      const plateWidth = metrics.width + 14;
+      const plateHeight = fontSize + 8;
+      ctx.globalAlpha = alpha * 0.72;
+      ctx.fillStyle = 'rgba(2, 8, 10, 0.56)';
+      roundedRect(ctx, screen.x - plateWidth / 2, screen.y - plateHeight / 2, plateWidth, plateHeight, 4);
+      ctx.fill();
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.82)';
+      ctx.strokeText(label, screen.x, screen.y);
+      ctx.fillStyle = 'rgba(255, 211, 142, 0.9)';
+      ctx.fillText(label, screen.x, screen.y);
     }
     ctx.restore();
   }

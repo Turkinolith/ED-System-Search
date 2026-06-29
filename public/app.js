@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=region-map-perf-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=region-map-lod-1';
 
 const state = {
   meta: null,
