@@ -1213,7 +1213,25 @@ function pruneSystemCache() {
 function hideTooltip() {
   tooltipOwner = null;
   el.tooltip.hidden = true;
+  el.tooltip.classList.remove('loading');
   el.tooltip.textContent = '';
+}
+
+function positionTooltip(x, y) {
+  const viewport = el.tooltip.parentElement.getBoundingClientRect();
+  const tooltip = el.tooltip.getBoundingClientRect();
+  const left = Math.min(viewport.width - tooltip.width - 10, x + 14);
+  const top = Math.max(10, Math.min(viewport.height - tooltip.height - 10, y - tooltip.height - 10));
+  el.tooltip.style.left = `${left}px`;
+  el.tooltip.style.top = `${top}px`;
+}
+
+function showTooltipLoading(hover) {
+  tooltipOwner = 'system';
+  el.tooltip.classList.add('loading');
+  el.tooltip.textContent = 'Loading system...';
+  el.tooltip.hidden = false;
+  positionTooltip(hover.x, hover.y);
 }
 
 async function showTooltip(hover) {
@@ -1239,6 +1257,7 @@ async function showTooltip(hover) {
   const requestId = ++hoverRequestId;
   pendingTooltipIndex = hover.index;
   clearTimeout(hoverFetchTimer);
+  showTooltipLoading(hover);
   const wait = Math.max(0, tooltipFetchDelayMs - (Date.now() - lastHoverFetchAt));
   hoverFetchTimer = setTimeout(() => {
     const nextHover = pendingTooltipHover ?? hover;
@@ -1267,16 +1286,12 @@ function renderTooltip(system, x, y) {
   const starType = compactStarType(system.mainStar);
   const typeText = starType ? ` · ${starType}` : '';
   const note = system.note?.text ? `\n${notePreview(system.note.text, 180)}` : '';
+  el.tooltip.classList.remove('loading');
   el.tooltip.textContent = distance === null
     ? `${system.name}${typeText}${note}`
     : `${system.name}${typeText} · ${fmt(distance)} ly${note}`;
   el.tooltip.hidden = false;
-  const viewport = el.tooltip.parentElement.getBoundingClientRect();
-  const tooltip = el.tooltip.getBoundingClientRect();
-  const left = Math.min(viewport.width - tooltip.width - 10, x + 14);
-  const top = Math.max(10, Math.min(viewport.height - tooltip.height - 10, y - tooltip.height - 10));
-  el.tooltip.style.left = `${left}px`;
-  el.tooltip.style.top = `${top}px`;
+  positionTooltip(x, y);
 }
 
 function focusSystem(name, coords) {
@@ -1441,8 +1456,15 @@ async function saveActiveNote(text = el.noteText.value) {
 
 async function loadNotes(query = '') {
   const params = query ? `?q=${encodeURIComponent(query)}` : '';
-  const response = await api(`/api/notes${params}`);
+  const response = await fetch(`/api/notes${params}`, {
+    headers: state.notesEtag ? { 'If-None-Match': state.notesEtag } : {},
+  });
+  if (response.status === 304) return;
+  if (!response.ok) throw new Error(response.statusText);
+  const etag = response.headers.get('etag');
+  if (etag && etag === state.notesEtag) return;
   const data = await response.json();
+  state.notesEtag = etag;
   state.notes = data.notes ?? [];
   renderNotes(data);
 }
@@ -1568,6 +1590,7 @@ async function pollJournalScan(scan) {
       const detail = (scan.stderr || scan.stdout || '').trim();
       throw new Error(detail || `Journal scan exited with code ${scan.code}.`);
     }
+    const priorSupplementalCount = state.visited?.supplementalCount ?? 0;
     await loadStatus();
     await loadPlaces();
     systemCache.clear();
@@ -1580,7 +1603,12 @@ async function pollJournalScan(scan) {
     if (state.selectedSystem) await loadSelectedBodies();
     setStatus(scan.message || 'Journal data refreshed.');
     setJournalButtonsDisabled(false);
-    loadPoints({ background: true }).catch((error) => {
+    // When no new journal-only systems appeared, the global point set is
+    // unchanged except for visited flags — patch those in place instead of
+    // re-downloading the whole map layer.
+    const supplementalChanged = (state.visited?.supplementalCount ?? 0) !== priorSupplementalCount;
+    const refreshTask = supplementalChanged ? loadPoints({ background: true }) : applyVisitedIndexUpdate();
+    refreshTask.catch((error) => {
       if (isAbortError(error)) return;
       console.error(error);
       setStatus(`Could not refresh galaxy map: ${error.message}`);
@@ -1750,25 +1778,42 @@ async function loadPoints(options = {}) {
       if (rich.government) params.set('government', rich.government);
     }
   }
-  let response;
-  let buffer;
+  const fetchStage = async (limit, { reportProgress = false } = {}) => {
+    const stageParams = new URLSearchParams(params);
+    stageParams.set('limit', String(limit));
+    const response = await api(`/api/points?${stageParams.toString()}`, { signal: controller.signal });
+    const buffer = reportProgress
+      ? await readBodyWithProgress(response, (loaded, total) => {
+        if (requestId !== pointLoadRequestId) return;
+        const totalText = total ? ` of ${(total / 1048576).toFixed(1)} MB` : '';
+        setStatus(`Loading detailed star field... ${(loaded / 1048576).toFixed(1)} MB${totalText}`);
+      })
+      : await response.arrayBuffer();
+    return { response, buffer };
+  };
+  const applyStage = async ({ response, buffer }) => {
+    if (requestId !== pointLoadRequestId) return false;
+    state.basePointCount = buffer.byteLength / 20;
+    state.baseLod = response.headers.get('x-lod-level');
+    state.richPointFiltersActive = response.headers.get('x-rich-filters') === '1';
+    await state.renderer.setPoints(buffer, state.meta);
+    return requestId === pointLoadRequestId;
+  };
   try {
-    response = await api(`/api/points?${params.toString()}`, { signal: controller.signal });
-    buffer = await response.arrayBuffer();
+    if (options.progressive) {
+      // Coarse pass fills in the wider galaxy quickly; the full-detail pass
+      // below replaces it under the same request id.
+      if (!(await applyStage(await fetchStage(40000)))) return;
+      updatePointStatus();
+    }
+    if (!(await applyStage(await fetchStage(300000, { reportProgress: options.progressive })))) return;
   } catch (error) {
     if (isAbortError(error)) return;
     throw error;
   } finally {
     if (pointLoadController === controller) pointLoadController = null;
   }
-  if (requestId !== pointLoadRequestId) return;
-  const lod = response.headers.get('x-lod-level');
-  const richFiltersActive = response.headers.get('x-rich-filters') === '1';
-  state.basePointCount = buffer.byteLength / 20;
-  state.baseLod = lod;
-  state.richPointFiltersActive = richFiltersActive;
-  state.renderer.setPoints(buffer, state.meta);
-  if (richFiltersActive || !state.spatialIndex) {
+  if (state.richPointFiltersActive || !state.spatialIndex) {
     state.localPointCount = 0;
     state.localRadius = null;
     state.localPointRequestKey = null;
@@ -1777,6 +1822,35 @@ async function loadPoints(options = {}) {
     scheduleLocalPointsRefresh(0);
   }
   updatePointStatus();
+}
+
+async function applyVisitedIndexUpdate() {
+  const response = await api('/api/visited-indexes');
+  const data = await response.json();
+  const changed = state.renderer.applyVisitedFlags(new Set(data.indexes ?? []));
+  if (changed) updatePointStatus();
+}
+
+async function readBodyWithProgress(response, onProgress) {
+  if (!response.body?.getReader) return response.arrayBuffer();
+  const total = Number(response.headers.get('content-length')) || 0;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.byteLength;
+    onProgress?.(loaded, total);
+  }
+  const out = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer;
 }
 
 function updatePointStatus() {
@@ -1878,7 +1952,7 @@ async function refreshLocalPoints(requestId, limit, options = {}) {
   state.localPointCount = buffer.byteLength / 20;
   state.localRadius = Number(response.headers.get('x-local-radius') ?? 0);
   state.localPointRequestKey = tileKey;
-  state.renderer.setLocalPoints(buffer, state.meta);
+  await state.renderer.setLocalPoints(buffer, state.meta);
   updatePointStatus();
 }
 
@@ -1894,8 +1968,15 @@ async function refreshLocalPointsNow(options = {}) {
 
 async function loadPlaces() {
   try {
-    const response = await api('/api/places');
+    const response = await fetch('/api/places', {
+      headers: state.placesEtag && state.places.length ? { 'If-None-Match': state.placesEtag } : {},
+    });
+    if (response.status === 304) return;
+    if (!response.ok) throw new Error(response.statusText);
+    const etag = response.headers.get('etag');
+    if (etag && etag === state.placesEtag && state.places.length) return;
     const data = await response.json();
+    state.placesEtag = etag;
     state.places = applyCarrierOverride(data.places ?? []);
     state.placesMeta = data.imported ? data : state.placesMeta;
     renderPlaceFilters();
@@ -2457,6 +2538,7 @@ function showPlaceTooltip(hover) {
   tooltipOwner = 'place';
   const distance = distanceLy(state.focus?.coords, hover.place.coords);
   const distanceText = distance === null ? '' : ` · ${fmt(distance)} ly`;
+  el.tooltip.classList.remove('loading');
   el.tooltip.textContent = `${hover.place.name} · ${hover.place.category ?? 'Place'}${distanceText}`;
   el.tooltip.hidden = false;
   const viewport = el.tooltip.parentElement.getBoundingClientRect();
@@ -2511,15 +2593,32 @@ async function init() {
   resumeJournalScanIfRunning();
   resumeSystemUpdateIfRunning();
   renderFilters();
-  await loadNotes();
-  await loadPlaces();
 
-  if (!(await focusLatestJournal())) {
-    focusSystem('Sol', state.meta.sol.coords);
-  }
-
-  await loadPoints();
+  // Aim the camera straight from status data and start rendering now: the
+  // grid and region map appear immediately while star points stream in.
+  const latest = state.latestJournal;
+  if (latest?.coords) focusSystem(latest.name, latest.coords);
+  else focusSystem('Sol', state.meta.sol.coords);
   state.renderer.start();
+  setStatus('Loading star map...');
+  el.status.classList.add('loading');
+
+  // Nearest stars first: the density-adaptive local sphere around the focus
+  // renders (with working tooltips) while the global layers download.
+  const localFirst = refreshLocalPointsNow({ radius: Math.max(250, localPointRadius()), limit: 25000 })
+    .catch((error) => {
+      if (!isAbortError(error)) console.warn(error);
+    });
+  await Promise.allSettled([
+    localFirst,
+    loadPoints({ progressive: true }),
+    loadNotes(),
+    loadPlaces(),
+  ]);
+  el.status.classList.remove('loading');
+  // Selecting the latest journal system runs a server-side name search that
+  // can starve the point streams, so it waits until the map is loaded.
+  focusLatestJournal().catch((error) => console.warn(error));
 }
 
 async function searchLatestSystem(name, shouldFocus = false) {
