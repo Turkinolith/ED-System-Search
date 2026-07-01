@@ -48,6 +48,8 @@ const lodBytes = 20;
 const richIndexHeaderBytes = 32;
 const richIndexMinimumRecordBytes = 40;
 const richFilterMinimumRecordBytes = 12;
+const systemDetailCacheLimit = 3000;
+const systemDetailCacheTtlMs = 10 * 60 * 1000;
 const richFlags = {
   bodies: 1 << 0,
   stations: 1 << 1,
@@ -150,6 +152,7 @@ let galaxyManifestCache = null;
 let journalBodiesCache = null;
 let carrierRefreshPromise = null;
 let visitedIndexSet = new Set();
+const systemDetailCache = new Map();
 let journalScanStatus = {
   running: false,
   id: null,
@@ -282,6 +285,38 @@ async function noteForSystem(name) {
   if (!key) return null;
   const notes = await getNotes();
   return notes.notes.find((note) => note.systemKey === key) ?? null;
+}
+
+function clearSystemDetailCache() {
+  systemDetailCache.clear();
+}
+
+function getCachedSystemDetail(index) {
+  const entry = systemDetailCache.get(index);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > systemDetailCacheTtlMs) {
+    systemDetailCache.delete(index);
+    return null;
+  }
+  systemDetailCache.delete(index);
+  systemDetailCache.set(index, entry);
+  return entry.detail;
+}
+
+function setCachedSystemDetail(index, detail) {
+  systemDetailCache.set(index, { detail, cachedAt: Date.now() });
+  while (systemDetailCache.size > systemDetailCacheLimit) {
+    const oldest = systemDetailCache.keys().next().value;
+    systemDetailCache.delete(oldest);
+  }
+}
+
+async function sendSystemDetail(res, index, detail) {
+  setCachedSystemDetail(index, detail);
+  return sendJson(res, {
+    ...detail,
+    note: await noteForSystem(detail.name),
+  });
 }
 
 async function writeNotes(notes) {
@@ -1570,6 +1605,7 @@ async function queryLocalPoints(reqUrl, res) {
   const z = Number(reqUrl.searchParams.get('z') ?? 0);
   if (![x, y, z].every(Number.isFinite)) return badRequest(res, 'x, y, and z must be finite coordinates.');
   const limit = Math.max(1000, Math.min(150000, Number(reqUrl.searchParams.get('limit') ?? 100000) || 100000));
+  const maximumRadius = Math.max(25, Math.min(1000, Number(reqUrl.searchParams.get('radius') ?? 1000) || 1000));
   const typeSet = new Set(
     (reqUrl.searchParams.get('types') ?? '')
       .split(',')
@@ -1581,7 +1617,6 @@ async function queryLocalPoints(reqUrl, res) {
   const updates = range.active ? await getUpdateIndex() : null;
   await getVisited();
   const cellSize = Number(index.meta.cellSizeLy ?? 100);
-  const maximumRadius = 1000;
   const densityRadii = [100, 200, 500];
   const cellXMin = Math.floor((x - maximumRadius) / cellSize);
   const cellXMax = Math.floor((x + maximumRadius) / cellSize);
@@ -2396,6 +2431,8 @@ async function readSystemDetail(reqUrl, res) {
   if (!existsSync(recordsPath)) return sendJson(res, { error: 'Systems have not been imported yet.' }, 409);
   const meta = await getMeta();
   await getVisited();
+  const cached = getCachedSystemDetail(index);
+  if (cached) return sendSystemDetail(res, index, cached);
   const importedCount = meta?.importedCount ?? meta?.count ?? 0;
   if (index >= importedCount) {
     const supplemental = await getSupplemental();
@@ -2405,7 +2442,7 @@ async function readSystemDetail(reqUrl, res) {
       const virtualSystem = virtualVisitedSystemAt(index, meta, supplemental, visited);
       if (!virtualSystem) return notFound(res);
       const systemName = virtualSystem.name;
-      return sendJson(res, {
+      return sendSystemDetail(res, index, {
         index,
         id64: String(virtualSystem.id64 ?? virtualSystem.systemAddress ?? `journal:${systemName}`),
         name: systemName,
@@ -2421,11 +2458,10 @@ async function readSystemDetail(reqUrl, res) {
         updateTime: virtualSystem.updateTime ?? virtualSystem.lastVisited,
         lastEvent: virtualSystem.lastEvent,
         visitCount: virtualSystem.count,
-        note: await noteForSystem(systemName),
       });
     }
     const systemName = system.name;
-    return sendJson(res, {
+    return sendSystemDetail(res, index, {
       index,
       id64: String(system.id64 ?? system.systemAddress ?? ''),
       name: systemName,
@@ -2441,7 +2477,6 @@ async function readSystemDetail(reqUrl, res) {
       updateTime: system.updateTime ?? system.lastVisited,
       lastEvent: system.lastEvent,
       visitCount: system.visitCount,
-      note: await noteForSystem(systemName),
     });
   }
   const fd = await fs.open(recordsPath, 'r');
@@ -2467,7 +2502,7 @@ async function readSystemDetail(reqUrl, res) {
   const flags = buffer.readUInt16LE(14);
   const updateSeconds = await readUpdateSecondsAt(index);
   const systemName = nameBuffer.toString('utf8');
-  sendJson(res, {
+  return sendSystemDetail(res, index, {
     index,
     id64: buffer.readBigUInt64LE(24).toString(),
     name: systemName,
@@ -2483,7 +2518,6 @@ async function readSystemDetail(reqUrl, res) {
     visited: visitedIndexSet.has(index),
     updateTime: secondsToIso(updateSeconds),
     source: 'Spansh',
-    note: await noteForSystem(systemName),
   });
 }
 
@@ -2557,6 +2591,7 @@ async function runJournalRefresh(reqUrl, res) {
     supplementalCache = null;
     journalBodiesCache = null;
     metaCache = null;
+    clearSystemDetailCache();
     await getVisited().catch(() => null);
     const finalLine = stdout
       .split(/\r?\n/)
@@ -2728,6 +2763,7 @@ async function runSystemUpdate(reqUrl, res) {
     supplementalCache = null;
     visitedCache = null;
     journalBodiesCache = null;
+    clearSystemDetailCache();
     updateMetaCache = null;
     closeCachedFd(updateIndexCache);
     updateIndexCache = null;

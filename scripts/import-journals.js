@@ -724,7 +724,10 @@ function makeJournalState(journalDir, entries, previousState = null) {
 
 async function resolveImportedSystems(visitedSystems, options = {}) {
   const skipLegacyFallback = Boolean(options.skipLegacyFallback);
-  const wanted = new Set([...visitedSystems.keys()]);
+  const knownMatchedKeys = options.knownMatchedKeys instanceof Set
+    ? options.knownMatchedKeys
+    : new Set(options.knownMatchedKeys ?? []);
+  const wanted = new Set([...visitedSystems.keys()].filter((key) => !knownMatchedKeys.has(key)));
   const indexes = [];
   const matchedKeys = new Set();
   const matchedIndexes = new Set();
@@ -1048,7 +1051,12 @@ async function main() {
   const previousJournalState = options.mergeExisting ? await readJson(journalStatePath, null) : null;
   const previousSupplemental = await readJson(supplementalPath, { systems: [] });
   const { files, selectedFiles, allFiles, totalFileCount } = await readJournalFiles(options.journalDir, options.latest, previousJournalState);
-  if (options.latest && files.length === 0) progress(`no new journal lines in latest ${selectedFiles.length}`);
+  if (options.latest && files.length === 0) {
+    progress(`no new journal lines in latest ${selectedFiles.length}`);
+    await fs.writeFile(journalStatePath, JSON.stringify(makeJournalState(options.journalDir, selectedFiles, previousJournalState), null, 2));
+    console.log(`Read 0 changed journal files from ${selectedFiles.length} selected files; existing journal outputs are unchanged.`);
+    return;
+  }
   const parsedScan = await parseJournals(files);
   progress('merging visits');
   const existing = options.mergeExisting ? await readJson(visitedPath, null) : null;
@@ -1067,6 +1075,7 @@ async function main() {
   const systemsToResolve = previousMatchedKeys ? parsedScan.systems : parsed.systems;
   const imported = await resolveImportedSystems(systemsToResolve, {
     skipLegacyFallback: options.mergeExisting,
+    knownMatchedKeys: previousMatchedKeys,
   });
   const matchedKeys = previousMatchedKeys
     ? new Set([...previousMatchedKeys, ...imported.matchedKeys])

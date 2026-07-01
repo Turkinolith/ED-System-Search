@@ -147,6 +147,8 @@ let hoverRequestId = 0;
 let searchRequestId = 0;
 let hoverFetchTimer = null;
 let lastHoverFetchAt = 0;
+let pendingTooltipIndex = null;
+let pendingTooltipHover = null;
 let focusCopyStatusTimer = null;
 let journalScanPollTimer = null;
 let systemUpdatePollTimer = null;
@@ -154,12 +156,15 @@ let murderBinariesRefreshTimer = null;
 let murderBinariesRequestId = 0;
 let localPointsRefreshTimer = null;
 let localPointsRequestId = 0;
+let localPointsController = null;
+let pointLoadController = null;
+let pointLoadRequestId = 0;
 let starScaleFrame = null;
 let tooltipOwner = null;
 let clientToastTimer = null;
-const tooltipCacheLimit = 180;
-const tooltipCacheTtlMs = 5 * 60 * 1000;
-const tooltipFetchDelayMs = 120;
+const tooltipCacheLimit = 500;
+const tooltipCacheTtlMs = 10 * 60 * 1000;
+const tooltipFetchDelayMs = 40;
 const viewSettingsKey = 'ed-system-search:view';
 const dayMs = 24 * 60 * 60 * 1000;
 const richSystemCache = new Map();
@@ -256,6 +261,10 @@ function distanceLy(a, b) {
 function setStatus(message, title = message) {
   el.status.textContent = message;
   el.status.title = title;
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError';
 }
 
 function showClientToast(message, timeoutMs = 9000) {
@@ -1211,18 +1220,33 @@ async function showTooltip(hover) {
   if (!hover || !Number.isInteger(hover.index) || hover.index < 0) {
     hoverRequestId += 1;
     clearTimeout(hoverFetchTimer);
+    pendingTooltipIndex = null;
+    pendingTooltipHover = null;
     if (tooltipOwner === 'system') hideTooltip();
     return;
   }
-  const requestId = ++hoverRequestId;
   const cached = getCachedSystem(hover.index);
   if (cached) {
+    hoverRequestId += 1;
+    clearTimeout(hoverFetchTimer);
+    pendingTooltipIndex = null;
+    pendingTooltipHover = null;
     renderTooltip(cached, hover.x, hover.y);
     return;
   }
+  pendingTooltipHover = hover;
+  if (pendingTooltipIndex === hover.index && hoverFetchTimer) return;
+  const requestId = ++hoverRequestId;
+  pendingTooltipIndex = hover.index;
   clearTimeout(hoverFetchTimer);
-  const wait = Math.max(tooltipFetchDelayMs, tooltipFetchDelayMs - (Date.now() - lastHoverFetchAt));
-  hoverFetchTimer = setTimeout(() => fetchTooltipSystem(hover, requestId), wait);
+  const wait = Math.max(0, tooltipFetchDelayMs - (Date.now() - lastHoverFetchAt));
+  hoverFetchTimer = setTimeout(() => {
+    const nextHover = pendingTooltipHover ?? hover;
+    hoverFetchTimer = null;
+    pendingTooltipIndex = null;
+    pendingTooltipHover = null;
+    fetchTooltipSystem(nextHover, requestId);
+  }, wait);
 }
 
 async function fetchTooltipSystem(hover, requestId) {
@@ -1548,11 +1572,19 @@ async function pollJournalScan(scan) {
     await loadPlaces();
     systemCache.clear();
     await loadNotes();
-    await loadPoints();
+    await refreshLocalPointsNow({ radius: Math.max(250, localPointRadius()), limit: 25000 }).catch((error) => {
+      if (isAbortError(error)) return;
+      console.warn(error);
+    });
     richSystemCache.clear();
     if (state.selectedSystem) await loadSelectedBodies();
     setStatus(scan.message || 'Journal data refreshed.');
     setJournalButtonsDisabled(false);
+    loadPoints({ background: true }).catch((error) => {
+      if (isAbortError(error)) return;
+      console.error(error);
+      setStatus(`Could not refresh galaxy map: ${error.message}`);
+    });
     return;
   }
   journalScanPollTimer = setTimeout(async () => {
@@ -1674,14 +1706,22 @@ async function resumeSystemUpdateIfRunning() {
   }
 }
 
-async function loadPoints() {
+async function loadPoints(options = {}) {
+  pointLoadController?.abort();
+  const requestId = ++pointLoadRequestId;
+  const controller = new AbortController();
+  pointLoadController = controller;
   if (state.enabledTypes.size === 0) {
     state.renderer.setPoints(new ArrayBuffer(0), state.meta);
     state.renderer.setLocalPoints(new ArrayBuffer(0), state.meta);
     state.basePointCount = 0;
     state.localPointCount = 0;
+    if (pointLoadController === controller) pointLoadController = null;
     setStatus('0 systems · filters hidden · search still works');
     return;
+  }
+  if (options.background) {
+    setStatus('Refreshing galaxy map in the background...', 'Nearby/local detail remains available while the global map layer refreshes.');
   }
   const params = new URLSearchParams({
     types: [...state.enabledTypes].join(','),
@@ -1710,8 +1750,18 @@ async function loadPoints() {
       if (rich.government) params.set('government', rich.government);
     }
   }
-  const response = await api(`/api/points?${params.toString()}`);
-  const buffer = await response.arrayBuffer();
+  let response;
+  let buffer;
+  try {
+    response = await api(`/api/points?${params.toString()}`, { signal: controller.signal });
+    buffer = await response.arrayBuffer();
+  } catch (error) {
+    if (isAbortError(error)) return;
+    throw error;
+  } finally {
+    if (pointLoadController === controller) pointLoadController = null;
+  }
+  if (requestId !== pointLoadRequestId) return;
   const lod = response.headers.get('x-lod-level');
   const richFiltersActive = response.headers.get('x-rich-filters') === '1';
   state.basePointCount = buffer.byteLength / 20;
@@ -1741,11 +1791,32 @@ function updatePointStatus() {
   );
 }
 
-function scheduleLocalPointsRefresh(delay = 450) {
+function localPointRadius() {
+  const step = state.renderer?.gridStep?.() ?? 250;
+  if (step <= 10) return 180;
+  if (step <= 25) return 250;
+  if (step <= 50) return 350;
+  if (step <= 100) return 500;
+  return 750;
+}
+
+function localPointLimit() {
+  const limit = state.renderer?.localPointLimit?.() ?? 0;
+  if (limit <= 0) return 0;
+  return Math.max(1000, Math.min(50000, limit));
+}
+
+function abortLocalPointsRequest() {
+  localPointsController?.abort();
+  localPointsController = null;
+}
+
+function scheduleLocalPointsRefresh(delay = 160, options = {}) {
   clearTimeout(localPointsRefreshTimer);
+  abortLocalPointsRequest();
   const requestId = ++localPointsRequestId;
   if (!state.spatialIndex || state.richPointFiltersActive || state.enabledTypes.size === 0) return;
-  const limit = state.renderer.localPointLimit();
+  const limit = Math.max(0, Math.min(Number(options.limit ?? localPointLimit()) || 0, 50000));
   if (limit <= 0) {
     if (state.localPointCount > 0) {
       state.localPointCount = 0;
@@ -1756,14 +1827,17 @@ function scheduleLocalPointsRefresh(delay = 450) {
     }
     return;
   }
-  localPointsRefreshTimer = setTimeout(() => refreshLocalPoints(requestId, limit).catch((error) => {
+  const radius = Math.max(25, Math.min(1000, Number(options.radius ?? localPointRadius()) || localPointRadius()));
+  localPointsRefreshTimer = setTimeout(() => refreshLocalPoints(requestId, limit, { radius, force: Boolean(options.force) }).catch((error) => {
+    if (isAbortError(error)) return;
     console.warn(error);
     setStatus(`Local system detail failed: ${error.message}`);
   }), delay);
 }
 
-async function refreshLocalPoints(requestId, limit) {
+async function refreshLocalPoints(requestId, limit, options = {}) {
   const coords = state.renderer.targetCoords();
+  const radius = Math.max(25, Math.min(1000, Number(options.radius ?? localPointRadius()) || localPointRadius()));
   const tileSize = Math.max(200, Math.min(1000, state.renderer.gridStep?.() ?? 250));
   const tileKey = [
     Math.floor(coords.x / tileSize),
@@ -1771,28 +1845,51 @@ async function refreshLocalPoints(requestId, limit) {
     Math.floor(coords.z / tileSize),
     tileSize,
     limit,
+    radius,
     [...state.enabledTypes].join(','),
     el.updatedFrom.disabled ? '' : el.updatedFrom.value,
     el.updatedBefore.disabled ? '' : el.updatedBefore.value,
   ].join(':');
-  if (state.localPointRequestKey === tileKey && state.localPointCount > 0) return;
+  if (!options.force && state.localPointRequestKey === tileKey && state.localPointCount > 0) return;
   const params = new URLSearchParams({
     x: String(coords.x),
     y: String(coords.y),
     z: String(coords.z),
     types: [...state.enabledTypes].join(','),
     limit: String(limit),
+    radius: String(radius),
   });
   if (!el.updatedFrom.disabled && el.updatedFrom.value) params.set('updatedFrom', el.updatedFrom.value);
   if (!el.updatedBefore.disabled && el.updatedBefore.value) params.set('updatedBefore', el.updatedBefore.value);
-  const response = await api(`/api/local-points?${params.toString()}`);
-  const buffer = await response.arrayBuffer();
+  const controller = new AbortController();
+  localPointsController = controller;
+  let response;
+  let buffer;
+  try {
+    response = await api(`/api/local-points?${params.toString()}`, { signal: controller.signal });
+    buffer = await response.arrayBuffer();
+  } catch (error) {
+    if (isAbortError(error)) return;
+    throw error;
+  } finally {
+    if (localPointsController === controller) localPointsController = null;
+  }
   if (requestId !== localPointsRequestId) return;
   state.localPointCount = buffer.byteLength / 20;
   state.localRadius = Number(response.headers.get('x-local-radius') ?? 0);
   state.localPointRequestKey = tileKey;
   state.renderer.setLocalPoints(buffer, state.meta);
   updatePointStatus();
+}
+
+async function refreshLocalPointsNow(options = {}) {
+  if (!state.spatialIndex || state.richPointFiltersActive || state.enabledTypes.size === 0) return false;
+  const limit = Math.max(1000, Math.min(Number(options.limit ?? localPointLimit()) || 25000, 50000));
+  const radius = Math.max(25, Math.min(1000, Number(options.radius ?? localPointRadius()) || localPointRadius()));
+  const requestId = ++localPointsRequestId;
+  abortLocalPointsRequest();
+  await refreshLocalPoints(requestId, limit, { radius, force: true });
+  return state.localPointCount > 0;
 }
 
 async function loadPlaces() {
