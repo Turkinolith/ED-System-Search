@@ -359,18 +359,18 @@ async function saveSystemNote(req, res) {
   });
 }
 
-async function listSystemNotes(reqUrl, res) {
+async function listSystemNotes(req, reqUrl, res) {
   const data = await getNotes();
   const q = String(reqUrl.searchParams.get('q') ?? '').trim().toLowerCase();
   const notes = q
     ? data.notes.filter((note) => note.systemName.toLowerCase().includes(q) || note.text.toLowerCase().includes(q))
     : data.notes;
-  return sendJson(res, {
+  return sendJsonWithEtag(req, res, {
     ...data,
     query: q,
     count: notes.length,
     notes,
-  });
+  }, `"notes-${notesCache?.mtimeMs ?? 0}-${q}"`);
 }
 
 async function getMeta() {
@@ -1261,6 +1261,34 @@ function updateSecondsAt(indexCache, index) {
   return record.readUInt32LE(0);
 }
 
+// Batch lookup for scattered indexes. Random-order updateSecondsAt calls
+// thrash the page LRU with synchronous multi-MB reads; reading the sorted
+// indexes as merged ranges touches each region of the file exactly once.
+function updateSecondsForIndexes(indexCache, sortedIndexes) {
+  const seconds = new Map();
+  if (!indexCache || sortedIndexes.length === 0) return seconds;
+  const mergeGapRecords = 16384;
+  let i = 0;
+  while (i < sortedIndexes.length) {
+    let j = i;
+    while (j + 1 < sortedIndexes.length && sortedIndexes[j + 1] - sortedIndexes[j] <= mergeGapRecords) j += 1;
+    const start = sortedIndexes[i];
+    const end = sortedIndexes[j];
+    const byteStart = indexCache.headerBytes + start * 4;
+    const byteLength = Math.min((end - start + 1) * 4, indexCache.size - byteStart);
+    if (byteLength > 0) {
+      const buffer = Buffer.allocUnsafe(byteLength);
+      const bytesRead = readSync(indexCache.fd, buffer, 0, byteLength, byteStart);
+      for (let k = i; k <= j; k += 1) {
+        const offset = (sortedIndexes[k] - start) * 4;
+        if (offset >= 0 && offset + 4 <= bytesRead) seconds.set(sortedIndexes[k], buffer.readUInt32LE(offset));
+      }
+    }
+    i = j + 1;
+  }
+  return seconds;
+}
+
 async function readUpdateSecondsAt(index) {
   return updateSecondsAt(await getUpdateIndex(), index);
 }
@@ -1303,6 +1331,12 @@ async function getVisited() {
     visitedCache = { cacheKey, data };
   }
   return visitedCache.data;
+}
+
+function visitedSummary(visited) {
+  if (!visited) return null;
+  const { systems, ...summary } = visited;
+  return summary;
 }
 
 async function getPlaces() {
@@ -1348,6 +1382,7 @@ async function getPlaces() {
         sourceGroups: data?.sourceGroups ?? {},
         types: data?.types ?? {},
         carrierRefresh: data?.carrierRefresh ?? null,
+        rawSource: data?.source ?? null,
         discoveries: discoveries ? {
           importedAt: discoveries.importedAt,
           source: discoveries.source,
@@ -1672,7 +1707,7 @@ async function queryLocalPoints(reqUrl, res) {
     if (selectedPointCount >= readTarget) break;
   }
   selectedCells.sort((a, b) => a.offset - b.offset);
-  const candidates = [];
+  let candidates = [];
   const dataFd = await fs.open(spatialDataPath, 'r');
   try {
     for (const cell of selectedCells) {
@@ -1690,15 +1725,21 @@ async function queryLocalPoints(reqUrl, res) {
         const typeCode = bytes.readUInt16LE(offset + 12);
         if (!typeAllowed(typeCode, typeSet)) continue;
         const recordIndex = bytes.readUInt32LE(offset + 16);
-        if (range.active && !updateAllowed(updateSecondsAt(updates, recordIndex), range)) continue;
         const record = Buffer.allocUnsafe(spatialPointBytes);
         bytes.copy(record, 0, offset, offset + spatialPointBytes);
         record.writeUInt16LE(record.readUInt16LE(14) | (visitedIndexSet.has(recordIndex) ? 4 : 0), 14);
-        candidates.push({ distanceSq, record });
+        candidates.push({ distanceSq, record, recordIndex });
       }
     }
   } finally {
     await dataFd.close();
+  }
+  if (range.active && candidates.length) {
+    // Spatial candidates come out in random index order; batch the update
+    // lookups in sorted order so the 737 MB index is read as merged ranges.
+    const sortedIndexes = [...new Set(candidates.map((candidate) => candidate.recordIndex))].sort((a, b) => a - b);
+    const secondsByIndex = updateSecondsForIndexes(updates, sortedIndexes);
+    candidates = candidates.filter((candidate) => updateAllowed(secondsByIndex.get(candidate.recordIndex) ?? unknownUpdateSeconds, range));
   }
   candidates.sort((a, b) => a.distanceSq - b.distanceSq);
   const selected = candidates.slice(0, limit);
@@ -1928,6 +1969,10 @@ function shouldRefreshCarriers(payload) {
 }
 
 async function refreshCarrierPlacesOnceDaily() {
+  if (carrierRefreshPromise) return carrierRefreshPromise;
+  const summary = existsSync(placesPath) ? await getPlaces() : null;
+  if (!summary?.imported) return;
+  if (summary.rawSource !== 'EDAstro Combined POI' || summary.carrierRefresh?.date === todayKey()) return;
   const payload = await readJson(placesPath, null);
   if (!payload?.places?.length || !shouldRefreshCarriers(payload)) return;
   if (carrierRefreshPromise) return carrierRefreshPromise;
@@ -1994,14 +2039,24 @@ async function refreshCarrierPlacesOnceDaily() {
   return carrierRefreshPromise;
 }
 
-function sendJson(res, data, status = 200) {
+function sendJson(res, data, status = 200, extraHeaders = null) {
   const body = Buffer.from(JSON.stringify(data));
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': body.length,
     'cache-control': 'no-store',
+    ...extraHeaders,
   });
   res.end(body);
+}
+
+// Serve JSON with an ETag so unchanged payloads revalidate as 304s.
+function sendJsonWithEtag(req, res, data, etag) {
+  if (req.headers['if-none-match'] === etag) {
+    res.writeHead(304, { etag, 'cache-control': 'no-cache' });
+    return res.end();
+  }
+  return sendJson(res, data, 200, { etag, 'cache-control': 'no-cache' });
 }
 
 function badRequest(res, message) {
@@ -2151,6 +2206,23 @@ function appendVirtualVisitedPoints(out, included, includedCoords, meta, supplem
   });
 }
 
+// Cache of final /api/points payloads for the common request shape (no update
+// range, no rich filters), keyed by everything that can change the output.
+const pointsPayloadCache = new Map();
+const pointsPayloadCacheLimit = 3;
+
+function sendPointsPayload(res, body, lod, richActive) {
+  res.writeHead(200, {
+    'content-type': 'application/octet-stream',
+    'content-length': body.length,
+    'x-lod-level': String(lod.level),
+    'x-total-count': String(lod.count),
+    'x-rich-filters': richActive ? '1' : '0',
+    'cache-control': 'no-store',
+  });
+  res.end(body);
+}
+
 async function readPoints(reqUrl, res) {
   const meta = await getMeta();
   if (!meta) return sendJson(res, { error: 'Systems have not been imported yet.' }, 409);
@@ -2171,6 +2243,26 @@ async function readPoints(reqUrl, res) {
   const updates = range.active ? await getUpdateIndex() : null;
   const limit = Math.max(1000, Math.min(Number(reqUrl.searchParams.get('limit') ?? 250000), 500000));
   const source = path.join(dataDir, lod.file);
+  let payloadCacheKey = null;
+  if (!richFilters.active) {
+    const lodStat = existsSync(source) ? await fs.stat(source) : null;
+    const supplementalStat = existsSync(supplementalPath) ? await fs.stat(supplementalPath) : null;
+    payloadCacheKey = [
+      lod.level,
+      lodStat?.mtimeMs ?? 0,
+      supplementalStat?.mtimeMs ?? 0,
+      visitedCache?.cacheKey ?? '',
+      updates ? `${updates.mtimeMs}:${range.from}:${range.before}` : '',
+      [...typeSet].sort((a, b) => a - b).join(','),
+      limit,
+    ].join('|');
+    const hit = pointsPayloadCache.get(payloadCacheKey);
+    if (hit) {
+      pointsPayloadCache.delete(payloadCacheKey);
+      pointsPayloadCache.set(payloadCacheKey, hit);
+      return sendPointsPayload(res, hit, lod, false);
+    }
+  }
   const out = [];
   const included = new Set();
   const includedCoords = new Set();
@@ -2263,15 +2355,13 @@ async function readPoints(reqUrl, res) {
   }
 
   const body = Buffer.concat(out);
-  res.writeHead(200, {
-    'content-type': 'application/octet-stream',
-    'content-length': body.length,
-    'x-lod-level': String(lod.level),
-    'x-total-count': String(lod.count),
-    'x-rich-filters': richFilters.active ? '1' : '0',
-    'cache-control': 'no-store',
-  });
-  res.end(body);
+  if (payloadCacheKey) {
+    pointsPayloadCache.set(payloadCacheKey, body);
+    while (pointsPayloadCache.size > pointsPayloadCacheLimit) {
+      pointsPayloadCache.delete(pointsPayloadCache.keys().next().value);
+    }
+  }
+  sendPointsPayload(res, body, lod, richFilters.active);
 }
 
 function searchMatch(query, candidate) {
@@ -2593,6 +2683,7 @@ async function runJournalRefresh(reqUrl, res) {
     metaCache = null;
     clearSystemDetailCache();
     await getVisited().catch(() => null);
+    await getMeta().catch(() => null);
     const finalLine = stdout
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -2769,7 +2860,10 @@ async function runSystemUpdate(reqUrl, res) {
     updateIndexCache = null;
     suggestOverlayCache = null;
     galaxyManifestCache = null;
+    // Warm the heavy caches before clients see running:false, so their next
+    // /api/status and /api/places calls don't stall on the re-parse.
     await getVisited().catch(() => null);
+    await getPlaces().catch(() => null);
     const meta = await getMeta().catch(() => null);
     const finishedAt = new Date().toISOString();
     const ok = Boolean(final.ok);
@@ -2828,7 +2922,15 @@ async function runSystemUpdate(reqUrl, res) {
   return sendJson(res, { started: true, update: systemUpdateStatus }, 202);
 }
 
-async function serveRegionMap(res) {
+function notModifiedSince(req, stat) {
+  const since = req.headers['if-modified-since'];
+  if (!since) return false;
+  const sinceMs = Date.parse(since);
+  // HTTP dates have second precision, so truncate the file mtime before comparing.
+  return Number.isFinite(sinceMs) && Math.floor(stat.mtimeMs / 1000) * 1000 <= sinceMs;
+}
+
+async function serveRegionMap(req, res) {
   if (!existsSync(regionMapPath)) {
     return sendJson(res, {
       imported: false,
@@ -2837,14 +2939,19 @@ async function serveRegionMap(res) {
   }
   const stat = await fs.stat(regionMapPath);
   if (!stat.isFile()) return notFound(res);
+  if (notModifiedSince(req, stat)) {
+    res.writeHead(304, { 'cache-control': 'no-cache' });
+    return res.end();
+  }
   res.writeHead(200, {
     'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
+    'cache-control': 'no-cache',
+    'last-modified': new Date(stat.mtimeMs).toUTCString(),
   });
   return createReadStream(regionMapPath).pipe(res);
 }
 
-async function serveStatic(reqUrl, res) {
+async function serveStatic(req, reqUrl, res) {
   const decoded = decodeURIComponent(reqUrl.pathname === '/' ? '/index.html' : reqUrl.pathname);
   const requested = path.normalize(decoded).replace(/^(\.\.[/\\])+/, '');
   const filePath = path.join(publicDir, requested);
@@ -2852,10 +2959,15 @@ async function serveStatic(reqUrl, res) {
   try {
     const stat = await fs.stat(filePath);
     if (!stat.isFile()) return notFound(res);
+    if (notModifiedSince(req, stat)) {
+      res.writeHead(304, { 'cache-control': 'no-cache' });
+      return res.end();
+    }
     const ext = path.extname(filePath);
     res.writeHead(200, {
       'content-type': mimeTypes.get(ext) ?? 'application/octet-stream',
-      'cache-control': 'no-store',
+      'cache-control': 'no-cache',
+      'last-modified': new Date(stat.mtimeMs).toUTCString(),
     });
     createReadStream(filePath).pipe(res);
   } catch {
@@ -2867,7 +2979,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const reqUrl = new URL(req.url, `http://${req.headers.host}`);
     if (reqUrl.pathname === '/api/status') {
-      await refreshCarrierPlacesOnceDaily().catch((error) => console.warn(`Carrier POI refresh failed: ${error.message}`));
+      refreshCarrierPlacesOnceDaily().catch((error) => console.warn(`Carrier POI refresh failed: ${error.message}`));
       const [meta, visited, places, systemUpdateLog, galaxyManifest, spatialIndex] = await Promise.all([
         getMeta(),
         getVisited(),
@@ -2879,7 +2991,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, {
         imported: Boolean(meta),
         meta,
-        visited,
+        visited: visitedSummary(visited),
         places: placesSummary(places),
         galaxyDetails: galaxyDetailsSummary(galaxyManifest),
         spatialIndex,
@@ -2909,10 +3021,17 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/llm-search' && req.method === 'POST') return await llmAugmentedSearch(req, res);
     if (reqUrl.pathname === '/api/system') return await readSystemDetail(reqUrl, res);
     if (reqUrl.pathname === '/api/system-rich') return await readRichSystem(reqUrl, res);
-    if (reqUrl.pathname === '/api/notes' && req.method === 'GET') return await listSystemNotes(reqUrl, res);
+    if (reqUrl.pathname === '/api/notes' && req.method === 'GET') return await listSystemNotes(req, reqUrl, res);
     if (reqUrl.pathname === '/api/notes' && req.method === 'POST') return await saveSystemNote(req, res);
-    if (reqUrl.pathname === '/api/places') return sendJson(res, await getPlaces());
-    if (reqUrl.pathname === '/api/regions') return await serveRegionMap(res);
+    if (reqUrl.pathname === '/api/places') {
+      const places = await getPlaces();
+      return sendJsonWithEtag(req, res, places, `"places-${placesCache?.cacheKey ?? 'empty'}"`);
+    }
+    if (reqUrl.pathname === '/api/visited-indexes') {
+      await getVisited();
+      return sendJson(res, { indexes: [...visitedIndexSet] });
+    }
+    if (reqUrl.pathname === '/api/regions') return await serveRegionMap(req, res);
     if (reqUrl.pathname === '/api/murder-binaries') return queryMurderBinaries(reqUrl, res);
     if (reqUrl.pathname === '/api/discoveries') return sendJson(res, await getDiscoveries() ?? { imported: false, places: [] });
     if (reqUrl.pathname === '/api/visited') return sendJson(res, await getVisited());
@@ -2920,7 +3039,7 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/refresh-journals' && req.method === 'POST') return await runJournalRefresh(reqUrl, res);
     if (reqUrl.pathname === '/api/system-update-status') return sendJson(res, { ...systemUpdateStatus, log: await getSystemUpdateLog() });
     if (reqUrl.pathname === '/api/system-update' && req.method === 'POST') return await runSystemUpdate(reqUrl, res);
-    return await serveStatic(reqUrl, res);
+    return await serveStatic(req, reqUrl, res);
   } catch (error) {
     console.error(error);
     sendJson(res, { error: error.message }, 500);

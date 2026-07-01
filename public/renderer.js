@@ -399,6 +399,11 @@ function placeStyle(place) {
   return styles[category] ?? styles['Other POIs'];
 }
 
+function yieldToUi() {
+  if (typeof scheduler !== 'undefined' && typeof scheduler.yield === 'function') return scheduler.yield();
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 export class GalaxyRenderer {
   constructor(canvas, overlay) {
     this.canvas = canvas;
@@ -415,6 +420,8 @@ export class GalaxyRenderer {
     this.basePoints = [];
     this.localPoints = [];
     this.allPoints = [];
+    this.pointDecodeTokens = { basePoints: 0, localPoints: 0 };
+    this.mergeToken = 0;
     this.pointByIndex = new Map();
     this.pointSpatialBuckets = new Map();
     this.pointSpatialCellSize = 2500;
@@ -479,6 +486,7 @@ export class GalaxyRenderer {
     this.regionPathCache = null;
     this.regionMapLoading = false;
     this.regionMapError = null;
+    this.accentColor = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#f2a541';
     this.bind();
     this.loadRegionMap();
   }
@@ -748,18 +756,29 @@ export class GalaxyRenderer {
   }
 
   setPoints(buffer, meta) {
-    this.basePoints = this.decodePoints(buffer, meta);
-    this.mergePointSources();
+    return this.replacePointSource('basePoints', buffer, meta);
   }
 
   setLocalPoints(buffer, meta) {
-    this.localPoints = this.decodePoints(buffer, meta);
-    this.mergePointSources();
+    return this.replacePointSource('localPoints', buffer, meta);
   }
 
-  decodePoints(buffer, meta) {
+  // Decode and merge are time-sliced so a 300k-point payload never freezes
+  // the UI; a newer call for the same source cancels the in-flight one.
+  async replacePointSource(sourceKey, buffer, meta) {
+    const token = ++this.pointDecodeTokens[sourceKey];
+    const isCurrent = () => this.pointDecodeTokens[sourceKey] === token;
+    const points = await this.decodePoints(buffer, meta, isCurrent);
+    if (!points || !isCurrent()) return;
+    this[sourceKey] = points;
+    await this.mergePointSources();
+  }
+
+  async decodePoints(buffer, meta, isCurrent = () => true) {
     const view = new DataView(buffer);
     const points = [];
+    const chunkRecords = 10000;
+    let recordsInChunk = 0;
     for (let offset = 0; offset + 20 <= buffer.byteLength; offset += 20) {
       const x = view.getFloat32(offset, true);
       const y = view.getFloat32(offset + 4, true);
@@ -769,31 +788,52 @@ export class GalaxyRenderer {
       const index = view.getUint32(offset + 16, true);
       const typeName = meta.typeNames[typeCode] ?? '';
       points.push({ ...toRenderCoords({ x, y, z }), typeName, flags, index, special: specialKind(typeName), bucket: stableBucket(index) });
+      if (++recordsInChunk >= chunkRecords) {
+        recordsInChunk = 0;
+        await yieldToUi();
+        if (!isCurrent()) return null;
+      }
     }
     return points;
   }
 
-  mergePointSources() {
-    const indexes = new Set(this.basePoints.map((point) => point.index));
-    this.allPoints = [...this.basePoints];
-    for (const point of this.localPoints) {
-      if (indexes.has(point.index)) continue;
-      indexes.add(point.index);
-      this.allPoints.push(point);
+  async mergePointSources() {
+    const token = ++this.mergeToken;
+    const isCurrent = () => this.mergeToken === token;
+    const indexes = new Set();
+    const all = [];
+    for (const source of [this.basePoints, this.localPoints]) {
+      for (let i = 0; i < source.length; i += 1) {
+        const point = source[i];
+        if (indexes.has(point.index)) continue;
+        indexes.add(point.index);
+        all.push(point);
+        if (all.length % 25000 === 0) {
+          await yieldToUi();
+          if (!isCurrent()) return;
+        }
+      }
     }
-    this.buildPointSpatialIndex();
+    const spatial = await this.buildPointSpatialIndex(all, isCurrent);
+    if (!spatial || !isCurrent()) return;
+    this.allPoints = all;
+    this.pointByIndex = spatial.byIndex;
+    this.pointSpatialBuckets = spatial.buckets;
+    this.alwaysPriorityPoints = spatial.alwaysPriority;
+    this.visitedPriorityPoints = spatial.visitedPriority;
     this.lastBufferKey = '';
     this.rebuildDrawBuffers(true);
     this.requestRender();
   }
 
-  buildPointSpatialIndex() {
+  async buildPointSpatialIndex(allPoints, isCurrent = () => true) {
     const buckets = new Map();
     const byIndex = new Map();
     const alwaysPriority = [];
     const visitedPriority = [];
     const cellSize = this.pointSpatialCellSize;
-    for (const point of this.allPoints) {
+    for (let i = 0; i < allPoints.length; i += 1) {
+      const point = allPoints[i];
       byIndex.set(point.index, point);
       const key = `${Math.floor(point.x / cellSize)}:${Math.floor(point.y / cellSize)}:${Math.floor(point.z / cellSize)}`;
       let bucket = buckets.get(key);
@@ -804,11 +844,30 @@ export class GalaxyRenderer {
       bucket.push(point);
       if (point.special || (point.flags & 2)) alwaysPriority.push(point);
       if (point.flags & 4) visitedPriority.push(point);
+      if (i > 0 && i % 25000 === 0) {
+        await yieldToUi();
+        if (!isCurrent()) return null;
+      }
     }
-    this.pointByIndex = byIndex;
-    this.pointSpatialBuckets = buckets;
-    this.alwaysPriorityPoints = alwaysPriority;
-    this.visitedPriorityPoints = visitedPriority;
+    return { buckets, byIndex, alwaysPriority, visitedPriority };
+  }
+
+  // Journal scans only ever add visits, so flags are set (never cleared) in
+  // place on the shared point objects; a full reload handles anything else.
+  applyVisitedFlags(indexSet) {
+    let changed = 0;
+    for (const point of this.allPoints) {
+      if ((point.flags & 4) === 0 && indexSet.has(point.index)) {
+        point.flags |= 4;
+        changed += 1;
+      }
+    }
+    if (!changed) return 0;
+    this.visitedPriorityPoints = this.allPoints.filter((point) => point.flags & 4);
+    this.lastBufferKey = '';
+    this.rebuildDrawBuffers(true);
+    this.requestRender();
+    return changed;
   }
 
   addPointCandidate(out, seen, point) {
@@ -2011,8 +2070,8 @@ export class GalaxyRenderer {
     const ctx = this.ctx;
     ctx.save();
     ctx.translate(screen.x, screen.y);
-    ctx.strokeStyle = '#f2a541';
-    ctx.fillStyle = '#f2a541';
+    ctx.strokeStyle = this.accentColor;
+    ctx.fillStyle = this.accentColor;
     ctx.lineWidth = 2.4;
     ctx.beginPath();
     ctx.arc(0, 0, 16, 0, Math.PI * 2);
@@ -2031,7 +2090,7 @@ export class GalaxyRenderer {
     ctx.textBaseline = 'middle';
     const width = ctx.measureText(this.selectedSystem.name).width;
     this.drawLabelPlate(24, -13, width + 16, 26, 'rgba(242, 165, 65, 0.72)');
-    ctx.fillStyle = '#f2a541';
+    ctx.fillStyle = this.accentColor;
     ctx.fillText(this.selectedSystem.name, 31, 0);
     ctx.restore();
   }
@@ -2064,8 +2123,8 @@ export class GalaxyRenderer {
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.translate(screen.x, screen.y);
-    ctx.strokeStyle = search ? '#f2a541' : css;
-    ctx.fillStyle = search ? '#f2a541' : css;
+    ctx.strokeStyle = search ? this.accentColor : css;
+    ctx.fillStyle = search ? this.accentColor : css;
     ctx.lineWidth = search ? 2 : 1.4;
     if (this.showVisited && (point.flags & 4)) {
       ctx.lineCap = 'round';
