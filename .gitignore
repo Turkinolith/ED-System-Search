@@ -23,6 +23,7 @@ tmp/
 # Codex and local-agent metadata
 .agents/
 .codex/
+.claude/
 
 # Editor and OS files
 .vscode/
