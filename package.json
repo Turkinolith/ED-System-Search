@@ -28,6 +28,7 @@
     "test:journals": "node scripts/test-journal-bodies.js",
     "test:config": "node scripts/test-local-config.js",
     "test:stars": "node scripts/test-star-visuals.js",
+    "test:shutdown": "node scripts/test-shutdown-guard.js",
     "import:journals": "node scripts/import-journals.js",
     "import:updates": "node scripts/import-updates.js systems.json.gz",
     "import:name-lookup": "node --max-old-space-size=98304 scripts/import-name-lookup.js",

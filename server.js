@@ -1,5 +1,6 @@
-import { closeSync, createReadStream, existsSync, openSync, promises as fs, readSync } from 'node:fs';
+import { closeSync, createReadStream, existsSync, openSync, promises as fs, readSync, writeSync } from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +11,7 @@ import { zstdDecompressSync } from 'node:zlib';
 import { dateInputToSeconds, parseUpdateSeconds, secondsToIso, unknownUpdateSeconds } from './scripts/update-time.js';
 import { suggestKey } from './scripts/suggest-key.js';
 import { loadLocalConfig } from './local-config.js';
+import { createShutdownController } from './shutdown-guard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
@@ -43,6 +45,34 @@ const spatialDataPath = path.join(dataDir, 'systems-spatial.bin');
 const localConfig = loadLocalConfig();
 const spatialIndexPath = path.join(dataDir, 'systems-spatial.idx');
 const combinedPoiUrl = 'https://edastro.com/mapcharts/files/edsmPOI.csv';
+const appIdentity = 'ed-system-search';
+
+// Describe any long-running data write in progress, or null when idle. Used to
+// warn a second instance before it takes over the port and interrupts a write.
+function currentWriteActivity() {
+  if (systemUpdateStatus?.running) {
+    const detail = systemUpdateStatus.step || systemUpdateStatus.mode || 'in progress';
+    return `system/galaxy update (${detail})`;
+  }
+  if (journalScanStatus?.running) {
+    const detail = journalScanStatus.mode ? `${journalScanStatus.mode} scan` : 'in progress';
+    return `journal scan (${detail})`;
+  }
+  return null;
+}
+
+// Write via a temp file + rename so a crash or forced shutdown mid-write can
+// never leave a truncated/corrupt file in place of the real one.
+async function writeFileAtomic(filePath, data) {
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  await fs.writeFile(tmp, data);
+  try {
+    await fs.rename(tmp, filePath);
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+}
 const recordBytes = 32;
 const lodBytes = 20;
 const richIndexHeaderBytes = 32;
@@ -277,7 +307,7 @@ async function appendSystemUpdateLog(entry) {
     updatedAt: new Date().toISOString(),
     runs,
   };
-  await fs.writeFile(systemUpdateLogPath, JSON.stringify(next, null, 2));
+  await writeFileAtomic(systemUpdateLogPath, JSON.stringify(next, null, 2));
   return next;
 }
 
@@ -327,7 +357,7 @@ async function writeNotes(notes) {
     notes: notes.sort((a, b) => a.systemName.localeCompare(b.systemName)),
   };
   await fs.mkdir(dataDir, { recursive: true });
-  await fs.writeFile(notesPath, JSON.stringify(payload, null, 2));
+  await writeFileAtomic(notesPath, JSON.stringify(payload, null, 2));
   notesCache = null;
   return payload;
 }
@@ -2102,7 +2132,7 @@ async function refreshCarrierPlacesOnceDaily() {
         },
         places,
       };
-      await fs.writeFile(placesPath, JSON.stringify(next, null, 2));
+      await writeFileAtomic(placesPath, JSON.stringify(next, null, 2));
       placesCache = null;
     } catch (error) {
       const next = {
@@ -2115,7 +2145,7 @@ async function refreshCarrierPlacesOnceDaily() {
           sourceUrl: combinedPoiUrl,
         },
       };
-      await fs.writeFile(placesPath, JSON.stringify(next, null, 2));
+      await writeFileAtomic(placesPath, JSON.stringify(next, null, 2));
       placesCache = null;
     } finally {
       carrierRefreshPromise = null;
@@ -3142,6 +3172,10 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/refresh-journals' && req.method === 'POST') return await runJournalRefresh(reqUrl, res);
     if (reqUrl.pathname === '/api/system-update-status') return sendJson(res, { ...systemUpdateStatus, log: await getSystemUpdateLog() });
     if (reqUrl.pathname === '/api/system-update' && req.method === 'POST') return await runSystemUpdate(reqUrl, res);
+    if (reqUrl.pathname === '/api/ping') {
+      const activity = currentWriteActivity();
+      return sendJson(res, { app: appIdentity, pid: process.pid, busy: Boolean(activity), activity });
+    }
     return await serveStatic(req, reqUrl, res);
   } catch (error) {
     console.error(error);
@@ -3150,6 +3184,259 @@ const server = http.createServer(async (req, res) => {
 });
 
 const port = Number(process.env.PORT ?? 5177);
-server.listen(port, () => {
+
+// Distinct exit codes so the launcher (.bat) can print a situation-appropriate
+// message instead of a generic failure line.
+const exitCodes = {
+  declinedBusyInstance: 2,
+  portHeldByOtherProgram: 3,
+  couldNotFreePort: 4,
+};
+
+// Look up the PID of whatever process is listening on the port. Used only to
+// stop a leftover instance of this app, so it may return null on unsupported
+// platforms without affecting normal startup.
+function findListeningPid(targetPort) {
+  const isWindows = process.platform === 'win32';
+  const child = isWindows
+    ? spawn('netstat', ['-ano'], { windowsHide: true })
+    : spawn('lsof', ['-nP', `-iTCP:${targetPort}`, '-sTCP:LISTEN', '-t']);
+  return new Promise((resolve) => {
+    let out = '';
+    child.stdout.on('data', (chunk) => { out += chunk; });
+    child.on('error', () => resolve(null));
+    child.on('close', () => {
+      if (!isWindows) {
+        const pid = Number(out.split(/\r?\n/).find(Boolean));
+        return resolve(Number.isInteger(pid) && pid > 0 ? pid : null);
+      }
+      for (const line of out.split(/\r?\n/)) {
+        const parts = line.trim().split(/\s+/);
+        // Proto  LocalAddress  ForeignAddress  State  PID
+        if (parts[0] !== 'TCP' || parts[3] !== 'LISTENING') continue;
+        if (!parts[1]?.endsWith(`:${targetPort}`)) continue;
+        const pid = Number(parts[4]);
+        if (Number.isInteger(pid) && pid > 0) return resolve(pid);
+      }
+      resolve(null);
+    });
+  });
+}
+
+// Determine whether the port is held by another instance of this app, which
+// process it is, and whether it is mid-write. Returns { pid, busy, activity },
+// or null when the port is held by an unrelated program (never to be killed).
+async function readExistingInstance(targetPort) {
+  const base = `http://127.0.0.1:${targetPort}`;
+  const probe = async (path) => {
+    try {
+      const response = await fetch(`${base}${path}`, { signal: AbortSignal.timeout(2000) });
+      if (!response.ok) return null;
+      return await response.json().catch(() => null);
+    } catch {
+      return null;
+    }
+  };
+  // Current builds expose /api/ping, which reports their own pid and whether a
+  // data write is in progress.
+  const ping = await probe('/api/ping');
+  if (ping?.app === appIdentity) {
+    const pid = Number(ping.pid) > 0 ? Number(ping.pid) : await findListeningPid(targetPort);
+    if (!pid) return null;
+    if (typeof ping.busy === 'boolean') {
+      return { pid, busy: ping.busy, activity: ping.activity ?? null };
+    }
+    return { pid, ...await probeInstanceActivity(probe) };
+  }
+  // Older builds have no ping route; confirm identity via the status shape and
+  // fall back to an OS lookup of the listening pid.
+  const status = await probe('/api/status');
+  if (status && typeof status === 'object' && 'galaxyDetails' in status) {
+    const pid = await findListeningPid(targetPort);
+    if (!pid) return null;
+    return { pid, ...await probeInstanceActivity(probe, status) };
+  }
+  return null;
+}
+
+// Fallback busy check for builds whose /api/ping predates the busy flag, using
+// the long-standing status and journal-scan endpoints.
+async function probeInstanceActivity(probe, status = null) {
+  const update = status ?? await probe('/api/status');
+  if (update?.systemUpdates?.running) {
+    const current = update.systemUpdates.current ?? {};
+    return { busy: true, activity: `system/galaxy update (${current.step || current.mode || 'in progress'})` };
+  }
+  const scan = await probe('/api/journal-scan-status');
+  if (scan?.running) {
+    return { busy: true, activity: `journal scan (${scan.mode ? `${scan.mode} scan` : 'in progress'})` };
+  }
+  return { busy: false, activity: null };
+}
+
+function askYesNo(query) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(query, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase());
+    });
+  });
+}
+
+// The previous instance is mid-write. Only proceed if the user explicitly opts
+// in — and warn about the corruption risk before doing so.
+async function confirmForcedTakeover(existing) {
+  const forceFlag = process.argv.includes('--force') || process.env.EDSS_FORCE_TAKEOVER === '1';
+  const warning = [
+    '',
+    '============================================================',
+    ` WARNING: the running instance (pid ${existing.pid}) is busy:`,
+    `   ${existing.activity || 'writing data'}`,
+    '',
+    ' Forcing it to stop now can interrupt that write and leave the',
+    ' galaxy database or your notes/places files corrupted, likely',
+    ' requiring a re-import to recover.',
+    '============================================================',
+    '',
+  ].join('\n');
+  console.error(warning);
+  if (forceFlag) {
+    console.error('Proceeding: --force / EDSS_FORCE_TAKEOVER=1 was set.');
+    return true;
+  }
+  if (!process.stdin.isTTY) {
+    console.error('Left the previous instance running (this session is not interactive).');
+    console.error('Wait for it to finish, or restart with --force (or EDSS_FORCE_TAKEOVER=1) to override.');
+    return false;
+  }
+  const answer = await askYesNo('Type "yes" to force takeover and accept the corruption risk, or press Enter to cancel: ');
+  if (answer === 'yes') return true;
+  console.error('Cancelled. The previous instance is still running.');
+  return false;
+}
+
+function waitForPortFree(targetPort, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const attempt = () => {
+      const socket = net.connect(targetPort, '127.0.0.1');
+      socket.once('connect', () => {
+        socket.destroy();
+        if (Date.now() > deadline) return resolve(false);
+        setTimeout(attempt, 150);
+      });
+      socket.once('error', () => {
+        socket.destroy();
+        resolve(true);
+      });
+    };
+    attempt();
+  });
+}
+
+async function stopExistingInstance(pid, targetPort) {
+  if (process.platform === 'win32') {
+    // /T kills the whole tree, so a spawned importer child is stopped too
+    // rather than orphaned to keep writing.
+    await new Promise((resolve) => {
+      const child = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true });
+      child.on('error', resolve);
+      child.on('close', resolve);
+    });
+  } else {
+    try {
+      process.kill(pid, 'SIGTERM');
+      setTimeout(() => { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }, 1500).unref();
+    } catch (error) {
+      if (error.code !== 'ESRCH') throw error;
+    }
+  }
+  return waitForPortFree(targetPort);
+}
+
+function listen(targetPort) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      resolve();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(targetPort);
+  });
+}
+
+async function start() {
+  try {
+    await listen(port);
+  } catch (error) {
+    if (error.code !== 'EADDRINUSE') throw error;
+    const existing = await readExistingInstance(port);
+    if (!existing) {
+      console.error(`Port ${port} is already in use by another program. Close it or set PORT to a free port, then restart.`);
+      process.exit(exitCodes.portHeldByOtherProgram);
+    }
+    if (existing.busy && !(await confirmForcedTakeover(existing))) {
+      process.exit(exitCodes.declinedBusyInstance);
+    }
+    console.log(`Port ${port} is held by a previous instance (pid ${existing.pid}). Stopping it...`);
+    const freed = await stopExistingInstance(existing.pid, port);
+    if (!freed) {
+      console.error(`Could not free port ${port} from the previous instance (pid ${existing.pid}). Stop it manually, then restart.`);
+      process.exit(exitCodes.couldNotFreePort);
+    }
+    await listen(port);
+  }
   console.log(`Elite Dangerous System Search running at http://localhost:${port}`);
+}
+
+function gracefulExit(code) {
+  let exited = false;
+  const finish = () => {
+    if (exited) return;
+    exited = true;
+    process.exit(code);
+  };
+  server.close(finish);
+  setTimeout(finish, 3000).unref();
+}
+
+// Intercept shutdown signals so a Ctrl+C (or console interrupt) while an import
+// or journal scan is writing does not corrupt data — it queues the exit until
+// the write finishes, or forces it on a second interrupt.
+// Write straight to the stderr fd so shutdown notices are guaranteed to flush
+// before process.exit, even when output is piped (async console streams can be
+// truncated by an immediate exit).
+const writeShutdownMessage = (message) => {
+  try {
+    writeSync(2, `${message}\n`);
+  } catch {
+    console.error(message);
+  }
+};
+const shutdownController = createShutdownController({
+  getActivity: currentWriteActivity,
+  exit: gracefulExit,
+  log: writeShutdownMessage,
+  error: writeShutdownMessage,
+  schedulePoll: (tick) => {
+    const timer = setInterval(() => {
+      if (tick() === 'stop') clearInterval(timer);
+    }, 1000);
+    timer.unref();
+  },
+});
+const shutdownSignals = process.platform === 'win32' ? ['SIGINT', 'SIGBREAK'] : ['SIGINT', 'SIGTERM'];
+for (const signal of shutdownSignals) {
+  process.on(signal, () => shutdownController.handleSignal(signal));
+}
+
+start().catch((error) => {
+  console.error(error);
+  process.exit(1);
 });

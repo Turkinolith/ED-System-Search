@@ -263,6 +263,16 @@ function setStatus(message, title = message) {
   el.status.title = title;
 }
 
+// While the server is writing data (journal scan or system/galaxy update), the
+// status pill switches to a high-visibility warning style so the user knows
+// not to close or relaunch the app mid-write.
+const busyWriteKinds = new Set();
+function setWriteActivity(kind, active) {
+  if (active) busyWriteKinds.add(kind);
+  else busyWriteKinds.delete(kind);
+  el.status.classList.toggle('busy-write', busyWriteKinds.size > 0);
+}
+
 function isAbortError(error) {
   return error?.name === 'AbortError';
 }
@@ -604,6 +614,7 @@ function elapsedText(startedAt) {
 function setScanStatus(scan) {
   const label = scan.mode === 'all' ? 'All scan' : 'Latest scan';
   const elapsed = scan.startedAt ? elapsedText(scan.startedAt) : '0:00';
+  setWriteActivity('scan', Boolean(scan.running));
   setStatus(`${label} ${elapsed} · ${scan.message ?? 'working'}`);
 }
 
@@ -621,6 +632,7 @@ function setSystemUpdateStatus(update) {
       : 'Data update';
   const elapsed = update?.startedAt ? elapsedText(update.startedAt) : '0:00';
   const message = `${label} ${elapsed} · ${update?.step ?? 'running'} · ${update?.message ?? 'working'}`;
+  setWriteActivity('update', Boolean(update?.running));
   setStatus(message);
   el.systemUpdateStatus.textContent = message;
   setDownloadProgress(update?.message ?? '', Boolean(update?.running));
@@ -1586,6 +1598,7 @@ async function refreshJournals(mode = 'latest') {
     await pollJournalScan(result.scan);
   } catch (error) {
     console.error(error);
+    setWriteActivity('scan', false);
     setStatus(`Journal scan failed: ${error.message}`);
     setJournalButtonsDisabled(false);
   }
@@ -1630,6 +1643,7 @@ async function pollJournalScan(scan) {
       await pollJournalScan(nextScan);
     } catch (error) {
       console.error(error);
+      setWriteActivity('scan', false);
       setStatus(`Journal scan status failed: ${error.message}`);
       setJournalButtonsDisabled(false);
     }
@@ -1682,6 +1696,7 @@ async function runSystemUpdate(mode, confirmedLarge = false) {
     await pollSystemUpdate(result.update);
   } catch (error) {
     console.error(error);
+    setWriteActivity('update', false);
     setStatus(`System update failed: ${error.message}`);
     el.systemUpdateStatus.textContent = `Failed: ${error.message}`;
     setDownloadProgress('', false);
@@ -1716,12 +1731,37 @@ async function pollSystemUpdate(update) {
       await pollSystemUpdate(nextUpdate);
     } catch (error) {
       console.error(error);
+      setWriteActivity('update', false);
       setStatus(`System update status failed: ${error.message}`);
       el.systemUpdateStatus.textContent = `Status failed: ${error.message}`;
       setDownloadProgress('', false);
       setSystemButtonsDisabled(false);
     }
   }, 1000);
+}
+
+// Notice server write activity this page didn't start (another tab, or a scan
+// begun before load): a cheap ping every 5s hands off to the per-second
+// trackers above, which drive the busy banner and the post-completion refresh.
+// The buttons are disabled exactly while a tracker is active, so they double
+// as the "already tracking" guard against duplicate poll loops.
+function startServerBusyWatch() {
+  setInterval(async () => {
+    if (busyWriteKinds.size > 0) return;
+    const scanTracking = el.refreshJournals?.disabled;
+    const updateTracking = [...(el.systemUpdateButtons ?? [])].some((button) => button.disabled);
+    if (scanTracking && updateTracking) return;
+    try {
+      const response = await fetch('/api/ping', { cache: 'no-store' });
+      if (!response.ok) return;
+      const ping = await response.json();
+      if (!ping?.busy) return;
+      if (!scanTracking) resumeJournalScanIfRunning();
+      if (!updateTracking) resumeSystemUpdateIfRunning();
+    } catch {
+      // Server unreachable or mid-restart; the next tick will retry.
+    }
+  }, 5000);
 }
 
 async function resumeSystemUpdateIfRunning() {
@@ -2619,6 +2659,7 @@ async function init() {
   updateLandmarks();
   resumeJournalScanIfRunning();
   resumeSystemUpdateIfRunning();
+  startServerBusyWatch();
   renderFilters();
 
   // Aim the camera straight from status data and start rendering now: the

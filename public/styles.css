@@ -297,6 +297,35 @@ button:disabled {
   font-size: var(--text-md);
 }
 
+.status.busy-write {
+  border-color: rgba(255, 177, 76, 0.6);
+  background: rgba(26, 15, 4, 0.94);
+  color: #ffd9a0;
+  animation: busy-write-pulse 1.6s ease-in-out infinite;
+}
+
+.status.busy-write::before {
+  content: '⚠ Data write in progress — do not close or relaunch the app';
+  display: block;
+  margin-bottom: 4px;
+  color: #ffb14c;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+@keyframes busy-write-pulse {
+  0%, 100% {
+    border-color: rgba(255, 177, 76, 0.4);
+    box-shadow: 0 0 8px rgba(255, 177, 76, 0.14);
+  }
+  50% {
+    border-color: rgba(255, 177, 76, 0.85);
+    box-shadow: 0 0 18px rgba(255, 177, 76, 0.38);
+  }
+}
+
 .status.loading::after {
   content: '';
   position: absolute;
