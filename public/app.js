@@ -480,7 +480,12 @@ function richFilterControls() {
 }
 
 function richFiltersAvailable() {
-  return Boolean(state.galaxyDetails?.imported && state.galaxyDetails?.mapFilters?.lodLevels?.length);
+  const compatibility = state.galaxyDetails?.mapFilters?.compatibility;
+  return Boolean(
+    state.galaxyDetails?.imported
+    && state.galaxyDetails?.mapFilters?.lodLevels?.length
+    && compatibility?.compatible !== false
+  );
 }
 
 function richCategoryControls() {
@@ -515,9 +520,11 @@ function configureRichFilters() {
     input.value = categoriesAvailable ? String(settings.richFilters?.[name] ?? '') : '';
   }
   if (!available) {
-    el.richFiltersSummary.textContent = state.galaxyDetails?.imported
-      ? 'Reimport galaxy.json.gz to build map filter indexes.'
-      : 'Import galaxy.json.gz to enable these filters.';
+    const reason = state.galaxyDetails?.mapFilters?.compatibility?.reason;
+    el.richFiltersSummary.textContent = reason
+      ?? (state.galaxyDetails?.imported
+        ? 'Reimport galaxy.json.gz to build map filter indexes.'
+        : 'Import galaxy.json.gz to enable these filters.');
     return;
   }
   const count = state.galaxyDetails.baseCount ?? state.galaxyDetails.indexedRecords ?? 0;
@@ -535,6 +542,7 @@ function richFilterSettings() {
 
 function saveAndApplyRichFilters() {
   writeViewSettings({ richFilters: richFilterSettings() });
+  setStatus('Applying full-data filters...');
   loadPoints().catch((error) => {
     console.error(error);
     setStatus(`Could not apply full-data filters: ${error.message}`);
@@ -1757,6 +1765,7 @@ async function loadPoints(options = {}) {
   });
   if (!el.updatedFrom.disabled && el.updatedFrom.value) params.set('updatedFrom', el.updatedFrom.value);
   if (!el.updatedBefore.disabled && el.updatedBefore.value) params.set('updatedBefore', el.updatedBefore.value);
+  let richActive = false;
   if (richFiltersAvailable()) {
     const rich = richFilterSettings();
     if (rich.richData) params.set('richData', '1');
@@ -1777,7 +1786,12 @@ async function loadPoints(options = {}) {
       if (rich.security) params.set('security', rich.security);
       if (rich.government) params.set('government', rich.government);
     }
+    richActive = ['richData', 'hasStations', 'populated', 'landable', 'markets', 'shipyards', 'outfitting', 'signals', 'minBodies', 'bodyType', 'atmosphere', 'ringType', 'volcanism', 'economy', 'security', 'government']
+      .some((name) => params.has(name));
   }
+  // Rich filters replace the unfiltered nearby-detail layer, so stop any
+  // pending local point request before it can repopulate the map.
+  if (richActive) cancelLocalPointsRefresh();
   const fetchStage = async (limit, { reportProgress = false } = {}) => {
     const stageParams = new URLSearchParams(params);
     stageParams.set('limit', String(limit));
@@ -1800,9 +1814,11 @@ async function loadPoints(options = {}) {
     return requestId === pointLoadRequestId;
   };
   try {
-    if (options.progressive) {
+    if (options.progressive && !richActive) {
       // Coarse pass fills in the wider galaxy quickly; the full-detail pass
-      // below replaces it under the same request id.
+      // below replaces it under the same request id. With rich filters the
+      // server scans a deep LOD either way, so one request avoids paying for
+      // that scan twice.
       if (!(await applyStage(await fetchStage(40000)))) return;
       updatePointStatus();
     }
@@ -1814,6 +1830,7 @@ async function loadPoints(options = {}) {
     if (pointLoadController === controller) pointLoadController = null;
   }
   if (state.richPointFiltersActive || !state.spatialIndex) {
+    cancelLocalPointsRefresh();
     state.localPointCount = 0;
     state.localRadius = null;
     state.localPointRequestKey = null;
@@ -1883,6 +1900,16 @@ function localPointLimit() {
 function abortLocalPointsRequest() {
   localPointsController?.abort();
   localPointsController = null;
+}
+
+// Drop any scheduled or in-flight local point refresh and invalidate responses
+// that already left the server, so a stale request can never repopulate the
+// local layer after rich filters clear it.
+function cancelLocalPointsRefresh() {
+  clearTimeout(localPointsRefreshTimer);
+  localPointsRefreshTimer = null;
+  localPointsRequestId += 1;
+  abortLocalPointsRequest();
 }
 
 function scheduleLocalPointsRefresh(delay = 160, options = {}) {

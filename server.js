@@ -48,6 +48,7 @@ const lodBytes = 20;
 const richIndexHeaderBytes = 32;
 const richIndexMinimumRecordBytes = 40;
 const richFilterMinimumRecordBytes = 12;
+const richFilterScanBudget = 60000000;
 const systemDetailCacheLimit = 3000;
 const systemDetailCacheTtlMs = 10 * 60 * 1000;
 const richFlags = {
@@ -443,7 +444,38 @@ async function getJournalBodies() {
   return journalBodiesCache.data;
 }
 
-function galaxyDetailsSummary(manifest) {
+function richMapFiltersCompatibility(meta, manifest) {
+  const filters = manifest?.mapFilters;
+  if (!filters?.lodLevels?.length) {
+    return {
+      compatible: false,
+      reason: 'Map filter indexes are not available.',
+      issues: [],
+    };
+  }
+  const metaLevels = new Map((meta?.lodLevels ?? []).map((level) => [Number(level.level), level]));
+  const issues = [];
+  for (const richLevel of filters.lodLevels ?? []) {
+    const level = Number(richLevel.level);
+    const metaLevel = metaLevels.get(level);
+    if (!metaLevel) {
+      issues.push(`LOD ${level} no longer exists in the current system import.`);
+      continue;
+    }
+    if (Number(richLevel.count) !== Number(metaLevel.count)) {
+      issues.push(`LOD ${level} has ${metaLevel.count} systems, but its rich filter sidecar has ${richLevel.count}.`);
+    }
+  }
+  return {
+    compatible: issues.length === 0,
+    reason: issues.length
+      ? 'Full-data map filters are out of date. Reimport full galaxy data after system updates to rebuild them.'
+      : null,
+    issues,
+  };
+}
+
+function galaxyDetailsSummary(manifest, meta = null) {
   if (!manifest) {
     return {
       imported: false,
@@ -467,7 +499,12 @@ function galaxyDetailsSummary(manifest) {
     baseCount,
     deltaRecords,
     indexedRecords: baseCount + deltaRecords,
-    mapFilters: manifest.mapFilters ?? null,
+    mapFilters: manifest.mapFilters
+      ? {
+          ...manifest.mapFilters,
+          compatibility: richMapFiltersCompatibility(meta, manifest),
+        }
+      : null,
     segments: segments.map((segment) => ({
       kind: segment.kind,
       importedAt: segment.importedAt,
@@ -557,6 +594,54 @@ function richPointAllowed(buffer, offset, filters, recordBytes) {
     if (filters.governmentTypes && !(buffer.readUInt32LE(offset + 36) & filters.governmentTypes)) return false;
   }
   return true;
+}
+
+// Estimate what fraction of systems match the active rich filters by scanning
+// the smallest rich sidecar (a few MB at most).
+async function richFilterMatchFraction(galaxyManifest, richFilters) {
+  const recordBytes = Number(galaxyManifest?.mapFilters?.recordBytes ?? 0);
+  const sample = [...(galaxyManifest?.mapFilters?.lodLevels ?? [])]
+    .filter((entry) => Number(entry.count) > 0)
+    .sort((a, b) => Number(a.count) - Number(b.count))[0];
+  if (!sample || recordBytes < richFilterMinimumRecordBytes) return 1;
+  const fd = await fs.open(galaxyDataPath(sample.file), 'r');
+  try {
+    const chunk = Buffer.allocUnsafe(recordBytes * 8192);
+    let position = 0;
+    let scanned = 0;
+    let matches = 0;
+    for (;;) {
+      const { bytesRead } = await fd.read(chunk, 0, chunk.length, position);
+      if (!bytesRead) break;
+      position += bytesRead;
+      for (let offset = 0; offset + recordBytes <= bytesRead; offset += recordBytes) {
+        scanned += 1;
+        if (richPointAllowed(chunk, offset, richFilters, recordBytes)) matches += 1;
+      }
+    }
+    return scanned ? matches / scanned : 1;
+  } finally {
+    await fd.close();
+  }
+}
+
+// Rich filters usually match a tiny fraction of systems, so the default map
+// LOD would surface almost none of them. Pick the deepest LOD whose expected
+// match count still fits the response limit, capped so a full scan stays
+// around a second of chunked reads.
+async function chooseRichFilterLod(meta, galaxyManifest, richFilters, defaultLod, limit) {
+  const richLevels = new Set((galaxyManifest?.mapFilters?.lodLevels ?? []).map((entry) => Number(entry.level)));
+  const candidates = (meta.lodLevels ?? []).filter((level) => richLevels.has(Number(level.level))
+    && Number(level.count) > Number(defaultLod.count)
+    && Number(level.count) <= richFilterScanBudget);
+  if (!candidates.length) return defaultLod;
+  const fraction = await richFilterMatchFraction(galaxyManifest, richFilters);
+  let best = defaultLod;
+  for (const level of candidates) {
+    if (fraction * Number(level.count) > limit) continue;
+    if (Number(level.count) > Number(best.count)) best = level;
+  }
+  return best;
 }
 
 function parseId64(value) {
@@ -2206,10 +2291,11 @@ function appendVirtualVisitedPoints(out, included, includedCoords, meta, supplem
   });
 }
 
-// Cache of final /api/points payloads for the common request shape (no update
-// range, no rich filters), keyed by everything that can change the output.
+// Cache of final /api/points payloads keyed by everything that can change the
+// output, including active rich filters. Filtered payloads are small, so a few
+// extra slots keep recent filter combos warm without a deep rescan.
 const pointsPayloadCache = new Map();
-const pointsPayloadCacheLimit = 3;
+const pointsPayloadCacheLimit = 8;
 
 function sendPointsPayload(res, body, lod, richActive) {
   res.writeHead(200, {
@@ -2228,7 +2314,7 @@ async function readPoints(reqUrl, res) {
   if (!meta) return sendJson(res, { error: 'Systems have not been imported yet.' }, 409);
   const visited = await getVisited();
 
-  const lod = chooseLod(meta, reqUrl.searchParams.get('lod'));
+  let lod = chooseLod(meta, reqUrl.searchParams.get('lod'));
   if (!lod) return sendJson(res, { error: 'No LOD point files are available.' }, 409);
 
   const typeSet = new Set(
@@ -2242,47 +2328,66 @@ async function readPoints(reqUrl, res) {
   const richFilters = richPointFilters(reqUrl);
   const updates = range.active ? await getUpdateIndex() : null;
   const limit = Math.max(1000, Math.min(Number(reqUrl.searchParams.get('limit') ?? 250000), 500000));
-  const source = path.join(dataDir, lod.file);
-  let payloadCacheKey = null;
-  if (!richFilters.active) {
-    const lodStat = existsSync(source) ? await fs.stat(source) : null;
-    const supplementalStat = existsSync(supplementalPath) ? await fs.stat(supplementalPath) : null;
-    payloadCacheKey = [
-      lod.level,
-      lodStat?.mtimeMs ?? 0,
-      supplementalStat?.mtimeMs ?? 0,
-      visitedCache?.cacheKey ?? '',
-      updates ? `${updates.mtimeMs}:${range.from}:${range.before}` : '',
-      [...typeSet].sort((a, b) => a - b).join(','),
-      limit,
-    ].join('|');
-    const hit = pointsPayloadCache.get(payloadCacheKey);
-    if (hit) {
-      pointsPayloadCache.delete(payloadCacheKey);
-      pointsPayloadCache.set(payloadCacheKey, hit);
-      return sendPointsPayload(res, hit, lod, false);
+  const galaxyManifest = richFilters.active ? await getGalaxyManifest() : null;
+  const richRecordBytes = Number(galaxyManifest?.mapFilters?.recordBytes ?? 0);
+  let richLod = null;
+  let richStat = null;
+  if (richFilters.active) {
+    const richCompatibility = richMapFiltersCompatibility(meta, galaxyManifest);
+    if (!richCompatibility.compatible) {
+      return sendJson(res, {
+        error: richCompatibility.reason,
+        issues: richCompatibility.issues,
+      }, 409);
     }
+    if (richRecordBytes < richFilterMinimumRecordBytes) {
+      return sendJson(res, { error: 'The rich map filter index format is invalid. Reimport galaxy.json.gz.' }, 409);
+    }
+    if (richFilters.advanced && richRecordBytes < 40) {
+      return sendJson(res, { error: 'Detailed body and economy filters require a new full galaxy import.' }, 409);
+    }
+    if (reqUrl.searchParams.get('lod') === null) {
+      lod = await chooseRichFilterLod(meta, galaxyManifest, richFilters, lod, limit);
+    }
+    richLod = galaxyManifest.mapFilters.lodLevels.find((entry) => Number(entry.level) === Number(lod.level));
+    if (!richLod) {
+      return sendJson(res, { error: `Rich filters are not available for LOD ${lod.level}. Reimport galaxy.json.gz to build filter indexes.` }, 409);
+    }
+    if (Number(richLod.count) !== Number(lod.count)) {
+      return sendJson(res, {
+        error: `Rich filters are out of date for LOD ${lod.level}. Reimport full galaxy data to rebuild map filter indexes.`,
+        issues: [`LOD ${lod.level} has ${lod.count} systems, but its rich filter sidecar has ${richLod.count}.`],
+      }, 409);
+    }
+    richStat = await fs.stat(galaxyDataPath(richLod.file)).catch(() => null);
+    if (!richStat) {
+      return sendJson(res, { error: `The rich filter index file for LOD ${lod.level} is missing. Reimport galaxy.json.gz.` }, 409);
+    }
+  }
+  const source = path.join(dataDir, lod.file);
+  const lodStat = existsSync(source) ? await fs.stat(source) : null;
+  const supplementalStat = existsSync(supplementalPath) ? await fs.stat(supplementalPath) : null;
+  const payloadCacheKey = [
+    lod.level,
+    lodStat?.mtimeMs ?? 0,
+    supplementalStat?.mtimeMs ?? 0,
+    visitedCache?.cacheKey ?? '',
+    updates ? `${updates.mtimeMs}:${range.from}:${range.before}` : '',
+    [...typeSet].sort((a, b) => a - b).join(','),
+    limit,
+    richFilters.active ? `${JSON.stringify(richFilters)}:${richStat.mtimeMs}` : '',
+  ].join('|');
+  const hit = pointsPayloadCache.get(payloadCacheKey);
+  if (hit) {
+    pointsPayloadCache.delete(payloadCacheKey);
+    pointsPayloadCache.set(payloadCacheKey, hit);
+    return sendPointsPayload(res, hit, lod, richFilters.active);
   }
   const out = [];
   const included = new Set();
   const includedCoords = new Set();
   const fd = await fs.open(source, 'r');
   const buffer = Buffer.allocUnsafe(lodBytes * 8192);
-  const galaxyManifest = richFilters.active ? await getGalaxyManifest() : null;
-  const richLod = galaxyManifest?.mapFilters?.lodLevels?.find((entry) => Number(entry.level) === Number(lod.level));
-  const richRecordBytes = Number(galaxyManifest?.mapFilters?.recordBytes ?? 0);
-  if (richFilters.active && !richLod) {
-    await fd.close();
-    return sendJson(res, { error: `Rich filters are not available for LOD ${lod.level}. Reimport galaxy.json.gz to build filter indexes.` }, 409);
-  }
-  if (richFilters.active && richRecordBytes < richFilterMinimumRecordBytes) {
-    await fd.close();
-    return sendJson(res, { error: 'The rich map filter index format is invalid. Reimport galaxy.json.gz.' }, 409);
-  }
-  if (richFilters.advanced && richRecordBytes < 40) {
-    await fd.close();
-    return sendJson(res, { error: 'Detailed body and economy filters require a new full galaxy import.' }, 409);
-  }
   const richFd = richLod ? await fs.open(galaxyDataPath(richLod.file), 'r') : null;
   const richBuffer = richFd ? Buffer.allocUnsafe(richRecordBytes * 8192) : null;
 
@@ -2355,11 +2460,9 @@ async function readPoints(reqUrl, res) {
   }
 
   const body = Buffer.concat(out);
-  if (payloadCacheKey) {
-    pointsPayloadCache.set(payloadCacheKey, body);
-    while (pointsPayloadCache.size > pointsPayloadCacheLimit) {
-      pointsPayloadCache.delete(pointsPayloadCache.keys().next().value);
-    }
+  pointsPayloadCache.set(payloadCacheKey, body);
+  while (pointsPayloadCache.size > pointsPayloadCacheLimit) {
+    pointsPayloadCache.delete(pointsPayloadCache.keys().next().value);
   }
   sendPointsPayload(res, body, lod, richFilters.active);
 }
@@ -2993,7 +3096,7 @@ const server = http.createServer(async (req, res) => {
         meta,
         visited: visitedSummary(visited),
         places: placesSummary(places),
-        galaxyDetails: galaxyDetailsSummary(galaxyManifest),
+        galaxyDetails: galaxyDetailsSummary(galaxyManifest, meta),
         spatialIndex,
         systemUpdates: {
           running: systemUpdateStatus.running,

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
+import { densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, specialKind, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
 
 const o = starVisual('O (Blue-White) Star');
 const a = starVisual('A (Blue-White) Star');
@@ -22,6 +22,9 @@ assert.equal(isGiantStarType('M (Red giant) Star'), true, 'Giant stars should ma
 assert.equal(isGiantStarType('A (Blue-White super giant) Star'), true, 'Supergiant stars should match the Giants preset.');
 assert.equal(isGiantStarType('M (Red dwarf) Star'), false, 'Main-sequence and dwarf stars should not match the Giants preset.');
 assert.equal(isGiantStarType('Class V gas giant'), false, 'Gas giants should not match the stellar Giants preset.');
+assert.equal(specialKind('M (Red giant) Star'), 'giant', 'Giant stars should receive an overlay cage marker.');
+assert.equal(specialKind('A (Blue-White super giant) Star'), 'giant', 'Supergiant stars should receive an overlay cage marker.');
+assert.equal(specialKind('Class V gas giant'), '', 'Gas giants should not receive the stellar giant marker.');
 assert.equal(zoomStarScalePercent(850), 300, 'Local journal views should use 300% stars.');
 assert.equal(zoomStarScalePercent(30000), 60, 'Whole-galaxy views should use 60% stars.');
 assert.ok(zoomStarScalePercent(7500) < 300 && zoomStarScalePercent(7500) > 60, 'Intermediate zoom should scale smoothly.');

@@ -362,13 +362,18 @@ export function starVisual(typeName = '') {
   return { color, size, style };
 }
 
-function specialKind(typeName = '') {
+export function specialKind(typeName = '') {
   if (typeName.includes('Black Hole')) return 'blackHole';
   if (typeName.includes('Neutron')) return 'neutron';
   if (typeName.includes('White Dwarf')) return 'whiteDwarf';
   if (typeName.includes('T Tauri') || typeName.includes('Herbig')) return 'triangle';
+  if (isGiantStarType(typeName)) return 'giant';
   if (/Wolf-Rayet|C Star|CJ Star|CN Star|S-type|MS-type/i.test(typeName)) return 'other';
   return '';
+}
+
+function isPrioritySpecial(point) {
+  return Boolean(point?.special && point.special !== 'giant');
 }
 
 function placeStyle(place) {
@@ -935,7 +940,7 @@ export class GalaxyRenderer {
       const dy = point.y - this.target[1];
       const dz = point.z - this.target[2];
       const distanceSq = dx * dx + dy * dy + dz * dz;
-      const important = required.has(point.index) || point.special || (point.flags & 2) || (this.showVisited && (point.flags & 4));
+      const important = required.has(point.index) || isPrioritySpecial(point) || (point.flags & 2) || (this.showVisited && (point.flags & 4));
       if (!important && distanceSq > maxDistance * maxDistance) continue;
       if (important) importantPoints.push(point);
       else {
@@ -1578,7 +1583,6 @@ export class GalaxyRenderer {
     ctx.rect(clip.x, clip.y, clip.width, clip.height);
     ctx.clip();
     ctx.lineCap = 'round';
-    ctx.globalAlpha = alpha;
     if (grid.step >= 10) {
       this.drawGridLines(grid, grid.step / 10, this.gridDetailAlpha(grid.step), false);
     }
@@ -1599,13 +1603,17 @@ export class GalaxyRenderer {
       const edgeFade = 1 - Math.abs(index) / (lineCount + 1);
       const center = Math.abs(x - grid.centerX) < step * 0.5;
       const major = primary || Math.abs(x / grid.step - Math.round(x / grid.step)) < 0.001;
-      ctx.lineWidth = center ? 1.8 : major ? 1.15 : 0.55;
-      ctx.strokeStyle = center
+      const lineWidth = center ? 2.2 : major ? 1.45 : 0.75;
+      const strokeStyle = center
         ? `rgba(72, 220, 230, ${(this.showDepthEmphasis ? 0.72 : 0.62) * alpha})`
         : major
-          ? `rgba(78, 138, 150, ${((this.showDepthEmphasis ? 0.18 : 0.14) + edgeFade * 0.24) * alpha})`
-          : `rgba(60, 111, 124, ${((this.showDepthEmphasis ? 0.08 : 0.055) + edgeFade * 0.1) * alpha})`;
-      this.drawWorldLine({ x, y: grid.y, z: grid.minZ }, { x, y: grid.y, z: grid.maxZ });
+          ? `rgba(104, 181, 194, ${((this.showDepthEmphasis ? 0.28 : 0.22) + edgeFade * 0.3) * alpha})`
+          : `rgba(84, 150, 164, ${((this.showDepthEmphasis ? 0.13 : 0.095) + edgeFade * 0.13) * alpha})`;
+      this.drawGridWorldLine(
+        { x, y: grid.y, z: grid.minZ },
+        { x, y: grid.y, z: grid.maxZ },
+        { lineWidth, strokeStyle, center, major },
+      );
     }
     for (let index = -lineCount; index <= lineCount; index += 1) {
       const z = grid.centerZ + index * step;
@@ -1613,14 +1621,37 @@ export class GalaxyRenderer {
       const edgeFade = 1 - Math.abs(index) / (lineCount + 1);
       const center = Math.abs(z - grid.centerZ) < step * 0.5;
       const major = primary || Math.abs(z / grid.step - Math.round(z / grid.step)) < 0.001;
-      ctx.lineWidth = center ? 1.8 : major ? 1.15 : 0.55;
-      ctx.strokeStyle = center
+      const lineWidth = center ? 2.2 : major ? 1.45 : 0.75;
+      const strokeStyle = center
         ? `rgba(255, 177, 76, ${(this.showDepthEmphasis ? 0.66 : 0.55) * alpha})`
         : major
-          ? `rgba(78, 138, 150, ${((this.showDepthEmphasis ? 0.18 : 0.14) + edgeFade * 0.24) * alpha})`
-          : `rgba(60, 111, 124, ${((this.showDepthEmphasis ? 0.08 : 0.055) + edgeFade * 0.1) * alpha})`;
-      this.drawWorldLine({ x: grid.minX, y: grid.y, z }, { x: grid.maxX, y: grid.y, z });
+          ? `rgba(104, 181, 194, ${((this.showDepthEmphasis ? 0.28 : 0.22) + edgeFade * 0.3) * alpha})`
+          : `rgba(84, 150, 164, ${((this.showDepthEmphasis ? 0.13 : 0.095) + edgeFade * 0.13) * alpha})`;
+      this.drawGridWorldLine(
+        { x: grid.minX, y: grid.y, z },
+        { x: grid.maxX, y: grid.y, z },
+        { lineWidth, strokeStyle, center, major },
+      );
     }
+  }
+
+  drawGridWorldLine(a, b, { lineWidth, strokeStyle, center = false, major = false }) {
+    const ctx = this.ctx;
+    if (center || major) {
+      ctx.save();
+      ctx.lineWidth = lineWidth + (center ? 3.4 : 2.4);
+      ctx.strokeStyle = center ? 'rgba(0, 5, 8, 0.7)' : 'rgba(0, 5, 8, 0.5)';
+      this.drawWorldLine(a, b);
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.lineWidth = lineWidth;
+    ctx.strokeStyle = strokeStyle;
+    ctx.shadowColor = center ? strokeStyle : major ? 'rgba(72, 220, 230, 0.18)' : 'transparent';
+    ctx.shadowBlur = center ? 8 : major ? 5 : 0;
+    this.drawWorldLine(a, b);
+    ctx.restore();
   }
 
   drawGridIndicators(grid) {
@@ -2163,7 +2194,33 @@ export class GalaxyRenderer {
       ctx.closePath();
       ctx.stroke();
     } else if (point.special === 'giant') {
-      ctx.strokeRect(-6, -6, 12, 12);
+      const radius = 9;
+      ctx.save();
+      ctx.lineWidth = search ? 2.2 : 1.6;
+      ctx.shadowColor = search ? this.accentColor : css;
+      ctx.shadowBlur = search ? 9 : 7;
+      ctx.beginPath();
+      for (let i = 0; i < 6; i += 1) {
+        const angle = Math.PI / 6 + i * Math.PI / 3;
+        const x = Math.cos(angle) * radius;
+        const y = Math.sin(angle) * radius;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha *= 0.82;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, radius * 0.82, radius * 0.34, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.ellipse(0, 0, radius * 0.82, radius * 0.34, Math.PI / 3, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.ellipse(0, 0, radius * 0.82, radius * 0.34, -Math.PI / 3, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
     } else if (point.special === 'other') {
       ctx.beginPath();
       ctx.arc(0, 0, 5, 0, Math.PI * 2);
@@ -2249,7 +2306,7 @@ export class GalaxyRenderer {
       if (dist > hitRadius) continue;
       const depthBias = (screen.z + 1) * 4;
       const selectedBias = point.index === this.selectedSystem?.index ? -8 : 0;
-      const importantBias = point.special || (point.flags & 4) ? -2 : 0;
+      const importantBias = isPrioritySpecial(point) || (point.flags & 4) ? -2 : 0;
       const score = dist + depthBias + selectedBias + importantBias;
       if (score < bestScore) {
         best = { point, screen };

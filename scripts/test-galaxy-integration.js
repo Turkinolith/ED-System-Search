@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { gzipSync } from 'node:zlib';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -141,7 +141,11 @@ for (const [index, system] of systems.entries()) {
   lodRecords.writeUInt32LE(index, lodOffset + 16);
 }
 writeFileSync(path.join(dataDir, 'systems.bin'), systemRecords);
-writeFileSync(path.join(dataDir, 'systems-lod-0.bin'), lodRecords);
+// LOD 0 only holds a coarse subset so rich-filter requests must hop to the
+// deeper LOD 1 to see every matching system.
+const coarseLodCount = 2;
+writeFileSync(path.join(dataDir, 'systems-lod-0.bin'), lodRecords.subarray(0, coarseLodCount * 20));
+writeFileSync(path.join(dataDir, 'systems-lod-1.bin'), lodRecords);
 writeFileSync(path.join(dataDir, 'systems-names.txt'), Buffer.concat(nameParts));
 writeFileSync(path.join(dataDir, 'systems-search.tsv'), `${searchLines.join('\n')}\n`);
 mkdirSync(path.join(dataDir, 'suggest'), { recursive: true });
@@ -151,7 +155,10 @@ writeFileSync(path.join(dataDir, 'systems-meta.json'), JSON.stringify({
   importedCount: systems.length,
   importedAt: new Date().toISOString(),
   typeNames: ['Fixture star'],
-  lodLevels: [{ level: 0, count: systems.length, file: 'systems-lod-0.bin' }],
+  lodLevels: [
+    { level: 0, count: coarseLodCount, file: 'systems-lod-0.bin' },
+    { level: 1, count: systems.length, file: 'systems-lod-1.bin' },
+  ],
   sol: { coords: { x: 0, y: 0, z: 0 } },
 }));
 
@@ -191,10 +198,13 @@ assert.equal(murderData.subarray(0, 8).toString('ascii'), 'EDMBIN01');
 assert.equal(murderData.byteLength, 64);
 assert.equal(murderNames, 'Fixture Murder Binary');
 
-const manifest = JSON.parse(readFileSync(path.join(dataDir, 'galaxy', 'manifest.json'), 'utf8'));
+const manifestPath = path.join(dataDir, 'galaxy', 'manifest.json');
+const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 assert.equal(manifest.mapFilters.recordBytes, 40);
-assert.equal(manifest.mapFilters.lodLevels[0].count, systems.length);
-assert.equal(readFileSync(path.join(dataDir, 'galaxy', 'systems-lod-0-rich.bin')).byteLength, systems.length * 40);
+assert.equal(manifest.mapFilters.lodLevels[0].count, coarseLodCount);
+assert.equal(manifest.mapFilters.lodLevels[1].count, systems.length);
+assert.equal(readFileSync(path.join(dataDir, 'galaxy', 'systems-lod-0-rich.bin')).byteLength, coarseLodCount * 40);
+assert.equal(readFileSync(path.join(dataDir, 'galaxy', 'systems-lod-1-rich.bin')).byteLength, systems.length * 40);
 
 const server = spawn(process.execPath, ['server.js'], {
   cwd: root,
@@ -222,6 +232,10 @@ try {
     return indexes;
   }
 
+  const stationResponse = await fetch(`http://localhost:${port}/api/points?types=0&limit=100&hasStations=1`);
+  assert.equal(stationResponse.status, 200);
+  assert.equal(stationResponse.headers.get('x-lod-level'), '1', 'Rich filters should scan the deepest affordable LOD.');
+
   assert.deepEqual(await pointIndexes('hasStations=1'), [0]);
   assert.deepEqual(await pointIndexes('minBodies=2'), [0, 3]);
   assert.deepEqual(await pointIndexes('landable=1'), [2]);
@@ -234,6 +248,15 @@ try {
   assert.deepEqual(await pointIndexes('economy=highTech'), [0]);
   assert.deepEqual(await pointIndexes('security=high'), [0]);
   assert.deepEqual(await pointIndexes('government=democracy'), [0]);
+
+  const staleManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  staleManifest.mapFilters.lodLevels[0].count += 1;
+  writeFileSync(manifestPath, JSON.stringify(staleManifest, null, 2));
+  const future = new Date(Date.now() + 2000);
+  utimesSync(manifestPath, future, future);
+  const staleFilterResponse = await fetch(`http://localhost:${port}/api/points?types=0&limit=100&hasStations=1`);
+  assert.equal(staleFilterResponse.status, 409);
+  assert.match(await staleFilterResponse.text(), /map filters are out of date/i);
 
   const richResponse = await fetch(`http://localhost:${port}/api/system-rich?id64=100`);
   assert.equal(richResponse.status, 200);
