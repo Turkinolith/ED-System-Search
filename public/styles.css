@@ -2013,13 +2013,6 @@ body {
   min-height: 100%;
 }
 
-.bodies-header {
-  position: sticky;
-  z-index: 2;
-  top: 0;
-  background: rgba(6, 13, 17, 0.96);
-}
-
 .body-system-summary {
   margin-top: 14px;
 }
