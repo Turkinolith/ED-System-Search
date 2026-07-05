@@ -26,6 +26,7 @@ const visitedPath = path.join(dataDir, 'visited.json');
 const visitedIndexesPath = path.join(dataDir, 'visited-indexes.json');
 const supplementalPath = path.join(dataDir, 'journal-systems.json');
 const journalBodiesPath = path.join(dataDir, 'journal-bodies.json');
+const navRoutePath = path.join(journalDir, 'NavRoute.json');
 const placesPath = path.join(dataDir, 'places.json');
 const discoveriesPath = path.join(dataDir, 'discoveries.json');
 const murderBinariesMetaPath = path.join(dataDir, 'murder-binaries-meta.json');
@@ -2197,6 +2198,93 @@ function finiteCoords(coords) {
     && Number.isFinite(Number(coords.z));
 }
 
+function distanceLy(a, b) {
+  return Math.hypot(
+    Number(a.x) - Number(b.x),
+    Number(a.y) - Number(b.y),
+    Number(a.z) - Number(b.z),
+  );
+}
+
+function coordsFromStarPos(value) {
+  if (!Array.isArray(value) || value.length < 3) return null;
+  const coords = { x: Number(value[0]), y: Number(value[1]), z: Number(value[2]) };
+  return finiteCoords(coords) ? coords : null;
+}
+
+function unavailableRoute(warning, extra = {}) {
+  return {
+    available: false,
+    timestamp: null,
+    event: null,
+    route: [],
+    totalDistanceLy: 0,
+    ...extra,
+    warnings: extra.warnings?.length ? [warning, ...extra.warnings] : [warning],
+  };
+}
+
+async function readNavRoute(res) {
+  if (!existsSync(navRoutePath)) {
+    return sendJson(res, unavailableRoute(`NavRoute.json was not found in ${journalDir}.`));
+  }
+
+  let payload;
+  try {
+    const raw = await fs.readFile(navRoutePath, 'utf8');
+    if (!raw.trim()) return sendJson(res, unavailableRoute('NavRoute.json is empty.'));
+    payload = JSON.parse(raw);
+  } catch (error) {
+    return sendJson(res, unavailableRoute(`Could not read NavRoute.json: ${error.message}`));
+  }
+
+  const warnings = [];
+  const entries = Array.isArray(payload.Route) ? payload.Route : [];
+  const route = [];
+  let totalDistanceLy = 0;
+  let previous = null;
+  for (const [sourceIndex, entry] of entries.entries()) {
+    const name = String(entry?.StarSystem ?? '').trim();
+    const coords = coordsFromStarPos(entry?.StarPos);
+    if (!name || !coords) {
+      warnings.push(`Skipped route entry ${sourceIndex + 1}: missing system name or coordinates.`);
+      continue;
+    }
+
+    const hopDistanceLy = previous ? distanceLy(previous.coords, coords) : 0;
+    totalDistanceLy += hopDistanceLy;
+    const normalized = {
+      name,
+      id64: entry.SystemAddress === undefined || entry.SystemAddress === null ? null : String(entry.SystemAddress),
+      coords,
+      starClass: entry.StarClass ? String(entry.StarClass) : null,
+      scoopable: typeof entry.StarClass === 'string' && 'KGBFOAM'.includes(entry.StarClass),
+      hopDistanceLy: Number(hopDistanceLy.toFixed(2)),
+      cumulativeDistanceLy: Number(totalDistanceLy.toFixed(2)),
+      routeIndex: route.length,
+      sourceIndex,
+    };
+    route.push(normalized);
+    previous = normalized;
+  }
+
+  if (route.length === 0) {
+    return sendJson(res, unavailableRoute(
+      entries.length ? 'NavRoute.json has no route entries with usable coordinates.' : 'No active route is available.',
+      { timestamp: payload.timestamp ?? null, event: payload.event ?? null, warnings },
+    ));
+  }
+
+  return sendJson(res, {
+    available: true,
+    timestamp: payload.timestamp ?? null,
+    event: payload.event ?? null,
+    route,
+    totalDistanceLy: Number(totalDistanceLy.toFixed(2)),
+    warnings,
+  });
+}
+
 function coordKey(coords) {
   if (!finiteCoords(coords)) return null;
   return `${Math.round(Number(coords.x) * 1000)}:${Math.round(Number(coords.y) * 1000)}:${Math.round(Number(coords.z) * 1000)}`;
@@ -3151,6 +3239,7 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/points') return await readPoints(reqUrl, res);
     if (reqUrl.pathname === '/api/local-points') return await queryLocalPoints(reqUrl, res);
     if (reqUrl.pathname === '/api/search') return await searchSystems(reqUrl, res);
+    if (reqUrl.pathname === '/api/nav-route') return await readNavRoute(res);
     if (reqUrl.pathname === '/api/llm-search' && req.method === 'POST') return await llmAugmentedSearch(req, res);
     if (reqUrl.pathname === '/api/system') return await readSystemDetail(reqUrl, res);
     if (reqUrl.pathname === '/api/system-rich') return await readRichSystem(reqUrl, res);

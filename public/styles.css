@@ -866,6 +866,21 @@ button:disabled {
   white-space: nowrap;
 }
 
+.route-refresh {
+  min-height: 28px;
+  border: 1px solid rgba(102, 224, 194, 0.34);
+  border-radius: 4px;
+  background: rgba(5, 14, 16, 0.72);
+  color: #a9f3e2;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.route-refresh:hover {
+  border-color: rgba(102, 224, 194, 0.66);
+  background: rgba(9, 28, 30, 0.82);
+}
+
 .overlay-mode {
   display: grid;
   grid-column: 1 / -1;
@@ -1472,6 +1487,21 @@ kbd {
   border-radius: inherit;
   background: linear-gradient(90deg, rgba(83, 214, 255, 0.86), rgba(182, 255, 0, 0.9));
   transition: width 180ms ease;
+}
+
+.update-progress.indeterminate span {
+  width: 38%;
+  min-width: 38%;
+  animation: progress-sweep 1.25s ease-in-out infinite;
+}
+
+@keyframes progress-sweep {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(270%);
+  }
 }
 
 .update-log-entry {
@@ -2604,6 +2634,44 @@ body {
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
+}
+
+.data-state.running {
+  color: #ffd9a0;
+}
+
+.data-state.running i {
+  background: #ffb14c;
+  box-shadow: 0 0 0 4px rgba(255, 177, 76, 0.11), 0 0 12px rgba(255, 177, 76, 0.45);
+  animation: data-state-pulse 1.3s ease-in-out infinite;
+}
+
+.data-state.failed {
+  color: #ff9d9d;
+}
+
+.data-state.failed i {
+  background: #ff6b6b;
+  box-shadow: 0 0 0 4px rgba(255, 107, 107, 0.12), 0 0 12px rgba(255, 107, 107, 0.42);
+}
+
+.journal-scan-state {
+  margin-top: 8px;
+}
+
+.journal-scan-progress {
+  margin-top: 6px;
+}
+
+@keyframes data-state-pulse {
+  0%, 100% {
+    opacity: 0.72;
+    transform: scale(0.9);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
 }
 
 .system-update-grid {

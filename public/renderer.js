@@ -204,6 +204,22 @@ function isTextInputActive() {
   return tag === 'input' || tag === 'textarea' || tag === 'select' || active.isContentEditable;
 }
 
+function routeStarColor(starClass = '') {
+  const key = String(starClass ?? '').trim().charAt(0).toUpperCase();
+  const colors = {
+    O: '#9db9ff',
+    B: '#b9ccff',
+    A: '#d7e3ff',
+    F: '#fff4cf',
+    G: '#ffd27d',
+    K: '#ffad5d',
+    M: '#ff7a45',
+    N: '#67e9ff',
+    D: '#d6f4ff',
+  };
+  return colors[key] ?? '#66e0c2';
+}
+
 export function colorsForType(typeName = '') {
   return starVisual(typeName).color;
 }
@@ -435,6 +451,8 @@ export class GalaxyRenderer {
     this.points = [];
     this.searchResults = [];
     this.selectedSystem = null;
+    this.routeOverlay = null;
+    this.routeHops = [];
     this.places = [];
     this.placeDrawList = [];
     this.placeDrawKey = '';
@@ -459,6 +477,7 @@ export class GalaxyRenderer {
     this.showAllPlaces = false;
     this.showMurderBinaries = false;
     this.showCarrierRange = false;
+    this.showRouteOverlay = false;
     this.starScale = 4;
     this.autoStarScale = true;
     this.onStarScaleChange = null;
@@ -467,6 +486,7 @@ export class GalaxyRenderer {
     this.drag = null;
     this.hoverIndex = null;
     this.hoverPlaceId = null;
+    this.hoverRouteIndex = null;
     this.hoverScreen = null;
     this.hoverPoint = null;
     this.lastHoverAt = 0;
@@ -630,6 +650,20 @@ export class GalaxyRenderer {
       ...toRenderCoords(place.coords),
     }));
     this.placeDrawKey = '';
+    this.requestRender();
+  }
+
+  setRouteOverlay(routePayload) {
+    this.routeOverlay = routePayload;
+    this.routeHops = Array.isArray(routePayload?.route)
+      ? routePayload.route
+        .filter((hop) => hop?.coords)
+        .map((hop) => ({
+          ...hop,
+          ...toRenderCoords(hop.coords),
+        }))
+      : [];
+    this.hoverRouteIndex = null;
     this.requestRender();
   }
 
@@ -1152,6 +1186,7 @@ export class GalaxyRenderer {
     if (this.showDropLines && this.gridFadeAlpha() > 0.02) this.drawDropLines(grid);
     this.drawGridIndicators(grid);
     if (this.showCarrierRange) this.drawCarrierRange();
+    if (this.showRouteOverlay) this.drawRouteOverlay();
     const drawList = this.overlayMarkers()
       .sort((a, b) => a.distance - b.distance)
       .slice(0, this.overlayMarkerBudget())
@@ -1164,6 +1199,85 @@ export class GalaxyRenderer {
     this.drawHoverMarker();
     if (this.showLandmarks) this.drawLandmarkIndicators();
     this.drawOrbitPoint(grid);
+  }
+
+  drawRouteOverlay() {
+    if (!this.routeHops.length) return;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (let index = 1; index < this.routeHops.length; index += 1) {
+      const previous = this.routeHops[index - 1];
+      const current = this.routeHops[index];
+      ctx.save();
+      ctx.lineWidth = index === 1 ? 2.4 : 1.8;
+      ctx.strokeStyle = index === 1 ? 'rgba(103, 233, 255, 0.82)' : 'rgba(102, 224, 194, 0.56)';
+      ctx.shadowColor = index === 1 ? 'rgba(103, 233, 255, 0.34)' : 'rgba(102, 224, 194, 0.2)';
+      ctx.shadowBlur = index === 1 ? 10 : 5;
+      this.drawWorldLine(previous, current);
+      ctx.restore();
+    }
+    for (const hop of this.routeHops) this.drawRouteHop(hop);
+    this.drawRouteSummaryBadge();
+    ctx.restore();
+  }
+
+  drawRouteHop(hop) {
+    const screen = this.screen(hop);
+    if (!screen) return;
+    const ctx = this.ctx;
+    const first = hop.routeIndex === 0;
+    const final = hop.routeIndex === this.routeHops.length - 1;
+    const hover = this.hoverRouteIndex === hop.routeIndex;
+    const color = first ? '#67e9ff' : final ? '#f2a541' : routeStarColor(hop.starClass);
+    const radius = hover ? 7 : first || final ? 6 : 4.5;
+    ctx.save();
+    ctx.translate(screen.x, screen.y);
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = hover ? 2.2 : 1.6;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = hover ? 12 : 7;
+    ctx.beginPath();
+    if (final && !first) {
+      ctx.moveTo(0, -radius - 1);
+      ctx.lineTo(radius + 1, radius);
+      ctx.lineTo(-radius - 1, radius);
+      ctx.closePath();
+    } else if (first) {
+      ctx.rect(-radius, -radius, radius * 2, radius * 2);
+    } else {
+      ctx.arc(0, 0, radius, 0, Math.PI * 2);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = hover ? 0.34 : 0.2;
+    ctx.fill();
+    ctx.restore();
+
+    if (first || final || hover) {
+      const label = first ? 'Route start' : final ? hop.name : `#${hop.routeIndex + 1} ${hop.name}`;
+      ctx.save();
+      ctx.font = '600 12px Segoe UI, sans-serif';
+      const width = Math.ceil(ctx.measureText(label).width) + 16;
+      this.drawLabelPlate(screen.x + 10, screen.y - 13, width, 24, first ? 'rgba(103, 233, 255, 0.62)' : 'rgba(242, 165, 65, 0.64)');
+      ctx.fillStyle = first ? 'rgba(199, 244, 245, 0.94)' : 'rgba(255, 219, 165, 0.94)';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, screen.x + 18, screen.y);
+      ctx.restore();
+    }
+  }
+
+  drawRouteSummaryBadge() {
+    const count = this.routeHops.length;
+    const distance = Number(this.routeOverlay?.totalDistanceLy ?? 0);
+    const text = `Route ${count.toLocaleString()} hops · ${distance.toLocaleString(undefined, { maximumFractionDigits: 1 })} ly`;
+    const clip = this.centerClipRect();
+    this.drawMapBadge(text, clip.x + 10, clip.y + clip.height - 30, {
+      stroke: 'rgba(102, 224, 194, 0.56)',
+      text: 'rgba(186, 245, 231, 0.9)',
+      fill: 'rgba(3, 13, 15, 0.9)',
+    });
   }
 
   drawPlaceIndicators() {
@@ -2235,6 +2349,11 @@ export class GalaxyRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
+    const routeHit = this.findRouteHopNear(x, y, 22);
+    if (routeHit) {
+      this.onRouteSelect?.(routeHit.hop);
+      return;
+    }
     const placeHit = this.showPlaces || this.showMurderBinaries ? this.findPlaceNear(x, y, 20) : null;
     if (placeHit) {
       this.onPlaceSelect?.(placeHit.place);
@@ -2248,6 +2367,7 @@ export class GalaxyRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
+    if (this.findRouteHopNear(x, y, 26)) return;
     const hit = this.findPointNear(x, y, 26);
     if (hit) this.onSystemContext?.({ index: hit.point.index, x, y, screen: hit.screen });
   }
@@ -2259,9 +2379,22 @@ export class GalaxyRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
+    const routeHit = this.findRouteHopNear(x, y, 18);
+    if (routeHit) {
+      this.hoverIndex = null;
+      this.hoverPlaceId = null;
+      this.hoverRouteIndex = routeHit.hop.routeIndex;
+      this.hoverScreen = routeHit.screen;
+      this.hoverPoint = routeHit.hop;
+      this.onPlaceHover?.(null);
+      this.onHover?.({ kind: 'route', hop: routeHit.hop, x: routeHit.screen.x, y: routeHit.screen.y });
+      this.requestRender();
+      return;
+    }
     const placeHit = this.showPlaces || this.showMurderBinaries ? this.findPlaceNear(x, y, 16) : null;
     if (placeHit) {
       this.hoverIndex = null;
+      this.hoverRouteIndex = null;
       this.hoverPlaceId = placeHit.place.id ?? placeHit.place.name ?? '';
       this.hoverScreen = placeHit.screen;
       this.hoverPoint = null;
@@ -2274,8 +2407,11 @@ export class GalaxyRenderer {
       this.hoverPlaceId = null;
       if (!hit) this.onPlaceHover?.(null);
     }
+    const hadRouteHover = this.hoverRouteIndex !== null;
+    this.hoverRouteIndex = null;
     const nextIndex = hit?.point?.index ?? null;
     if (nextIndex === this.hoverIndex) {
+      if (!hit && hadRouteHover) this.onHover?.(null);
       if (hit?.screen) {
         this.hoverScreen = hit.screen;
         this.hoverPoint = hit.point;
@@ -2288,6 +2424,25 @@ export class GalaxyRenderer {
     this.hoverPoint = hit?.point ?? null;
     this.onHover?.(hit ? { index: hit.point.index, x: hit.screen.x, y: hit.screen.y } : null);
     this.requestRender();
+  }
+
+  findRouteHopNear(x, y, radius) {
+    if (!this.showRouteOverlay || !this.routeHops.length) return null;
+    let best = null;
+    let bestScore = Infinity;
+    for (const hop of this.routeHops) {
+      const screen = this.screen(hop);
+      if (!screen) continue;
+      const hitRadius = hop.routeIndex === 0 || hop.routeIndex === this.routeHops.length - 1 ? Math.max(radius, 22) : radius;
+      const dist = Math.hypot(screen.x - x, screen.y - y);
+      if (dist > hitRadius) continue;
+      const score = dist + (screen.z + 1) * 4;
+      if (score < bestScore) {
+        best = { hop, screen };
+        bestScore = score;
+      }
+    }
+    return best;
   }
 
   findPointNear(x, y, radius) {

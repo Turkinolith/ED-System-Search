@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=perf-overhaul-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=route-overlay-1';
 
 const state = {
   meta: null,
@@ -35,6 +35,7 @@ const state = {
   localRadius: null,
   localPointRequestKey: null,
   richPointFiltersActive: false,
+  routeOverlay: null,
 };
 
 const el = {
@@ -81,6 +82,8 @@ const el = {
   landmarksToggle: document.querySelector('#landmarksToggle'),
   carrierRangeToggle: document.querySelector('#carrierRangeToggle'),
   murderBinariesToggle: document.querySelector('#murderBinariesToggle'),
+  routeToggle: document.querySelector('#routeToggle'),
+  refreshRoute: document.querySelector('#refreshRoute'),
   poiModeInputs: [...document.querySelectorAll('input[name="poiMode"]')],
   placesSummary: document.querySelector('#placesSummary'),
   placeFilterActions: document.querySelector('#placeFilterActions'),
@@ -93,6 +96,8 @@ const el = {
   refreshJournals: document.querySelector('#refreshJournals'),
   scanLatestJournals: document.querySelector('#scanLatestJournals'),
   scanAllJournals: document.querySelector('#scanAllJournals'),
+  journalScanStatus: document.querySelector('#journalScanStatus'),
+  journalScanProgress: document.querySelector('#journalScanProgress'),
   resetView: document.querySelector('#resetView'),
   tooltip: document.querySelector('#systemTooltip'),
   noteMenu: document.querySelector('#noteMenu'),
@@ -162,9 +167,13 @@ let pointLoadRequestId = 0;
 let starScaleFrame = null;
 let tooltipOwner = null;
 let clientToastTimer = null;
+let routePollTimer = null;
+let routePollInFlight = false;
+let routeOverlaySignature = null;
 const tooltipCacheLimit = 500;
 const tooltipCacheTtlMs = 10 * 60 * 1000;
 const tooltipFetchDelayMs = 40;
+const routePollMs = 5000;
 const viewSettingsKey = 'ed-system-search:view';
 const dayMs = 24 * 60 * 60 * 1000;
 const richSystemCache = new Map();
@@ -615,7 +624,9 @@ function setScanStatus(scan) {
   const label = scan.mode === 'all' ? 'All scan' : 'Latest scan';
   const elapsed = scan.startedAt ? elapsedText(scan.startedAt) : '0:00';
   setWriteActivity('scan', Boolean(scan.running));
-  setStatus(`${label} ${elapsed} · ${scan.message ?? 'working'}`);
+  const message = `${label} ${elapsed} · ${scan.message ?? 'working'}`;
+  setStatus(message);
+  setJournalScanPanel(scan, { message, processing: Boolean(scan.running) });
 }
 
 function setSystemUpdateStatus(update) {
@@ -647,6 +658,35 @@ function setDownloadProgress(message, running) {
   const percent = percentMatch ? Math.max(0, Math.min(100, Number(percentMatch[1]))) : 0;
   bar.style.width = `${percent}%`;
   el.systemUpdateProgress.title = message;
+}
+
+function scanModeLabel(mode) {
+  return mode === 'all' ? 'All scan' : 'Latest scan';
+}
+
+function setDataStateText(node, message) {
+  if (!node) return;
+  const span = node.querySelector('span');
+  if (span) span.textContent = message;
+  else node.textContent = message;
+}
+
+function setJournalScanPanel(scan = null, options = {}) {
+  const processing = Boolean(options.processing);
+  const failed = Boolean(options.failed || (scan && scan.running === false && scan.ok === false));
+  const mode = scan?.mode ?? options.mode ?? 'latest';
+  const label = scan ? scanModeLabel(mode) : '';
+  const elapsed = scan?.startedAt ? `${elapsedText(scan.startedAt)} · ` : '';
+  const message = options.message
+    ?? (scan ? `${label} ${elapsed}${scan.message ?? (scan.running ? 'working' : 'complete')}` : 'Idle');
+  setDataStateText(el.journalScanStatus, message);
+  el.journalScanStatus?.classList.toggle('running', processing);
+  el.journalScanStatus?.classList.toggle('failed', failed);
+  if (el.journalScanProgress) {
+    el.journalScanProgress.hidden = !processing;
+    el.journalScanProgress.classList.toggle('indeterminate', processing);
+    el.journalScanProgress.title = processing ? message : '';
+  }
 }
 
 function setFocusCopyStatus(message, ok = true) {
@@ -1255,12 +1295,20 @@ function showTooltipLoading(hover) {
 }
 
 async function showTooltip(hover) {
+  if (hover?.kind === 'route') {
+    hoverRequestId += 1;
+    clearTimeout(hoverFetchTimer);
+    pendingTooltipIndex = null;
+    pendingTooltipHover = null;
+    renderRouteTooltip(hover.hop, hover.x, hover.y);
+    return;
+  }
   if (!hover || !Number.isInteger(hover.index) || hover.index < 0) {
     hoverRequestId += 1;
     clearTimeout(hoverFetchTimer);
     pendingTooltipIndex = null;
     pendingTooltipHover = null;
-    if (tooltipOwner === 'system') hideTooltip();
+    if (tooltipOwner === 'system' || tooltipOwner === 'route') hideTooltip();
     return;
   }
   const cached = getCachedSystem(hover.index);
@@ -1314,11 +1362,152 @@ function renderTooltip(system, x, y) {
   positionTooltip(x, y);
 }
 
+function renderRouteTooltip(hop, x, y) {
+  tooltipOwner = 'route';
+  const starClass = compactStarType(hop?.starClass);
+  const starText = starClass ? ` · ${starClass}` : '';
+  const hopText = `Hop ${Number(hop?.routeIndex ?? 0) + 1}`;
+  const distanceText = hop?.hopDistanceLy
+    ? ` · ${fmt(hop.hopDistanceLy)} ly hop`
+    : ' · route start';
+  const cumulativeText = hop?.cumulativeDistanceLy
+    ? ` · ${fmt(hop.cumulativeDistanceLy)} ly total`
+    : '';
+  el.tooltip.classList.remove('loading');
+  el.tooltip.textContent = `${hop?.name ?? 'Route point'}${starText}\n${hopText}${distanceText}${cumulativeText}\nTemporary route point`;
+  el.tooltip.hidden = false;
+  positionTooltip(x, y);
+}
+
 function focusSystem(name, coords) {
   state.focus = { name, coords };
   el.focusName.textContent = name;
   el.focusCoords.textContent = coordsText(coords);
   state.renderer.setTarget(coords.x, coords.y, coords.z);
+}
+
+function focusRouteHop(hop) {
+  if (!hop?.coords) return;
+  focusSystem(hop.name, hop.coords);
+  setStatus(`Focused temporary route point: ${hop.name}`);
+}
+
+function routeSignature(payload) {
+  if (!payload?.available || !Array.isArray(payload.route)) {
+    return `unavailable:${payload?.event ?? ''}:${payload?.timestamp ?? ''}:${payload?.warnings?.[0] ?? ''}`;
+  }
+  return payload.route
+    .map((hop) => [
+      hop.id64 ?? '',
+      hop.name ?? '',
+      hop.starClass ?? '',
+      hop.coords?.x ?? '',
+      hop.coords?.y ?? '',
+      hop.coords?.z ?? '',
+    ].join(':'))
+    .join('|');
+}
+
+function isTransientRouteUnavailable(payload) {
+  const warning = String(payload?.warnings?.[0] ?? '').toLowerCase();
+  return warning.includes('could not read navroute.json')
+    || warning.includes('unexpected end of json')
+    || warning.includes('unterminated')
+    || warning.includes('is empty');
+}
+
+function routeStatusMessage(data) {
+  const warningText = data.warnings?.length ? ` · ${data.warnings.length} warning${data.warnings.length === 1 ? '' : 's'}` : '';
+  return `Route displayed: ${fmt(data.route.length)} hops · ${fmt(data.totalDistanceLy)} ly${warningText}`;
+}
+
+async function refreshRouteOverlay(options = {}) {
+  const manual = options.manual !== false;
+  const auto = options.auto === true;
+  if (manual) {
+    el.refreshRoute.disabled = true;
+    setStatus('Reading current nav route...');
+  }
+  try {
+    const response = await api('/api/nav-route');
+    const data = await response.json();
+    const signature = routeSignature(data);
+    const changed = signature !== routeOverlaySignature;
+    if (!data.available || !Array.isArray(data.route) || data.route.length === 0) {
+      if (auto && state.routeOverlay && isTransientRouteUnavailable(data)) return false;
+      if (auto && !changed) return false;
+      state.routeOverlay = null;
+      routeOverlaySignature = signature;
+      state.renderer.setRouteOverlay(null);
+      if (manual || auto) setStatus(data.warnings?.[0] ?? 'No active route is available.');
+      return changed;
+    }
+    if (auto && !changed) return false;
+    state.routeOverlay = data;
+    routeOverlaySignature = signature;
+    el.routeToggle.checked = true;
+    state.renderer.showRouteOverlay = true;
+    state.renderer.setRouteOverlay(data);
+    writeViewSettings({ showRouteOverlay: true });
+    setStatus(
+      routeStatusMessage(data),
+      data.warnings?.join('\n') || 'Temporary route points are drawn from NavRoute.json.'
+    );
+    startRouteAutoRefresh();
+    return changed;
+  } catch (error) {
+    if (auto && state.routeOverlay) return false;
+    state.routeOverlay = null;
+    routeOverlaySignature = null;
+    state.renderer.setRouteOverlay(null);
+    setStatus(`Route overlay failed: ${error.message}`);
+    return false;
+  } finally {
+    if (manual) el.refreshRoute.disabled = false;
+  }
+}
+
+function shouldAutoRefreshRoute() {
+  return Boolean(el.routeToggle?.checked) && document.visibilityState !== 'hidden';
+}
+
+function stopRouteAutoRefresh() {
+  clearTimeout(routePollTimer);
+  routePollTimer = null;
+}
+
+function scheduleRouteAutoRefresh(delayMs = routePollMs) {
+  stopRouteAutoRefresh();
+  if (!shouldAutoRefreshRoute()) return;
+  routePollTimer = setTimeout(() => {
+    pollRouteOverlay().catch((error) => console.warn(error));
+  }, delayMs);
+}
+
+async function pollRouteOverlay() {
+  if (!shouldAutoRefreshRoute()) {
+    stopRouteAutoRefresh();
+    return;
+  }
+  if (routePollInFlight) {
+    scheduleRouteAutoRefresh(routePollMs);
+    return;
+  }
+  routePollInFlight = true;
+  try {
+    await refreshRouteOverlay({ manual: false, auto: true });
+  } finally {
+    routePollInFlight = false;
+    scheduleRouteAutoRefresh(routePollMs);
+  }
+}
+
+function startRouteAutoRefresh({ immediate = false } = {}) {
+  if (!shouldAutoRefreshRoute()) {
+    stopRouteAutoRefresh();
+    return;
+  }
+  scheduleRouteAutoRefresh(immediate ? 0 : routePollMs);
 }
 
 function carrierDisplayName(carrierLocation = state.carrierLocation) {
@@ -1590,7 +1779,9 @@ async function refreshJournals(mode = 'latest') {
   const all = mode === 'all';
   setJournalButtonsDisabled(true);
   clearTimeout(journalScanPollTimer);
-  setStatus(all ? 'All scan 0:00 · starting' : 'Latest scan 0:00 · starting');
+  const startingMessage = all ? 'All scan 0:00 · starting' : 'Latest scan 0:00 · starting';
+  setStatus(startingMessage);
+  setJournalScanPanel(null, { mode, message: startingMessage, processing: true });
   try {
     const path = all ? '/api/refresh-journals?mode=all' : '/api/refresh-journals?mode=latest&count=20';
     const response = await api(path, { method: 'POST' });
@@ -1600,6 +1791,7 @@ async function refreshJournals(mode = 'latest') {
     console.error(error);
     setWriteActivity('scan', false);
     setStatus(`Journal scan failed: ${error.message}`);
+    setJournalScanPanel(null, { mode, message: `Failed: ${error.message}`, failed: true });
     setJournalButtonsDisabled(false);
   }
 }
@@ -1612,28 +1804,48 @@ async function pollJournalScan(scan) {
       throw new Error(detail || `Journal scan exited with code ${scan.code}.`);
     }
     const priorSupplementalCount = state.visited?.supplementalCount ?? 0;
+    setWriteActivity('scan', false);
+    setJournalScanPanel(scan, { message: 'Scan complete · updating summaries', processing: true });
     await loadStatus();
+    setJournalScanPanel(scan, { message: 'Scan complete · refreshing places and notes', processing: true });
     await loadPlaces();
     systemCache.clear();
     await loadNotes();
+    setJournalScanPanel(scan, { message: 'Scan complete · refreshing nearby map points', processing: true });
     await refreshLocalPointsNow({ radius: Math.max(250, localPointRadius()), limit: 25000 }).catch((error) => {
       if (isAbortError(error)) return;
       console.warn(error);
     });
     richSystemCache.clear();
-    if (state.selectedSystem) await loadSelectedBodies();
-    setStatus(scan.message || 'Journal data refreshed.');
+    if (state.selectedSystem) {
+      setJournalScanPanel(scan, { message: 'Scan complete · refreshing selected system', processing: true });
+      await loadSelectedBodies();
+    }
+    const completeMessage = scan.message || 'Journal data refreshed.';
+    setStatus(completeMessage);
     setJournalButtonsDisabled(false);
     // When no new journal-only systems appeared, the global point set is
     // unchanged except for visited flags — patch those in place instead of
     // re-downloading the whole map layer.
     const supplementalChanged = (state.visited?.supplementalCount ?? 0) !== priorSupplementalCount;
     const refreshTask = supplementalChanged ? loadPoints({ background: true }) : applyVisitedIndexUpdate();
-    refreshTask.catch((error) => {
-      if (isAbortError(error)) return;
-      console.error(error);
-      setStatus(`Could not refresh galaxy map: ${error.message}`);
+    setJournalScanPanel(scan, {
+      message: supplementalChanged ? 'Refreshing galaxy map layer' : 'Updating visited markers',
+      processing: true,
     });
+    refreshTask
+      .then(() => {
+        setJournalScanPanel(scan, { message: completeMessage, processing: false });
+      })
+      .catch((error) => {
+        if (isAbortError(error)) {
+          setJournalScanPanel(scan, { message: completeMessage, processing: false });
+          return;
+        }
+        console.error(error);
+        setStatus(`Could not refresh galaxy map: ${error.message}`);
+        setJournalScanPanel(scan, { message: `Map refresh failed: ${error.message}`, failed: true });
+      });
     return;
   }
   journalScanPollTimer = setTimeout(async () => {
@@ -1645,6 +1857,7 @@ async function pollJournalScan(scan) {
       console.error(error);
       setWriteActivity('scan', false);
       setStatus(`Journal scan status failed: ${error.message}`);
+      setJournalScanPanel(scan, { message: `Status failed: ${error.message}`, failed: true });
       setJournalButtonsDisabled(false);
     }
   }, 1000);
@@ -2530,6 +2743,25 @@ function bindControls() {
   el.murderBinariesToggle.addEventListener('change', () => {
     setMurderBinariesOverlay(el.murderBinariesToggle.checked, true);
   });
+  el.routeToggle.addEventListener('change', () => {
+    state.renderer.showRouteOverlay = el.routeToggle.checked;
+    state.renderer.requestRender();
+    writeViewSettings({ showRouteOverlay: el.routeToggle.checked });
+    if (el.routeToggle.checked) {
+      if (!state.routeOverlay) {
+        setStatus('Route overlay enabled. Reading NavRoute.json...');
+        startRouteAutoRefresh({ immediate: true });
+      } else {
+        startRouteAutoRefresh();
+      }
+    } else {
+      stopRouteAutoRefresh();
+      setStatus('Route overlay hidden.');
+    }
+  });
+  el.refreshRoute.addEventListener('click', () => {
+    refreshRouteOverlay().catch((error) => setStatus(`Route overlay failed: ${error.message}`));
+  });
   for (const input of el.poiModeInputs) {
     input.addEventListener('change', () => {
       if (input.checked) setPoiMode(input.value, true);
@@ -2555,6 +2787,10 @@ function bindControls() {
   window.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !el.noteMenu.hidden) closeNoteMenu();
     else if (event.key === 'Escape' && !el.llmSearchPanel.hidden) setLlmSearchOpen(false);
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') stopRouteAutoRefresh();
+    else startRouteAutoRefresh({ immediate: true });
   });
   el.recenterFocus.addEventListener('click', recenterFocus);
   el.returnLatestJournal.addEventListener('click', returnToLatestJournal);
@@ -2587,6 +2823,7 @@ function bindControls() {
     console.error(error);
     setStatus(`Could not open note editor: ${error.message}`);
   });
+  state.renderer.onRouteSelect = (hop) => focusRouteHop(hop);
   state.renderer.onPlaceSelect = (place) => focusPlace(place);
   state.renderer.onPlaceHover = (hover) => showPlaceTooltip(hover);
   state.renderer.onTargetChange = () => {
@@ -2629,6 +2866,7 @@ async function init() {
   el.sectorMapToggle.checked = viewSettings.showSectorMap ?? false;
   el.landmarksToggle.checked = viewSettings.showLandmarks ?? true;
   el.carrierRangeToggle.checked = viewSettings.showCarrierRange ?? false;
+  el.routeToggle.checked = viewSettings.showRouteOverlay ?? false;
   const savedMurderCategory = Array.isArray(viewSettings.placeCategories)
     && viewSettings.placeCategories.includes(murderBinariesCategory);
   el.murderBinariesToggle.checked = viewSettings.showMurderBinaries ?? savedMurderCategory ?? false;
@@ -2639,6 +2877,7 @@ async function init() {
   state.renderer.showSectorMap = el.sectorMapToggle.checked;
   state.renderer.showLandmarks = el.landmarksToggle.checked;
   state.renderer.showCarrierRange = el.carrierRangeToggle.checked;
+  state.renderer.showRouteOverlay = el.routeToggle.checked;
   state.renderer.showMurderBinaries = el.murderBinariesToggle.checked;
   const savedStarScale = Number(viewSettings.starScalePercent);
   const migratedStarScale = Number(viewSettings.starScale) * 50;
@@ -2687,6 +2926,7 @@ async function init() {
   // Selecting the latest journal system runs a server-side name search that
   // can starve the point streams, so it waits until the map is loaded.
   focusLatestJournal().catch((error) => console.warn(error));
+  if (el.routeToggle.checked) startRouteAutoRefresh({ immediate: true });
 }
 
 async function searchLatestSystem(name, shouldFocus = false) {
