@@ -31,6 +31,18 @@ writeFileSync(journalPath, [
     StarClass: 'A',
   }),
   event({
+    timestamp: '2026-06-15T12:00:01Z',
+    event: 'Loadout',
+    Ship: 'dolphin',
+    ShipID: 35,
+    ShipName: 'Fixture Runner',
+    ShipIdent: 'FR-01',
+    MaxJumpRange: 56.538074,
+    CargoCapacity: 16,
+    FuelCapacity: { Main: 16, Reserve: 0.5 },
+    Rebuy: 931810,
+  }),
+  event({
     timestamp: '2026-06-15T12:00:02Z',
     event: 'Scan',
     ScanType: 'AutoScan',
@@ -123,6 +135,13 @@ try {
   assert.equal(initialSupplemental.mainStar, 'A (Blue-White) Star');
   assert.equal(initialSupplemental.starClass, 'A');
   const originalIndex = initialSupplemental.index;
+  let visited = JSON.parse(readFileSync(path.join(dataDir, 'visited.json'), 'utf8'));
+  assert.equal(visited.currentShip.shipType, 'dolphin');
+  assert.equal(visited.currentShip.shipId, 35);
+  assert.equal(visited.currentShip.shipName, 'Fixture Runner');
+  assert.equal(visited.currentShip.shipIdent, 'FR-01');
+  assert.equal(visited.currentShip.shipKey, 'id:35');
+  assert.equal(visited.currentShip.maxJumpRangeLy, 56.538074);
 
   appendFileSync(journalPath, event({
     timestamp: '2026-06-15T12:03:00Z',
@@ -140,6 +159,24 @@ try {
   assert.equal(data.systems[0].bodies[2].signals.Biological.count, 3);
   assert.equal(JSON.parse(readFileSync(supplementalPath, 'utf8')).systems
     .find((system) => system.name === 'Journal Fixture').mainStar, 'A (Blue-White) Star');
+  visited = JSON.parse(readFileSync(path.join(dataDir, 'visited.json'), 'utf8'));
+  assert.equal(visited.currentShip.maxJumpRangeLy, 56.538074, 'Latest journal scans should preserve previous ship range when no new Loadout is present.');
+
+  appendFileSync(journalPath, event({
+    timestamp: '2026-06-15T12:03:30Z',
+    event: 'Loadout',
+    Ship: 'dolphin',
+    ShipID: 35,
+    ShipName: 'Fixture Runner',
+    ShipIdent: 'FR-01',
+    MaxJumpRange: 54.25,
+    CargoCapacity: 24,
+  }));
+  await run(process.execPath, ['scripts/import-journals.js', journalDir, '--latest', '20'], { EDSS_DATA_DIR: dataDir });
+  visited = JSON.parse(readFileSync(path.join(dataDir, 'visited.json'), 'utf8'));
+  assert.equal(visited.currentShip.maxJumpRangeLy, 54.25);
+  assert.equal(visited.currentShip.cargoCapacity, 24);
+  assert.equal(visited.currentShip.fuelCapacity.main, 16);
 
   appendFileSync(journalPath, event({
     timestamp: '2026-06-15T12:04:00Z',

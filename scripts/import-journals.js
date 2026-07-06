@@ -58,6 +58,12 @@ const bodyDataEvents = new Set([
   'NavBeaconScan',
 ]);
 
+const shipDataEvents = new Set([
+  'LoadGame',
+  'Loadout',
+  'ShipyardSwap',
+]);
+
 function journalSystemAddress(event) {
   const value = event._systemAddress ?? event.SystemAddress;
   if (value === undefined || value === null || value === '') return null;
@@ -187,6 +193,74 @@ function journalCoords(event) {
 function finiteNumber(value, transform = (number) => number) {
   const number = Number(value);
   return Number.isFinite(number) ? transform(number) : undefined;
+}
+
+function finiteInteger(value) {
+  const number = finiteNumber(value);
+  return number === undefined ? undefined : Math.trunc(number);
+}
+
+function cleanString(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function shipTypeFromEvent(event) {
+  return cleanString(event.Ship)
+    ?? cleanString(event.ShipType)
+    ?? cleanString(event.NewShipType)
+    ?? cleanString(event.StoredShip);
+}
+
+function shipIdFromEvent(event) {
+  return finiteInteger(event.ShipID)
+    ?? finiteInteger(event.ShipId)
+    ?? finiteInteger(event.NewShipID)
+    ?? finiteInteger(event.StoreShipID);
+}
+
+function shipIdentityKey(ship) {
+  if (!ship) return null;
+  if (ship.shipId !== undefined && ship.shipId !== null) return `id:${ship.shipId}`;
+  const parts = [ship.shipType, ship.shipName, ship.shipIdent].filter(Boolean).join(':').toLowerCase();
+  return parts ? `ship:${parts}` : null;
+}
+
+function currentShipFromEvent(event, previous = null) {
+  if (!shipDataEvents.has(event.event)) return null;
+  const shipType = shipTypeFromEvent(event) ?? previous?.shipType;
+  const shipId = shipIdFromEvent(event) ?? previous?.shipId;
+  const shipName = cleanString(event.ShipName) ?? previous?.shipName;
+  const shipIdent = cleanString(event.ShipIdent) ?? previous?.shipIdent;
+  if (!shipType && shipId === undefined && !shipName && !shipIdent) return null;
+
+  const next = {
+    timestamp: event.timestamp ?? previous?.timestamp ?? '',
+    sourceEvent: event.event,
+    shipType,
+    shipId,
+    shipName,
+    shipIdent,
+    maxJumpRangeLy: finiteNumber(event.MaxJumpRange),
+    cargoCapacity: finiteInteger(event.CargoCapacity),
+    fuelCapacity: event.FuelCapacity && typeof event.FuelCapacity === 'object'
+      ? {
+          main: finiteNumber(event.FuelCapacity.Main),
+          reserve: finiteNumber(event.FuelCapacity.Reserve),
+        }
+      : undefined,
+    rebuy: finiteInteger(event.Rebuy),
+  };
+  next.shipKey = shipIdentityKey(next);
+
+  const sameShip = previous?.shipKey && next.shipKey && previous.shipKey === next.shipKey;
+  if (sameShip) {
+    next.maxJumpRangeLy ??= previous.maxJumpRangeLy;
+    next.cargoCapacity ??= previous.cargoCapacity;
+    next.fuelCapacity ??= previous.fuelCapacity;
+    next.rebuy ??= previous.rebuy;
+  }
+
+  return Object.fromEntries(Object.entries(next).filter(([, value]) => value !== undefined));
 }
 
 function localizedValue(event, key) {
@@ -431,6 +505,7 @@ async function parseJournals(files) {
   const namesByAddress = new Map();
   const carrierObservations = [];
   let latest = null;
+  let currentShip = null;
   let eventCount = 0;
   let bodyEventCount = 0;
 
@@ -458,6 +533,8 @@ async function parseJournals(files) {
       if (bodyDataEvents.has(event.event) && recordJournalBodyEvent(bodySystems, namesByAddress, event)) {
         bodyEventCount += 1;
       }
+      const ship = currentShipFromEvent(event, currentShip);
+      if (ship && (!currentShip || (ship.timestamp ?? '') >= (currentShip.timestamp ?? ''))) currentShip = ship;
       if (!visitEvents.has(event.event)) continue;
       const carrier = carrierObservation(event);
       if (carrier) carrierObservations.push(carrier);
@@ -500,7 +577,7 @@ async function parseJournals(files) {
   }
 
   for (const [id64, system] of bodySystems) system.name ??= namesByAddress.get(id64);
-  return { systems, bodySystems, latest, eventCount, bodyEventCount, carrierObservations };
+  return { systems, bodySystems, latest, currentShip, eventCount, bodyEventCount, carrierObservations };
 }
 
 async function parseCarrierObservations(files) {
@@ -595,8 +672,24 @@ function mergeSystem(existing, incoming) {
   };
 }
 
+function mergeCurrentShip(existing, incoming) {
+  if (!existing) return incoming ?? null;
+  if (!incoming) return existing;
+  if ((incoming.timestamp ?? '') < (existing.timestamp ?? '')) return existing;
+  const sameShip = existing.shipKey && incoming.shipKey && existing.shipKey === incoming.shipKey;
+  if (!sameShip) return incoming;
+  return {
+    ...existing,
+    ...incoming,
+    maxJumpRangeLy: incoming.maxJumpRangeLy ?? existing.maxJumpRangeLy,
+    cargoCapacity: incoming.cargoCapacity ?? existing.cargoCapacity,
+    fuelCapacity: incoming.fuelCapacity ?? existing.fuelCapacity,
+    rebuy: incoming.rebuy ?? existing.rebuy,
+  };
+}
+
 function mergeParsedWithExisting(parsed, existingPayload) {
-  if (!existingPayload?.systems?.length) return parsed;
+  if (!existingPayload) return parsed;
   const systems = systemMapFromList(existingPayload.systems);
   for (const [key, incoming] of parsed.systems) {
     systems.set(key, mergeSystem(systems.get(key), incoming));
@@ -605,10 +698,12 @@ function mergeParsedWithExisting(parsed, existingPayload) {
   const latest = !previousLatest || (parsed.latest?.timestamp ?? '') > (previousLatest.timestamp ?? '')
     ? parsed.latest
     : previousLatest;
+  const currentShip = mergeCurrentShip(existingPayload.currentShip, parsed.currentShip);
   return {
     ...parsed,
     systems,
     latest,
+    currentShip,
     eventCount: existingPayload.eventCount ?? parsed.eventCount,
   };
 }
@@ -1112,6 +1207,7 @@ async function main() {
     matchedIndexCount: imported.indexes.length,
     supplementalCount: supplemental.systems.length,
     latestSystem: parsed.latest,
+    currentShip: parsed.currentShip ?? null,
     carrierLocation,
     systems,
   };

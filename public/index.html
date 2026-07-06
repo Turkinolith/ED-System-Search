@@ -425,6 +425,20 @@
               <div id="journalScanProgress" class="update-progress journal-scan-progress" hidden><span></span></div>
             </div>
 
+            <div class="section current-ship-section">
+              <div class="section-heading"><span>Current ship</span><span class="section-rule"></span></div>
+              <div id="currentShipSummary" class="muted">Ship data not loaded</div>
+              <div id="currentShipStats" class="current-ship-stats"></div>
+              <label class="ship-range-field">
+                <span>Max jump override</span>
+                <input id="shipJumpOverride" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Journal range">
+              </label>
+              <div class="ship-range-actions">
+                <button id="clearShipJumpOverride" class="panel-button panel-button-tertiary" type="button">Use journal range</button>
+              </div>
+              <div id="shipJumpEffective" class="muted"></div>
+            </div>
+
             <div class="section">
               <div class="section-heading"><span>Local dataset</span><span class="section-rule"></span></div>
               <div id="datasetSummary" class="summary">No import loaded</div>
@@ -433,6 +447,6 @@
         </div>
       </aside>
     </main>
-    <script type="module" src="/app.js?v=route-auto-refresh-1"></script>
+    <script type="module" src="/app.js?v=current-ship-settings-1"></script>
   </body>
 </html>

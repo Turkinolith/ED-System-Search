@@ -74,6 +74,11 @@ const el = {
   focusCopyStatus: document.querySelector('#focusCopyStatus'),
   focusCoords: document.querySelector('#focusCoords'),
   journalSummary: document.querySelector('#journalSummary'),
+  currentShipSummary: document.querySelector('#currentShipSummary'),
+  currentShipStats: document.querySelector('#currentShipStats'),
+  shipJumpOverride: document.querySelector('#shipJumpOverride'),
+  clearShipJumpOverride: document.querySelector('#clearShipJumpOverride'),
+  shipJumpEffective: document.querySelector('#shipJumpEffective'),
   visitedToggle: document.querySelector('#visitedToggle'),
   depthEmphasisToggle: document.querySelector('#depthEmphasisToggle'),
   gridToggle: document.querySelector('#gridToggle'),
@@ -307,6 +312,54 @@ function readViewSettings() {
 function writeViewSettings(patch) {
   const next = { ...readViewSettings(), ...patch };
   localStorage.setItem(viewSettingsKey, JSON.stringify(next));
+}
+
+function currentShipLabel(ship) {
+  if (!ship) return 'Unknown ship';
+  const type = ship.shipType ? String(ship.shipType).replaceAll('_', ' ') : 'Unknown ship';
+  const name = ship.shipName ? `"${ship.shipName}"` : null;
+  const ident = ship.shipIdent ? `[${ship.shipIdent}]` : null;
+  return [name, ident, type].filter(Boolean).join(' ');
+}
+
+function currentShipKey(ship) {
+  if (!ship) return null;
+  if (ship.shipKey) return ship.shipKey;
+  if (ship.shipId !== undefined && ship.shipId !== null) return `id:${ship.shipId}`;
+  const parts = [ship.shipType, ship.shipName, ship.shipIdent].filter(Boolean).join(':').toLowerCase();
+  return parts ? `ship:${parts}` : null;
+}
+
+function readShipJumpOverrides() {
+  const overrides = readViewSettings().shipJumpOverrides;
+  return overrides && typeof overrides === 'object' && !Array.isArray(overrides) ? overrides : {};
+}
+
+function setShipJumpOverride(shipKey, value) {
+  if (!shipKey) return;
+  const overrides = { ...readShipJumpOverrides() };
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) overrides[shipKey] = Number(numeric.toFixed(2));
+  else delete overrides[shipKey];
+  writeViewSettings({ shipJumpOverrides: overrides });
+}
+
+function shipJumpOverride(ship) {
+  const key = currentShipKey(ship);
+  if (!key) return null;
+  const value = Number(readShipJumpOverrides()[key]);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function effectiveShipJumpRange(ship) {
+  const override = shipJumpOverride(ship);
+  const journal = Number(ship?.maxJumpRangeLy);
+  return {
+    value: override ?? (Number.isFinite(journal) && journal > 0 ? journal : null),
+    source: override ? 'override' : 'journal',
+    override,
+    journal: Number.isFinite(journal) && journal > 0 ? journal : null,
+  };
 }
 
 const llmModelPresets = {
@@ -774,6 +827,7 @@ async function loadStatus() {
   } else {
     el.journalSummary.textContent = `No parsed journals yet. Source: ${data.journalPath}`;
   }
+  renderCurrentShip();
   if (data.places?.imported) {
     state.placesMeta = data.places;
     updatePlacesSummary();
@@ -824,6 +878,48 @@ function renderSystemUpdateLog(runs) {
     item.append(title, detail);
     el.systemUpdateLog.append(item);
   }
+}
+
+function appendShipStat(label, value) {
+  const item = document.createElement('div');
+  const title = document.createElement('span');
+  const detail = document.createElement('strong');
+  title.textContent = label;
+  detail.textContent = value;
+  item.append(title, detail);
+  el.currentShipStats.append(item);
+}
+
+function renderCurrentShip() {
+  const ship = state.visited?.currentShip ?? null;
+  el.currentShipStats.replaceChildren();
+  const shipKey = currentShipKey(ship);
+  el.shipJumpOverride.disabled = !shipKey;
+  el.clearShipJumpOverride.disabled = !shipKey || shipJumpOverride(ship) === null;
+  if (!ship) {
+    el.currentShipSummary.textContent = 'No ship data found. Scan journals after a Loadout event is present.';
+    el.shipJumpOverride.value = '';
+    el.shipJumpOverride.placeholder = 'Journal range';
+    el.shipJumpEffective.textContent = '';
+    return;
+  }
+
+  const range = effectiveShipJumpRange(ship);
+  const journalText = range.journal ? `${fmt(range.journal)} ly` : 'Unknown';
+  const override = range.override;
+  el.currentShipSummary.textContent = currentShipLabel(ship);
+  appendShipStat('Journal range', journalText);
+  appendShipStat('Ship ID', ship.shipId !== undefined && ship.shipId !== null ? String(ship.shipId) : 'Unknown');
+  appendShipStat('Last event', `${ship.sourceEvent ?? 'Journal'} · ${localDateTime(ship.timestamp)}`);
+  if (ship.cargoCapacity !== undefined) appendShipStat('Cargo', `${fmt(ship.cargoCapacity)} t`);
+  if (ship.fuelCapacity?.main !== undefined) appendShipStat('Fuel', `${fmt(ship.fuelCapacity.main)} t`);
+
+  el.shipJumpOverride.value = override ?? '';
+  el.shipJumpOverride.placeholder = range.journal ? `${fmt(range.journal)} ly` : 'Journal range';
+  el.clearShipJumpOverride.disabled = !shipKey || override === null;
+  el.shipJumpEffective.textContent = range.value
+    ? `Effective max jump: ${fmt(range.value)} ly (${range.source})`
+    : 'Effective max jump: unknown';
 }
 
 function setupUpdateFilters(range) {
@@ -2807,6 +2903,19 @@ function bindControls() {
   el.refreshJournals.addEventListener('click', () => refreshJournals('latest'));
   el.scanLatestJournals.addEventListener('click', () => refreshJournals('latest'));
   el.scanAllJournals.addEventListener('click', () => refreshJournals('all'));
+  el.shipJumpOverride.addEventListener('change', () => {
+    const ship = state.visited?.currentShip;
+    const key = currentShipKey(ship);
+    if (!key) return;
+    setShipJumpOverride(key, el.shipJumpOverride.value);
+    renderCurrentShip();
+  });
+  el.clearShipJumpOverride.addEventListener('click', () => {
+    const key = currentShipKey(state.visited?.currentShip);
+    if (!key) return;
+    setShipJumpOverride(key, null);
+    renderCurrentShip();
+  });
   for (const button of el.systemUpdateButtons) {
     button.addEventListener('click', () => {
       const confirmedLarge = button.dataset.largeUpdate === 'true';
