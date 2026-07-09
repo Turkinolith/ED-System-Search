@@ -260,6 +260,23 @@ struct FilterLodWriter {
     count: u64,
 }
 
+pub(crate) fn rebuild_map_filters(data_dir: &Path) -> Result<()> {
+    let rich_dir = data_dir.join("galaxy");
+    let manifest_path = rich_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        bail!(
+            "Cannot rebuild rich map filters before a base galaxy import. Run the galaxy mode first."
+        );
+    }
+    let mut manifest = serde_json::from_reader::<_, Manifest>(File::open(&manifest_path)?)
+        .context("Could not read existing galaxy manifest")?;
+    manifest.map_filters = build_map_filter_files_from_manifest(data_dir, &rich_dir, &manifest)?;
+    manifest.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    write_manifest(&manifest_path, &manifest)?;
+    println!("Rich map filter sidecars rebuilt from existing galaxy segments.");
+    Ok(())
+}
+
 pub(crate) fn run(config: RichImportConfig<'_>) -> Result<()> {
     let rich_dir = config.data_dir.join("galaxy");
     fs::create_dir_all(&rich_dir)?;
@@ -929,10 +946,120 @@ fn write_index(path: &Path, entries: &[IndexEntry]) -> Result<()> {
     Ok(())
 }
 
+fn read_index_header(reader: &mut BufReader<File>, path: &Path) -> Result<(u32, u64)> {
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != INDEX_MAGIC {
+        bail!("Invalid rich index magic in {}", path.display());
+    }
+    let mut u32_bytes = [0u8; 4];
+    reader.read_exact(&mut u32_bytes)?;
+    let version = u32::from_le_bytes(u32_bytes);
+    reader.read_exact(&mut u32_bytes)?;
+    let record_bytes = u32::from_le_bytes(u32_bytes);
+    let mut u64_bytes = [0u8; 8];
+    reader.read_exact(&mut u64_bytes)?;
+    let count = u64::from_le_bytes(u64_bytes);
+    reader.read_exact(&mut u64_bytes)?;
+    if version != FORMAT_VERSION || record_bytes != INDEX_RECORD_BYTES {
+        bail!("Unsupported rich index format in {}", path.display());
+    }
+    Ok((record_bytes, count))
+}
+
+fn read_index_entry(record: &[u8]) -> IndexEntry {
+    IndexEntry {
+        id64: u64::from_le_bytes(record[0..8].try_into().unwrap()),
+        offset: u64::from_le_bytes(record[8..16].try_into().unwrap()),
+        compressed_len: u32::from_le_bytes(record[16..20].try_into().unwrap()),
+        raw_len: u32::from_le_bytes(record[20..24].try_into().unwrap()),
+        update_seconds: u32::from_le_bytes(record[24..28].try_into().unwrap()),
+        body_count: u32::from_le_bytes(record[28..32].try_into().unwrap()),
+        station_count: u32::from_le_bytes(record[32..36].try_into().unwrap()),
+        flags: u32::from_le_bytes(record[36..40].try_into().unwrap()),
+        body_types: u32::from_le_bytes(record[40..44].try_into().unwrap()),
+        atmosphere_types: u32::from_le_bytes(record[44..48].try_into().unwrap()),
+        ring_types: u32::from_le_bytes(record[48..52].try_into().unwrap()),
+        volcanism_types: u32::from_le_bytes(record[52..56].try_into().unwrap()),
+        economy_types: u32::from_le_bytes(record[56..60].try_into().unwrap()),
+        security_types: u32::from_le_bytes(record[60..64].try_into().unwrap()),
+        government_types: u32::from_le_bytes(record[64..68].try_into().unwrap()),
+    }
+}
+
+fn filter_summary(entry: IndexEntry) -> FilterSummary {
+    FilterSummary {
+        flags: entry.flags | FLAG_RICH_DATA,
+        body_count: entry.body_count,
+        station_count: entry.station_count,
+        body_types: entry.body_types,
+        atmosphere_types: entry.atmosphere_types,
+        ring_types: entry.ring_types,
+        volcanism_types: entry.volcanism_types,
+        economy_types: entry.economy_types,
+        security_types: entry.security_types,
+        government_types: entry.government_types,
+    }
+}
+
 fn build_map_filter_files(
     data_dir: &Path,
     rich_dir: &Path,
     entries: &[IndexEntry],
+) -> Result<Option<MapFilterManifest>> {
+    let mut summaries = FxHashMap::default();
+    summaries
+        .try_reserve(entries.len())
+        .context("Not enough memory to allocate rich map summaries")?;
+    for entry in entries {
+        summaries.insert(entry.id64, filter_summary(*entry));
+    }
+    build_map_filter_files_from_summaries(data_dir, rich_dir, &summaries)
+}
+
+fn build_map_filter_files_from_manifest(
+    data_dir: &Path,
+    rich_dir: &Path,
+    manifest: &Manifest,
+) -> Result<Option<MapFilterManifest>> {
+    let total_count = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.count as usize)
+        .sum::<usize>();
+    println!(
+        "Building in-memory rich summaries from {} galaxy segment(s)...",
+        format_count(manifest.segments.len() as u64)
+    );
+    let mut summaries = FxHashMap::default();
+    summaries
+        .try_reserve(total_count)
+        .context("Not enough memory to allocate rich map summaries")?;
+    for segment in manifest.segments.iter().rev() {
+        let path = rich_dir.join(&segment.index_file);
+        let mut reader = BufReader::with_capacity(32 * 1024 * 1024, File::open(&path)?);
+        let (record_bytes, count) = read_index_header(&mut reader, &path)?;
+        let mut record = vec![0u8; record_bytes as usize];
+        for index in 0..count {
+            reader.read_exact(&mut record)?;
+            let entry = read_index_entry(&record);
+            summaries.insert(entry.id64, filter_summary(entry));
+            if (index + 1) % 10_000_000 == 0 {
+                println!(
+                    "Loaded {} summaries from {}...",
+                    format_count(index + 1),
+                    segment.index_file
+                );
+            }
+        }
+    }
+    build_map_filter_files_from_summaries(data_dir, rich_dir, &summaries)
+}
+
+fn build_map_filter_files_from_summaries(
+    data_dir: &Path,
+    rich_dir: &Path,
+    summaries: &FxHashMap<u64, FilterSummary>,
 ) -> Result<Option<MapFilterManifest>> {
     let systems_path = data_dir.join("systems.bin");
     if !systems_path.exists() {
@@ -954,29 +1081,8 @@ fn build_map_filter_files(
 
     println!(
         "Building in-memory rich summaries for {} ID64 values...",
-        format_count(entries.len() as u64)
+        format_count(summaries.len() as u64)
     );
-    let mut summaries = FxHashMap::default();
-    summaries
-        .try_reserve(entries.len())
-        .context("Not enough memory to allocate rich map summaries")?;
-    for entry in entries {
-        summaries.insert(
-            entry.id64,
-            FilterSummary {
-                flags: entry.flags | FLAG_RICH_DATA,
-                body_count: entry.body_count,
-                station_count: entry.station_count,
-                body_types: entry.body_types,
-                atmosphere_types: entry.atmosphere_types,
-                ring_types: entry.ring_types,
-                volcanism_types: entry.volcanism_types,
-                economy_types: entry.economy_types,
-                security_types: entry.security_types,
-                government_types: entry.government_types,
-            },
-        );
-    }
 
     let temp_tag = format!(".{}.tmp", Utc::now().timestamp_millis());
     let mut lods = Vec::with_capacity(available_lods.len());

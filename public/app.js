@@ -580,9 +580,15 @@ function configureRichFilters() {
   const available = richFiltersAvailable();
   const categoriesAvailable = richCategoryFiltersAvailable();
   const settings = readViewSettings();
+  const unavailableReason = state.galaxyDetails?.mapFilters?.compatibility?.reason
+    ?? (state.galaxyDetails?.imported
+      ? 'Reimport galaxy.json.gz to build map filter indexes.'
+      : 'Import galaxy.json.gz to enable these filters.');
   for (const [name, input] of richFilterControls()) {
     input.disabled = !available;
     input.checked = available ? Boolean(settings.richFilters?.[name]) : false;
+    input.closest('label')?.toggleAttribute('aria-disabled', !available);
+    input.closest('label')?.setAttribute('title', available ? '' : unavailableReason);
   }
   el.minBodyCount.disabled = !available;
   el.clearRichFilters.disabled = !available;
@@ -590,13 +596,11 @@ function configureRichFilters() {
   for (const [name, input] of richCategoryControls()) {
     input.disabled = !categoriesAvailable;
     input.value = categoriesAvailable ? String(settings.richFilters?.[name] ?? '') : '';
+    input.closest('label')?.toggleAttribute('aria-disabled', !categoriesAvailable);
+    input.closest('label')?.setAttribute('title', categoriesAvailable ? '' : unavailableReason);
   }
   if (!available) {
-    const reason = state.galaxyDetails?.mapFilters?.compatibility?.reason;
-    el.richFiltersSummary.textContent = reason
-      ?? (state.galaxyDetails?.imported
-        ? 'Reimport galaxy.json.gz to build map filter indexes.'
-        : 'Import galaxy.json.gz to enable these filters.');
+    el.richFiltersSummary.textContent = unavailableReason;
     return;
   }
   const count = state.galaxyDetails.baseCount ?? state.galaxyDetails.indexedRecords ?? 0;

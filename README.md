@@ -179,6 +179,14 @@ npm run import:galaxy-delta:7days
 npm run import:galaxy-delta:1month
 ```
 
+These commands also rebuild the map filter sidecars used by the System features
+toggles. If you have already updated the normal system map and rich data, rebuild
+only those sidecars with:
+
+```powershell
+npm run import:galaxy-filters
+```
+
 System-only updates preserve local journal systems and notes. Rich-data deltas
 are searched newest-first when a system appears in multiple segments.
 

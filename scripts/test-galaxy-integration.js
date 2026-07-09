@@ -206,6 +206,43 @@ assert.equal(manifest.mapFilters.lodLevels[1].count, systems.length);
 assert.equal(readFileSync(path.join(dataDir, 'galaxy', 'systems-lod-0-rich.bin')).byteLength, coarseLodCount * 40);
 assert.equal(readFileSync(path.join(dataDir, 'galaxy', 'systems-lod-1-rich.bin')).byteLength, systems.length * 40);
 
+const appendedSystemIndex = systems.length;
+const appendedRecord = Buffer.alloc(32);
+appendedRecord.writeFloatLE(5000, 0);
+appendedRecord.writeFloatLE(5000, 4);
+appendedRecord.writeFloatLE(5000, 8);
+appendedRecord.writeUInt16LE(0, 12);
+appendedRecord.writeBigUInt64LE(500n, 24);
+writeFileSync(path.join(dataDir, 'systems.bin'), Buffer.concat([systemRecords, appendedRecord]));
+const appendedLodRecord = Buffer.alloc(20);
+appendedLodRecord.writeFloatLE(5000, 0);
+appendedLodRecord.writeFloatLE(5000, 4);
+appendedLodRecord.writeFloatLE(5000, 8);
+appendedLodRecord.writeUInt16LE(0, 12);
+appendedLodRecord.writeUInt32LE(appendedSystemIndex, 16);
+writeFileSync(path.join(dataDir, 'systems-lod-1.bin'), Buffer.concat([lodRecords, appendedLodRecord]));
+writeFileSync(path.join(dataDir, 'systems-meta.json'), JSON.stringify({
+  count: systems.length + 1,
+  importedCount: systems.length + 1,
+  importedAt: new Date().toISOString(),
+  typeNames: ['Fixture star'],
+  lodLevels: [
+    { level: 0, count: coarseLodCount, file: 'systems-lod-0.bin' },
+    { level: 1, count: systems.length + 1, file: 'systems-lod-1.bin' },
+  ],
+  sol: { coords: { x: 0, y: 0, z: 0 } },
+}));
+const rebuiltFilters = spawnSync(importer, [
+  'galaxy-filters',
+  '--data-dir', dataDir,
+  '--threads', '2',
+], { cwd: root, encoding: 'utf8' });
+assert.equal(rebuiltFilters.status, 0, `${rebuiltFilters.stdout}\n${rebuiltFilters.stderr}`);
+const rebuiltManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+assert.equal(rebuiltManifest.mapFilters.lodLevels[0].count, coarseLodCount);
+assert.equal(rebuiltManifest.mapFilters.lodLevels[1].count, systems.length + 1);
+assert.equal(readFileSync(path.join(dataDir, 'galaxy', 'systems-lod-1-rich.bin')).byteLength, (systems.length + 1) * 40);
+
 const server = spawn(process.execPath, ['server.js'], {
   cwd: root,
   env: { ...process.env, EDSS_DATA_DIR: dataDir, PORT: String(port) },

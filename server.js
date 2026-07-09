@@ -500,7 +500,7 @@ function richMapFiltersCompatibility(meta, manifest) {
   return {
     compatible: issues.length === 0,
     reason: issues.length
-      ? 'Full-data map filters are out of date. Reimport full galaxy data after system updates to rebuild them.'
+      ? 'Full-data map filters are out of date. Run npm run import:galaxy-filters after system updates to rebuild them.'
       : null,
     issues,
   };
@@ -2459,7 +2459,7 @@ async function readPoints(reqUrl, res) {
       }, 409);
     }
     if (richRecordBytes < richFilterMinimumRecordBytes) {
-      return sendJson(res, { error: 'The rich map filter index format is invalid. Reimport galaxy.json.gz.' }, 409);
+      return sendJson(res, { error: 'The rich map filter index format is invalid. Run npm run import:galaxy-filters to rebuild it.' }, 409);
     }
     if (richFilters.advanced && richRecordBytes < 40) {
       return sendJson(res, { error: 'Detailed body and economy filters require a new full galaxy import.' }, 409);
@@ -2469,17 +2469,17 @@ async function readPoints(reqUrl, res) {
     }
     richLod = galaxyManifest.mapFilters.lodLevels.find((entry) => Number(entry.level) === Number(lod.level));
     if (!richLod) {
-      return sendJson(res, { error: `Rich filters are not available for LOD ${lod.level}. Reimport galaxy.json.gz to build filter indexes.` }, 409);
+      return sendJson(res, { error: `Rich filters are not available for LOD ${lod.level}. Run npm run import:galaxy-filters to build filter indexes.` }, 409);
     }
     if (Number(richLod.count) !== Number(lod.count)) {
       return sendJson(res, {
-        error: `Rich filters are out of date for LOD ${lod.level}. Reimport full galaxy data to rebuild map filter indexes.`,
+        error: `Rich filters are out of date for LOD ${lod.level}. Run npm run import:galaxy-filters to rebuild map filter indexes.`,
         issues: [`LOD ${lod.level} has ${lod.count} systems, but its rich filter sidecar has ${richLod.count}.`],
       }, 409);
     }
     richStat = await fs.stat(galaxyDataPath(richLod.file)).catch(() => null);
     if (!richStat) {
-      return sendJson(res, { error: `The rich filter index file for LOD ${lod.level} is missing. Reimport galaxy.json.gz.` }, 409);
+      return sendJson(res, { error: `The rich filter index file for LOD ${lod.level} is missing. Run npm run import:galaxy-filters.` }, 409);
     }
   }
   const source = path.join(dataDir, lod.file);

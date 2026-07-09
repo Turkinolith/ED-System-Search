@@ -845,6 +845,23 @@ button:disabled {
   box-shadow: var(--glow-cyan);
 }
 
+.toggle[aria-disabled],
+.toggle input:disabled + span {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.toggle input:disabled {
+  cursor: not-allowed;
+  border-color: rgba(116, 132, 142, 0.18);
+  background: rgba(5, 7, 11, 0.44);
+}
+
+.toggle input:disabled::after {
+  background: rgba(128, 150, 161, 0.42);
+  box-shadow: none;
+}
+
 .overlay-toggles {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

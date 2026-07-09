@@ -314,6 +314,7 @@ fn main() -> Result<()> {
             compression_level: config.compression_level,
             batch_size: config.batch_size,
         }),
+        "galaxy-filters" => rich::rebuild_map_filters(&config.data_dir),
         "murder-binaries" => murder::run(murder::MurderImportConfig {
             data_dir: &config.data_dir,
             threads: config.threads,
@@ -325,7 +326,7 @@ fn main() -> Result<()> {
             threads: config.threads,
         }),
         _ => bail!(
-            "Unknown mode '{}'. Use full, delta, galaxy, galaxy-delta, murder-binaries, murder-index, or spatial-index.",
+            "Unknown mode '{}'. Use full, delta, galaxy, galaxy-delta, galaxy-filters, murder-binaries, murder-index, or spatial-index.",
             config.mode
         ),
     }
@@ -345,7 +346,7 @@ impl Config {
         let mut args = env::args().skip(1);
         let mode = args.next().ok_or_else(|| {
             anyhow!(
-                "Usage: ed-data-importer <full|delta|galaxy|galaxy-delta|murder-binaries|murder-index|spatial-index> [--source <path-or-url>] [--data-dir data] [--threads N] [--compression-level 1-19] [--batch-size N]"
+                "Usage: ed-data-importer <full|delta|galaxy|galaxy-delta|galaxy-filters|murder-binaries|murder-index|spatial-index> [--source <path-or-url>] [--data-dir data] [--threads N] [--compression-level 1-19] [--batch-size N]"
             )
         })?;
         let mut source = None;
@@ -399,7 +400,11 @@ impl Config {
             bail!("--compression-level must be between 1 and 19");
         }
 
-        let source = if mode == "murder-binaries" || mode == "murder-index" || mode == "spatial-index" {
+        let source = if mode == "galaxy-filters"
+            || mode == "murder-binaries"
+            || mode == "murder-index"
+            || mode == "spatial-index"
+        {
             source.unwrap_or_default()
         } else {
             source.ok_or_else(|| anyhow!("--source is required"))?
