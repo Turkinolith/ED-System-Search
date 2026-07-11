@@ -693,6 +693,8 @@ function setSystemUpdateStatus(update) {
       ? 'Discoveries update'
       : update?.mode === 'murder-binaries'
         ? 'Murder Binaries analysis'
+      : update?.mode === 'green-gas-giants'
+        ? 'Green Gas Giant analysis'
       : update?.mode === 'galaxy'
         ? 'Full galaxy import'
     : update?.mode
@@ -1996,6 +1998,8 @@ async function runSystemUpdate(mode, confirmedLarge = false) {
       ? 'Discoveries update'
       : mode === 'murder-binaries'
         ? 'Murder Binaries analysis'
+      : mode === 'green-gas-giants'
+        ? 'Green Gas Giant analysis'
       : mode === 'galaxy'
         ? 'Full galaxy import'
         : `Systems ${mode}`;

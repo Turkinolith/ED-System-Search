@@ -171,6 +171,18 @@ npm run import:systems-delta:6months
 npm run import:systems-delta:finish
 ```
 
+To build the separate Green Gas Giant database from the installed full-galaxy
+pack and the locally imported EDAstro POI list, run:
+
+```powershell
+npm run build:green-gas-giants
+```
+
+It writes `data/green-gas-giants.json`, retaining every known EDAstro GGG and
+adding only strict very-high candidates: a Water Giant or Gas Giant with
+Water-Based Life at 158 K. The resulting optional POI filters are `Green Gas
+Giants` and `Green Gas Giant candidates`.
+
 Rich-data deltas can be added without replacing the base pack:
 
 ```powershell

@@ -32,6 +32,7 @@ const discoveriesPath = path.join(dataDir, 'discoveries.json');
 const murderBinariesMetaPath = path.join(dataDir, 'murder-binaries-meta.json');
 const murderBinariesDataPath = path.join(dataDir, 'murder-binaries.bin');
 const murderBinariesNamesPath = path.join(dataDir, 'murder-binaries-names.txt');
+const greenGasGiantsPath = path.join(dataDir, 'green-gas-giants.json');
 const notesPath = path.join(dataDir, 'system-notes.json');
 const regionMapPath = path.join(dataDir, 'region-map-vectors.json');
 const systemUpdateLogPath = path.join(dataDir, 'system-update-log.json');
@@ -175,6 +176,7 @@ let visitedCache = null;
 let placesCache = null;
 let discoveriesCache = null;
 let murderBinariesIndexCache = null;
+let greenGasGiantsCache = null;
 let spatialIndexCache = null;
 let notesCache = null;
 let updateMetaCache = null;
@@ -1459,7 +1461,8 @@ async function getPlaces() {
   const stat = existsSync(placesPath) ? await fs.stat(placesPath) : null;
   const discoveriesStat = existsSync(discoveriesPath) ? await fs.stat(discoveriesPath) : null;
   const murderStat = existsSync(murderBinariesMetaPath) ? await fs.stat(murderBinariesMetaPath) : null;
-  if (!stat && !discoveriesStat && !murderStat) {
+  const greenGasGiantsStat = existsSync(greenGasGiantsPath) ? await fs.stat(greenGasGiantsPath) : null;
+  if (!stat && !discoveriesStat && !murderStat && !greenGasGiantsStat) {
     return {
       imported: false,
       importedAt: null,
@@ -1469,17 +1472,36 @@ async function getPlaces() {
       categories: {},
       discoveries: null,
       murderBinaries: null,
+      greenGasGiants: null,
       places: [],
     };
   }
-  const cacheKey = `${stat?.mtimeMs ?? 0}:${discoveriesStat?.mtimeMs ?? 0}:${murderStat?.mtimeMs ?? 0}`;
+  const cacheKey = `${stat?.mtimeMs ?? 0}:${discoveriesStat?.mtimeMs ?? 0}:${murderStat?.mtimeMs ?? 0}:${greenGasGiantsStat?.mtimeMs ?? 0}`;
   if (!placesCache || placesCache.cacheKey !== cacheKey) {
     const data = stat ? await readJson(placesPath, null) : null;
     const discoveries = await getDiscoveries();
     const murderBinaries = murderStat ? await readJson(murderBinariesMetaPath, null) : null;
+    const greenGasGiants = greenGasGiantsStat ? await getGreenGasGiants() : null;
     const basePlaces = Array.isArray(data) ? data : data?.places ?? [];
     const discoveryPlaces = discoveries?.places ?? [];
-    const places = [...basePlaces, ...discoveryPlaces];
+    const greenGasGiantPlaces = (greenGasGiants?.systems ?? []).map((system) => ({
+      id: `ggg-${system.id64 ?? system.name.toLowerCase()}`,
+      name: system.name,
+      category: system.known ? 'Green Gas Giants' : 'Green Gas Giant candidates',
+      source: 'Local Green Gas Giant analysis',
+      sourceGroup: 'Local full galaxy analysis',
+      type: system.known ? 'Confirmed Green Gas Giant' : 'Very-high Green Gas Giant candidate',
+      typeLabel: system.known ? 'Confirmed Green Gas Giant' : 'Very-high candidate',
+      coords: system.coords,
+      systemName: system.name,
+      description: system.known
+        ? `Known GGG from EDAstro; ${system.bodies?.length ? 'also matches the strict 158 K candidate rule.' : 'not required to match the strict candidate rule.'}`
+        : `Water giant or gas giant with water-based life at 158 K (${system.bodies?.map((body) => body.name).join(', ') ?? 'matching body'}).`,
+      updatedAt: greenGasGiants.importedAt,
+      defaultEnabled: false,
+      discovery: true,
+    }));
+    const places = [...basePlaces, ...discoveryPlaces, ...greenGasGiantPlaces];
     const categories = places.reduce((counts, place) => {
       const category = place.category ?? 'Place';
       counts[category] = (counts[category] ?? 0) + 1;
@@ -1490,8 +1512,8 @@ async function getPlaces() {
       cacheKey,
       data: {
         imported: true,
-        importedAt: data?.importedAt ?? discoveries?.importedAt ?? murderBinaries?.importedAt ?? new Date((stat ?? discoveriesStat ?? murderStat).mtimeMs).toISOString(),
-        source: [data?.source, discoveries?.source, murderBinaries?.source].filter(Boolean).join(' + ') || 'Places',
+        importedAt: data?.importedAt ?? discoveries?.importedAt ?? murderBinaries?.importedAt ?? greenGasGiants?.importedAt ?? new Date((stat ?? discoveriesStat ?? murderStat ?? greenGasGiantsStat).mtimeMs).toISOString(),
+        source: [data?.source, discoveries?.source, murderBinaries?.source, greenGasGiants ? 'Green Gas Giant analysis' : null].filter(Boolean).join(' + ') || 'Places',
         sourceUrl: data?.sourceUrl ?? null,
         count: data?.count ?? places.length,
         categories,
@@ -1511,6 +1533,11 @@ async function getPlaces() {
           importedAt: murderBinaries.importedAt,
           count: murderBinaries.count ?? 0,
           criteria: murderBinaries.criteria,
+        } : null,
+        greenGasGiants: greenGasGiants ? {
+          importedAt: greenGasGiants.importedAt,
+          knownSystemCount: greenGasGiants.knownSystemCount,
+          highCandidateCount: greenGasGiants.highCandidateCount,
         } : null,
         places,
       },
@@ -2196,6 +2223,14 @@ function finiteCoords(coords) {
     && Number.isFinite(Number(coords.x))
     && Number.isFinite(Number(coords.y))
     && Number.isFinite(Number(coords.z));
+}
+
+async function getGreenGasGiants() {
+  const stat = await fs.stat(greenGasGiantsPath);
+  if (!greenGasGiantsCache || greenGasGiantsCache.mtimeMs !== stat.mtimeMs) {
+    greenGasGiantsCache = { mtimeMs: stat.mtimeMs, data: await readJson(greenGasGiantsPath, null) };
+  }
+  return greenGasGiantsCache.data;
 }
 
 function distanceLy(a, b) {
@@ -2993,6 +3028,7 @@ async function runSystemUpdate(reqUrl, res) {
   const placesUpdate = mode === 'places';
   const discoveriesUpdate = mode === 'discoveries';
   const murderBinariesUpdate = mode === 'murder-binaries';
+  const greenGasGiantsUpdate = mode === 'green-gas-giants';
   const galaxyUpdate = mode === 'galaxy';
   const localGalaxyPath = path.join(__dirname, 'galaxy.json.gz');
   const sourceInfo = placesUpdate
@@ -3001,6 +3037,8 @@ async function runSystemUpdate(reqUrl, res) {
       ? { label: 'EDAstro + Explorarium Discoveries', url: 'multiple discovery sources', large: false, kind: 'discoveries' }
       : murderBinariesUpdate
         ? { label: 'Murder Binaries local analysis', url: path.join(dataDir, 'galaxy'), large: true, kind: 'murder-binaries' }
+      : greenGasGiantsUpdate
+        ? { label: 'Green Gas Giant local analysis', url: path.join(dataDir, 'galaxy'), large: true, kind: 'green-gas-giants' }
       : galaxyUpdate
         ? { label: 'Local Spansh full galaxy data', url: localGalaxyPath, large: true, kind: 'galaxy' }
         : systemDeltaSources[mode];
@@ -3033,6 +3071,8 @@ async function runSystemUpdate(reqUrl, res) {
         ? 'queued discoveries update'
         : murderBinariesUpdate
           ? 'queued Murder Binaries analysis'
+        : greenGasGiantsUpdate
+          ? 'queued Green Gas Giant analysis'
         : galaxyUpdate
           ? 'queued full galaxy import'
           : `queued ${mode} systems update`,
@@ -3047,6 +3087,8 @@ async function runSystemUpdate(reqUrl, res) {
       ? [{ step: placesUpdate ? 'refresh places' : 'refresh discoveries', args: [path.join(__dirname, 'scripts', placesUpdate ? 'import-places.js' : 'import-discoveries.js'), ...(placesUpdate ? [source] : [])] }]
       : murderBinariesUpdate
         ? [{ step: 'analyze Murder Binaries', args: [path.join(__dirname, 'scripts', 'run-native-importer.js'), 'murder-binaries'] }]
+      : greenGasGiantsUpdate
+        ? [{ step: 'analyze Green Gas Giant candidates', args: [path.join(__dirname, 'scripts', 'run-native-importer.js'), 'green-gas-giants'] }]
       : galaxyUpdate
         ? [{ step: 'import full galaxy data', args: [path.join(__dirname, 'scripts', 'run-native-importer.js'), 'galaxy', '--source', source] }]
       : [
@@ -3070,6 +3112,7 @@ async function runSystemUpdate(reqUrl, res) {
     placesCache = null;
     discoveriesCache = null;
     murderBinariesIndexCache = null;
+    greenGasGiantsCache = null;
     closeCachedFd(spatialIndexCache);
     spatialIndexCache = null;
     supplementalCache = null;

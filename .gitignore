@@ -6,6 +6,7 @@ data/*
 *.json.gz
 *.csv.gz
 systemsWithCoordinates.json.gz
+*.crdownload
 
 # Local region-map source inputs
 regionID_numsort.csv

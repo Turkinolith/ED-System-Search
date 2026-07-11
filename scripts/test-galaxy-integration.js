@@ -61,11 +61,18 @@ const systems = [
   },
   {
     id64: 200,
-    name: 'Fixture Empty',
+    name: 'Fixture Green',
     coords: { x: 4, y: 5, z: 6 },
     date: '2026-06-13T12:00:00Z',
-    bodyCount: 0,
-    bodies: [],
+    bodyCount: 1,
+    bodies: [{
+      id64: 201,
+      bodyId: 1,
+      name: 'Fixture Green 1',
+      type: 'Planet',
+      subType: 'Water giant',
+      surfaceTemperature: 158,
+    }],
     stations: [],
   },
   {
@@ -161,6 +168,15 @@ writeFileSync(path.join(dataDir, 'systems-meta.json'), JSON.stringify({
   ],
   sol: { coords: { x: 0, y: 0, z: 0 } },
 }));
+writeFileSync(path.join(dataDir, 'places.json'), JSON.stringify({
+  sourceUrl: 'https://edastro.com/gec/search?catID=9',
+  places: [{
+    name: 'Fixture Green Giant',
+    systemName: 'Fixture Green',
+    type: 'Green Gas Giants',
+    coords: { x: 4, y: 5, z: 6 },
+  }],
+}));
 
 const imported = spawnSync(importer, [
   'galaxy',
@@ -170,6 +186,20 @@ const imported = spawnSync(importer, [
   '--batch-size', '2',
 ], { cwd: root, encoding: 'utf8' });
 assert.equal(imported.status, 0, `${imported.stdout}\n${imported.stderr}`);
+
+const greenGasGiants = spawnSync(importer, [
+  'green-gas-giants',
+  '--data-dir', dataDir,
+  '--threads', '2',
+  '--batch-size', '2',
+], { cwd: root, encoding: 'utf8' });
+assert.equal(greenGasGiants.status, 0, `${greenGasGiants.stdout}\n${greenGasGiants.stderr}`);
+const greenGasGiantDatabase = JSON.parse(readFileSync(path.join(dataDir, 'green-gas-giants.json'), 'utf8'));
+assert.equal(greenGasGiantDatabase.knownSystemCount, 1);
+assert.equal(greenGasGiantDatabase.highCandidateCount, 1);
+assert.equal(greenGasGiantDatabase.systems[0].name, 'Fixture Green');
+assert.equal(greenGasGiantDatabase.systems[0].known, true);
+assert.equal(greenGasGiantDatabase.systems[0].bodies[0].surfaceTemperature, 158);
 
 const spatial = spawnSync(importer, [
   'spatial-index',
@@ -307,6 +337,9 @@ try {
   const places = await placesResponse.json();
   assert.equal(places.categories['Murder Binaries'], 1);
   assert.equal(places.murderBinaries.count, 1);
+  assert.equal(places.greenGasGiants.knownSystemCount, 1);
+  assert.equal(places.greenGasGiants.highCandidateCount, 1);
+  assert.equal(places.places.some((place) => place.category === 'Green Gas Giants' && place.name === 'Fixture Green'), true);
   assert.equal(places.places.some((place) => place.category === 'Murder Binaries'), false);
 
   const murderResponse = await fetch(`http://localhost:${port}/api/murder-binaries?x=10&y=11&z=12&limit=50`);

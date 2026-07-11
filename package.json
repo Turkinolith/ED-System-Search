@@ -18,6 +18,7 @@
     "import:galaxy": "node scripts/run-native-importer.js galaxy --source galaxy.json.gz",
     "import:galaxy:download": "node scripts/run-native-importer.js galaxy --source https://downloads.spansh.co.uk/galaxy.json.gz",
     "import:galaxy-filters": "node scripts/run-native-importer.js galaxy-filters",
+    "build:green-gas-giants": "node scripts/run-native-importer.js green-gas-giants",
     "import:galaxy-delta:1day": "node scripts/run-native-importer.js galaxy-delta --source https://downloads.spansh.co.uk/galaxy_1day.json.gz && npm run import:galaxy-filters",
     "import:galaxy-delta:7days": "node scripts/run-native-importer.js galaxy-delta --source https://downloads.spansh.co.uk/galaxy_7days.json.gz && npm run import:galaxy-filters",
     "import:galaxy-delta:1month": "node scripts/run-native-importer.js galaxy-delta --source https://downloads.spansh.co.uk/galaxy_1month.json.gz && npm run import:galaxy-filters",
