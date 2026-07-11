@@ -495,6 +495,7 @@ export class GalaxyRenderer {
     this.onSelect = null;
     this.onHover = null;
     this.onSystemContext = null;
+    this.onPlaceContext = null;
     this.onPlaceSelect = null;
     this.onPlaceHover = null;
     this.matrix = identity();
@@ -1208,13 +1209,11 @@ export class GalaxyRenderer {
       for (const result of this.searchResults) this.drawMarker({ ...result.coords, ...result, flags: 0 }, true);
     }
     if (this.isolatePlaces || this.showPlaces || this.showMurderBinaries) this.drawPlaceIndicators();
-    if (!this.isolatePlaces && this.selectedSystem) this.drawSelectedSystem();
-    if (this.selectedPlace && (!this.isolatePlaces || this.places.some((place) => place.id === this.selectedPlace.id))) {
-      this.drawSelectedPlace();
-    }
+    if (this.selectedSystem) this.drawSelectedSystem();
+    if (this.selectedPlace) this.drawSelectedPlace();
     if (!this.isolatePlaces) this.drawHoverMarker();
     if (!this.isolatePlaces && this.showLandmarks) this.drawLandmarkIndicators();
-    if (!this.isolatePlaces) this.drawOrbitPoint(grid);
+    this.drawOrbitPoint(grid);
   }
 
   drawRouteOverlay() {
@@ -1374,6 +1373,9 @@ export class GalaxyRenderer {
       .map((item) => item.place);
     if (this.isolatePlaces) {
       this.placeDrawList = [...regularCandidates, ...murderCandidates];
+      if (this.selectedPlace && !this.placeDrawList.some((place) => place.id === this.selectedPlace.id)) {
+        this.placeDrawList.push(this.selectedPlace);
+      }
     } else if (this.showAllPlaces) {
       this.placeDrawList = [...regularCandidates, ...nearest(murderCandidates)];
     } else {
@@ -1674,8 +1676,10 @@ export class GalaxyRenderer {
   gridSpec() {
     const step = this.gridStep();
     const extent = step * 16;
-    const centerX = Math.round(this.target[0] / step) * step;
-    const centerZ = Math.round(this.target[2] / step) * step;
+    // The emphasized cyan/yellow lines mark the current map target. Keep their
+    // intersection at that exact world coordinate when zoom changes grid LOD.
+    const centerX = this.target[0];
+    const centerZ = this.target[2];
     return {
       step,
       extent,
@@ -2386,9 +2390,25 @@ export class GalaxyRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
-    if (this.isolatePlaces || this.findRouteHopNear(x, y, 26)) return;
-    const hit = this.findPointNear(x, y, 26);
+    if (!this.isolatePlaces && this.findRouteHopNear(x, y, 26)) return;
+    const placeHit = this.isolatePlaces || this.showPlaces || this.showMurderBinaries
+      ? this.findPlaceNear(x, y, 26)
+      : null;
+    if (placeHit) {
+      this.onPlaceContext?.({ place: placeHit.place, x, y, screen: placeHit.screen });
+      return;
+    }
+    const hit = this.isolatePlaces
+      ? this.findSelectedSystemNear(x, y, 26)
+      : this.findPointNear(x, y, 26);
     if (hit) this.onSystemContext?.({ index: hit.point.index, x, y, screen: hit.screen });
+  }
+
+  findSelectedSystemNear(x, y, radius) {
+    if (!this.selectedSystem) return null;
+    const screen = this.screen(this.selectedSystem);
+    if (!screen || Math.hypot(screen.x - x, screen.y - y) > radius) return null;
+    return { point: this.selectedSystem, screen };
   }
 
   updateHover(event) {

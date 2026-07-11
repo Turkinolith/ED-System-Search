@@ -75,6 +75,25 @@ assert.equal(dropLineRange, 10, 'Drop-line range should describe the farthest ac
 assert.equal(formatDistanceBadge(14.74), '14.7', 'Drop-line badges should keep local ranges compact but readable.');
 assert.equal(formatDistanceBadge(1234.4), '1,234', 'Drop-line badges should group large distances.');
 
+const gridRenderer = Object.assign(Object.create(GalaxyRenderer.prototype), {
+  target: [1234.5, 72, -987.25],
+  distance: 30000,
+});
+const farGrid = gridRenderer.gridSpec();
+gridRenderer.distance = 12000;
+const nearGrid = gridRenderer.gridSpec();
+assert.notEqual(farGrid.step, nearGrid.step, 'Fixture should cross a grid LOD boundary.');
+assert.deepEqual(
+  [farGrid.centerX, farGrid.centerZ],
+  [nearGrid.centerX, nearGrid.centerZ],
+  'The emphasized grid intersection should remain fixed while zoom changes grid LOD.',
+);
+assert.deepEqual(
+  [nearGrid.centerX, nearGrid.centerZ],
+  [gridRenderer.target[0], gridRenderer.target[2]],
+  'The emphasized grid intersection should use the exact map target coordinate.',
+);
+
 const placeRenderer = Object.assign(Object.create(GalaxyRenderer.prototype), {
   target: [0, 0, 0],
   places: Array.from({ length: 75 }, (_, index) => ({ id: `place-${index}`, x: index + 1, y: 0, z: 0, category: 'Green Gas Giants' })),
@@ -87,9 +106,25 @@ const placeRenderer = Object.assign(Object.create(GalaxyRenderer.prototype), {
   isolatePlaces: true,
 });
 assert.equal(placeRenderer.visiblePlaces().length, 75, 'Place isolation should override Nearby/Off and show every selected filtered place.');
+placeRenderer.selectedPlace = { id: 'current-target', x: 0, y: 0, z: 0, category: 'Unselected category' };
+placeRenderer.placeDrawKey = '';
+assert.equal(placeRenderer.visiblePlaces().length, 76, 'Place isolation should retain the current selected target even when its filter is not selected.');
+placeRenderer.selectedPlace = null;
 placeRenderer.isolatePlaces = false;
 placeRenderer.showPlaces = true;
 placeRenderer.placeDrawKey = '';
 assert.equal(placeRenderer.visiblePlaces().length, 50, 'Turning isolation off should restore the existing Nearby limit.');
+
+let contextPlace = null;
+const contextRenderer = Object.assign(Object.create(GalaxyRenderer.prototype), {
+  canvas: { getBoundingClientRect: () => ({ left: 0, top: 0 }) },
+  isolatePlaces: true,
+  showPlaces: false,
+  showMurderBinaries: false,
+  findPlaceNear: () => ({ place: { id: 'candidate', systemName: 'Candidate System' }, screen: { x: 12, y: 18 } }),
+  onPlaceContext: (hit) => { contextPlace = hit; },
+});
+contextRenderer.contextPick({ clientX: 12, clientY: 18 });
+assert.equal(contextPlace?.place?.systemName, 'Candidate System', 'Right-click should expose filtered places without selecting or refocusing them.');
 
 console.log('Star visual profile test passed.');

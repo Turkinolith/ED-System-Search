@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=place-isolation-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=context-copy-1';
 
 const state = {
   meta: null,
@@ -16,6 +16,7 @@ const state = {
   notes: [],
   notesMode: 'all',
   activeNoteSystem: null,
+  contextMenuSystemName: null,
   systemUpdates: null,
   enabledPlaceCategories: new Set(),
   activeSearchIndex: -1,
@@ -109,6 +110,7 @@ const el = {
   noteMenu: document.querySelector('#noteMenu'),
   noteMenuSystem: document.querySelector('#noteMenuSystem'),
   noteMenuClose: document.querySelector('#noteMenuClose'),
+  noteCopyName: document.querySelector('#noteCopyName'),
   noteText: document.querySelector('#noteText'),
   noteCount: document.querySelector('#noteCount'),
   noteDelete: document.querySelector('#noteDelete'),
@@ -1727,6 +1729,8 @@ async function openNoteMenu(hit) {
   const system = await response.json();
   setCachedSystem(hit.index, system);
   state.activeNoteSystem = system;
+  state.contextMenuSystemName = system.name;
+  setNoteMenuEditorVisible(true);
   el.noteMenuSystem.textContent = system.name;
   el.noteText.value = system.note?.text ?? '';
   updateNoteCount();
@@ -1734,8 +1738,40 @@ async function openNoteMenu(hit) {
   el.noteText.focus();
 }
 
+function openPlaceContextMenu(hit) {
+  const place = hit?.place;
+  const systemName = String(place?.systemName ?? place?.name ?? '').trim();
+  if (!systemName) return;
+  state.activeNoteSystem = null;
+  state.contextMenuSystemName = systemName;
+  setNoteMenuEditorVisible(false);
+  el.noteMenuSystem.textContent = systemName;
+  positionNoteMenu(hit.x, hit.y);
+}
+
+function setNoteMenuEditorVisible(visible) {
+  el.noteText.hidden = !visible;
+  el.noteCount.hidden = !visible;
+  el.noteDelete.hidden = !visible;
+  el.noteSave.hidden = !visible;
+}
+
+async function copyContextMenuSystemName() {
+  const name = state.contextMenuSystemName?.trim();
+  if (!name) return;
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(name);
+    else copyWithFallback(name);
+    showClientToast(`Copied system name: ${name}`, 3000);
+  } catch (error) {
+    console.warn(error);
+    showClientToast('Could not copy the system name.', 4000);
+  }
+}
+
 function closeNoteMenu() {
   state.activeNoteSystem = null;
+  state.contextMenuSystemName = null;
   el.noteMenu.hidden = true;
 }
 
@@ -2892,6 +2928,7 @@ function bindControls() {
     updateNoteCount();
   });
   el.noteMenuClose.addEventListener('click', closeNoteMenu);
+  el.noteCopyName.addEventListener('click', copyContextMenuSystemName);
   el.noteSave.addEventListener('click', () => saveActiveNote());
   el.noteDelete.addEventListener('click', () => saveActiveNote(''));
   el.noteSearch.addEventListener('input', () => {
@@ -2954,6 +2991,7 @@ function bindControls() {
     console.error(error);
     setStatus(`Could not open note editor: ${error.message}`);
   });
+  state.renderer.onPlaceContext = openPlaceContextMenu;
   state.renderer.onRouteSelect = (hop) => focusRouteHop(hop);
   state.renderer.onPlaceSelect = (place) => focusPlace(place);
   state.renderer.onPlaceHover = (hover) => showPlaceTooltip(hover);
