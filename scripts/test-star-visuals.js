@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, specialKind, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
+import { GalaxyRenderer, densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, specialKind, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
 
 const o = starVisual('O (Blue-White) Star');
 const a = starVisual('A (Blue-White) Star');
@@ -74,5 +74,22 @@ const dropLineRange = dropLineAnchorRange([
 assert.equal(dropLineRange, 10, 'Drop-line range should describe the farthest active anchor.');
 assert.equal(formatDistanceBadge(14.74), '14.7', 'Drop-line badges should keep local ranges compact but readable.');
 assert.equal(formatDistanceBadge(1234.4), '1,234', 'Drop-line badges should group large distances.');
+
+const placeRenderer = Object.assign(Object.create(GalaxyRenderer.prototype), {
+  target: [0, 0, 0],
+  places: Array.from({ length: 75 }, (_, index) => ({ id: `place-${index}`, x: index + 1, y: 0, z: 0, category: 'Green Gas Giants' })),
+  selectedPlace: null,
+  placeDrawKey: '',
+  placeDrawList: [],
+  showPlaces: false,
+  showMurderBinaries: false,
+  showAllPlaces: false,
+  isolatePlaces: true,
+});
+assert.equal(placeRenderer.visiblePlaces().length, 75, 'Place isolation should override Nearby/Off and show every selected filtered place.');
+placeRenderer.isolatePlaces = false;
+placeRenderer.showPlaces = true;
+placeRenderer.placeDrawKey = '';
+assert.equal(placeRenderer.visiblePlaces().length, 50, 'Turning isolation off should restore the existing Nearby limit.');
 
 console.log('Star visual profile test passed.');

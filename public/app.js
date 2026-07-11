@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=route-overlay-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=place-isolation-1';
 
 const state = {
   meta: null,
@@ -90,6 +90,7 @@ const el = {
   routeToggle: document.querySelector('#routeToggle'),
   refreshRoute: document.querySelector('#refreshRoute'),
   poiModeInputs: [...document.querySelectorAll('input[name="poiMode"]')],
+  placeIsolateToggle: document.querySelector('#placeIsolateToggle'),
   placesSummary: document.querySelector('#placesSummary'),
   placeFilterActions: document.querySelector('#placeFilterActions'),
   placeFilters: document.querySelector('#placeFilters'),
@@ -2382,15 +2383,25 @@ function updatePlacesSummary() {
   const meta = state.placesMeta;
   if (!meta?.imported && !meta?.count) return;
   const discoveryText = meta.discoveries?.count ? ` including ${fmt(meta.discoveries.count)} discoveries;` : '';
-  const shown = !state.renderer?.showPlaces
-    ? 'overlay hidden'
-    : state.renderer?.showAllPlaces
-      ? 'showing all'
-      : 'showing nearest 50';
+  const shown = state.renderer?.isolatePlaces
+    ? `isolating all ${fmt(state.visiblePlaces.length)} selected places`
+    : !state.renderer?.showPlaces
+      ? 'overlay hidden'
+      : state.renderer?.showAllPlaces
+        ? 'showing all'
+        : 'showing nearest 50';
   const filtered = state.visiblePlaces.length !== state.places.length
     ? ` ${fmt(state.visiblePlaces.length)} after filters;`
     : '';
   el.placesSummary.textContent = `${fmt(meta.count)} places loaded from ${meta.source};${discoveryText}${filtered} ${shown}.`;
+}
+
+function setPlaceIsolation(enabled, persist = false) {
+  const next = Boolean(enabled);
+  el.placeIsolateToggle.checked = next;
+  state.renderer.setIsolatePlaces(next);
+  if (persist) writeViewSettings({ isolatePlaceFilters: next });
+  updatePlacesSummary();
 }
 
 function poiModeFromSettings(settings) {
@@ -2871,6 +2882,9 @@ function bindControls() {
       if (input.checked) setPoiMode(input.value, true);
     });
   }
+  el.placeIsolateToggle.addEventListener('change', () => {
+    setPlaceIsolation(el.placeIsolateToggle.checked, true);
+  });
   el.resetView.addEventListener('click', () => state.renderer.resetOrientation());
   el.focusName.addEventListener('click', copyFocusName);
   el.noteText.addEventListener('input', () => {
@@ -3007,6 +3021,7 @@ async function init() {
   setStarScaleAuto(viewSettings.starScaleAuto ?? true, false);
   applyLlmSettingsToForm(readLlmSettings());
   setPoiMode(poiModeFromSettings(viewSettings), false);
+  setPlaceIsolation(viewSettings.isolatePlaceFilters ?? false, false);
   setNotesMode(viewSettings.notesMode, false);
   bindControls();
   const ready = await loadStatus();

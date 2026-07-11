@@ -475,6 +475,7 @@ export class GalaxyRenderer {
     this.showSectorMap = false;
     this.showPlaces = true;
     this.showAllPlaces = false;
+    this.isolatePlaces = false;
     this.showMurderBinaries = false;
     this.showCarrierRange = false;
     this.showRouteOverlay = false;
@@ -650,6 +651,16 @@ export class GalaxyRenderer {
       ...toRenderCoords(place.coords),
     }));
     this.placeDrawKey = '';
+    this.requestRender();
+  }
+
+  setIsolatePlaces(enabled) {
+    this.isolatePlaces = Boolean(enabled);
+    this.placeDrawKey = '';
+    this.hoverIndex = null;
+    this.hoverRouteIndex = null;
+    this.hoverPoint = null;
+    this.onHover?.(null);
     this.requestRender();
   }
 
@@ -1119,6 +1130,7 @@ export class GalaxyRenderer {
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (this.isolatePlaces) return;
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
     gl.useProgram(this.program);
@@ -1183,22 +1195,26 @@ export class GalaxyRenderer {
     if (this.showSectorMap) this.drawSectorMapOverlay();
     const grid = this.showGrid ? this.drawGrid() : this.gridSpec();
     this.labeledPlaceNames.clear();
-    if (this.showDropLines && this.gridFadeAlpha() > 0.02) this.drawDropLines(grid);
-    this.drawGridIndicators(grid);
-    if (this.showCarrierRange) this.drawCarrierRange();
-    if (this.showRouteOverlay) this.drawRouteOverlay();
-    const drawList = this.overlayMarkers()
-      .sort((a, b) => a.distance - b.distance)
-      .slice(0, this.overlayMarkerBudget())
-      .sort((a, b) => b.screen.z - a.screen.z);
-    for (const item of drawList) this.drawMarker(item.point, false, item.alpha);
-    for (const result of this.searchResults) this.drawMarker({ ...result.coords, ...result, flags: 0 }, true);
-    if (this.showPlaces || this.showMurderBinaries) this.drawPlaceIndicators();
-    if (this.selectedSystem) this.drawSelectedSystem();
-    if (this.selectedPlace) this.drawSelectedPlace();
-    this.drawHoverMarker();
-    if (this.showLandmarks) this.drawLandmarkIndicators();
-    this.drawOrbitPoint(grid);
+    if (!this.isolatePlaces && this.showDropLines && this.gridFadeAlpha() > 0.02) this.drawDropLines(grid);
+    if (!this.isolatePlaces) this.drawGridIndicators(grid);
+    if (!this.isolatePlaces && this.showCarrierRange) this.drawCarrierRange();
+    if (!this.isolatePlaces && this.showRouteOverlay) this.drawRouteOverlay();
+    if (!this.isolatePlaces) {
+      const drawList = this.overlayMarkers()
+        .sort((a, b) => a.distance - b.distance)
+        .slice(0, this.overlayMarkerBudget())
+        .sort((a, b) => b.screen.z - a.screen.z);
+      for (const item of drawList) this.drawMarker(item.point, false, item.alpha);
+      for (const result of this.searchResults) this.drawMarker({ ...result.coords, ...result, flags: 0 }, true);
+    }
+    if (this.isolatePlaces || this.showPlaces || this.showMurderBinaries) this.drawPlaceIndicators();
+    if (!this.isolatePlaces && this.selectedSystem) this.drawSelectedSystem();
+    if (this.selectedPlace && (!this.isolatePlaces || this.places.some((place) => place.id === this.selectedPlace.id))) {
+      this.drawSelectedPlace();
+    }
+    if (!this.isolatePlaces) this.drawHoverMarker();
+    if (!this.isolatePlaces && this.showLandmarks) this.drawLandmarkIndicators();
+    if (!this.isolatePlaces) this.drawOrbitPoint(grid);
   }
 
   drawRouteOverlay() {
@@ -1341,13 +1357,13 @@ export class GalaxyRenderer {
 
   visiblePlaces() {
     const selectedId = this.selectedPlace?.id ?? '';
-    const key = `${Math.round(this.target[0])}:${Math.round(this.target[1])}:${Math.round(this.target[2])}:${this.showAllPlaces ? 'all' : 'near'}:${this.showPlaces ? 'places' : 'no-places'}:${this.showMurderBinaries ? 'murder' : 'no-murder'}:${selectedId}`;
+    const key = `${Math.round(this.target[0])}:${Math.round(this.target[1])}:${Math.round(this.target[2])}:${this.isolatePlaces ? 'isolate' : this.showAllPlaces ? 'all' : 'near'}:${this.showPlaces ? 'places' : 'no-places'}:${this.showMurderBinaries ? 'murder' : 'no-murder'}:${selectedId}`;
     if (key === this.placeDrawKey) return this.placeDrawList;
 
-    const regularCandidates = this.showPlaces
+    const regularCandidates = this.isolatePlaces || this.showPlaces
       ? this.places.filter((place) => place.category !== 'Murder Binaries')
       : [];
-    const murderCandidates = this.showMurderBinaries
+    const murderCandidates = this.isolatePlaces || this.showMurderBinaries
       ? this.places.filter((place) => place.category === 'Murder Binaries')
       : [];
 
@@ -1356,7 +1372,9 @@ export class GalaxyRenderer {
       .sort((a, b) => a.distance - b.distance)
       .slice(0, 50)
       .map((item) => item.place);
-    if (this.showAllPlaces) {
+    if (this.isolatePlaces) {
+      this.placeDrawList = [...regularCandidates, ...murderCandidates];
+    } else if (this.showAllPlaces) {
       this.placeDrawList = [...regularCandidates, ...nearest(murderCandidates)];
     } else {
       const visible = [...nearest(regularCandidates), ...nearest(murderCandidates)];
@@ -2349,16 +2367,17 @@ export class GalaxyRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
-    const routeHit = this.findRouteHopNear(x, y, 22);
+    const routeHit = this.isolatePlaces ? null : this.findRouteHopNear(x, y, 22);
     if (routeHit) {
       this.onRouteSelect?.(routeHit.hop);
       return;
     }
-    const placeHit = this.showPlaces || this.showMurderBinaries ? this.findPlaceNear(x, y, 20) : null;
+    const placeHit = this.isolatePlaces || this.showPlaces || this.showMurderBinaries ? this.findPlaceNear(x, y, 20) : null;
     if (placeHit) {
       this.onPlaceSelect?.(placeHit.place);
       return;
     }
+    if (this.isolatePlaces) return;
     const hit = this.findPointNear(x, y, 22);
     if (hit) this.onSelect?.(hit.point.index);
   }
@@ -2367,7 +2386,7 @@ export class GalaxyRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
-    if (this.findRouteHopNear(x, y, 26)) return;
+    if (this.isolatePlaces || this.findRouteHopNear(x, y, 26)) return;
     const hit = this.findPointNear(x, y, 26);
     if (hit) this.onSystemContext?.({ index: hit.point.index, x, y, screen: hit.screen });
   }
@@ -2379,7 +2398,7 @@ export class GalaxyRenderer {
     const rect = this.canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
-    const routeHit = this.findRouteHopNear(x, y, 18);
+    const routeHit = this.isolatePlaces ? null : this.findRouteHopNear(x, y, 18);
     if (routeHit) {
       this.hoverIndex = null;
       this.hoverPlaceId = null;
@@ -2391,7 +2410,7 @@ export class GalaxyRenderer {
       this.requestRender();
       return;
     }
-    const placeHit = this.showPlaces || this.showMurderBinaries ? this.findPlaceNear(x, y, 16) : null;
+    const placeHit = this.isolatePlaces || this.showPlaces || this.showMurderBinaries ? this.findPlaceNear(x, y, 16) : null;
     if (placeHit) {
       this.hoverIndex = null;
       this.hoverRouteIndex = null;
@@ -2402,7 +2421,7 @@ export class GalaxyRenderer {
       this.onPlaceHover?.({ place: placeHit.place, x: placeHit.screen.x, y: placeHit.screen.y });
       return;
     }
-    const hit = this.findPointNear(x, y, 16);
+    const hit = this.isolatePlaces ? null : this.findPointNear(x, y, 16);
     if (this.hoverPlaceId !== null) {
       this.hoverPlaceId = null;
       if (!hit) this.onPlaceHover?.(null);

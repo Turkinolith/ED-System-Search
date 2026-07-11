@@ -910,6 +910,10 @@ button:disabled {
   margin: 10px 0 8px;
 }
 
+.place-isolate-toggle {
+  margin: 2px 0 10px;
+}
+
 .mode-label {
   color: var(--muted);
   font-size: 13px;
