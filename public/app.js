@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=context-copy-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=local-detail-only-1';
 
 const state = {
   meta: null,
@@ -84,6 +84,7 @@ const el = {
   depthEmphasisToggle: document.querySelector('#depthEmphasisToggle'),
   gridToggle: document.querySelector('#gridToggle'),
   dropLinesToggle: document.querySelector('#dropLinesToggle'),
+  localDetailOnlyToggle: document.querySelector('#localDetailOnlyToggle'),
   sectorMapToggle: document.querySelector('#sectorMapToggle'),
   landmarksToggle: document.querySelector('#landmarksToggle'),
   carrierRangeToggle: document.querySelector('#carrierRangeToggle'),
@@ -2265,14 +2266,19 @@ async function readBodyWithProgress(response, onProgress) {
 }
 
 function updatePointStatus() {
+  const localOnly = Boolean(el.localDetailOnlyToggle?.checked);
   const richSuffix = state.richPointFiltersActive ? ' · full-data filters active' : '';
   const localSuffix = state.localPointCount
     ? ` + ${fmt(state.localPointCount)} local within ${fmt(state.localRadius)} ly`
     : '';
   const displayed = fmt(state.renderer?.allPoints?.length ?? state.basePointCount);
   setStatus(
-    `${displayed} systems · LOD ${state.baseLod}${localSuffix}${richSuffix} · search overrides filters`,
-    `Displaying ${fmt(state.basePointCount)} global systems from LOD ${state.baseLod}${localSuffix}${state.richPointFiltersActive ? ' with full-data filters applied' : ''}. Nearby spatial detail receives rendering priority.`
+    localOnly
+      ? `${displayed} local systems within ${fmt(state.localRadius)} ly · global LOD hidden · search overrides filters`
+      : `${displayed} systems · LOD ${state.baseLod}${localSuffix}${richSuffix} · search overrides filters`,
+    localOnly
+      ? `Displaying detailed systems near the current view only. The ${fmt(state.basePointCount)}-system global LOD layer remains loaded and can be restored instantly.`
+      : `Displaying ${fmt(state.basePointCount)} global systems from LOD ${state.baseLod}${localSuffix}${state.richPointFiltersActive ? ' with full-data filters applied' : ''}. Nearby spatial detail receives rendering priority.`
   );
 }
 
@@ -2891,6 +2897,12 @@ function bindControls() {
     state.renderer.requestRender();
     writeViewSettings({ showCarrierRange: el.carrierRangeToggle.checked });
   });
+  el.localDetailOnlyToggle.addEventListener('change', async () => {
+    const localOnly = el.localDetailOnlyToggle.checked;
+    await state.renderer.setShowBasePoints(!localOnly);
+    writeViewSettings({ localDetailOnly: localOnly });
+    updatePointStatus();
+  });
   el.murderBinariesToggle.addEventListener('change', () => {
     setMurderBinariesOverlay(el.murderBinariesToggle.checked, true);
   });
@@ -3032,6 +3044,7 @@ async function init() {
   el.depthEmphasisToggle.checked = viewSettings.showDepthEmphasis ?? true;
   el.gridToggle.checked = viewSettings.showGrid ?? true;
   el.dropLinesToggle.checked = viewSettings.showDropLines ?? true;
+  el.localDetailOnlyToggle.checked = viewSettings.localDetailOnly ?? false;
   el.sectorMapToggle.checked = viewSettings.showSectorMap ?? false;
   el.landmarksToggle.checked = viewSettings.showLandmarks ?? true;
   el.carrierRangeToggle.checked = viewSettings.showCarrierRange ?? false;
@@ -3043,6 +3056,7 @@ async function init() {
   state.renderer.setDepthEmphasis(el.depthEmphasisToggle.checked);
   state.renderer.showGrid = el.gridToggle.checked;
   state.renderer.showDropLines = el.dropLinesToggle.checked;
+  await state.renderer.setShowBasePoints(!el.localDetailOnlyToggle.checked);
   state.renderer.showSectorMap = el.sectorMapToggle.checked;
   state.renderer.showLandmarks = el.landmarksToggle.checked;
   state.renderer.showCarrierRange = el.carrierRangeToggle.checked;

@@ -440,6 +440,7 @@ export class GalaxyRenderer {
     this.alphaBuffer = this.gl.createBuffer();
     this.basePoints = [];
     this.localPoints = [];
+    this.showBasePoints = true;
     this.allPoints = [];
     this.pointDecodeTokens = { basePoints: 0, localPoints: 0 };
     this.mergeToken = 0;
@@ -814,6 +815,13 @@ export class GalaxyRenderer {
     return this.replacePointSource('localPoints', buffer, meta);
   }
 
+  setShowBasePoints(enabled) {
+    const next = Boolean(enabled);
+    if (this.showBasePoints === next) return Promise.resolve();
+    this.showBasePoints = next;
+    return this.mergePointSources();
+  }
+
   // Decode and merge are time-sliced so a 300k-point payload never freezes
   // the UI; a newer call for the same source cancels the in-flight one.
   async replacePointSource(sourceKey, buffer, meta) {
@@ -853,7 +861,8 @@ export class GalaxyRenderer {
     const isCurrent = () => this.mergeToken === token;
     const indexes = new Set();
     const all = [];
-    for (const source of [this.basePoints, this.localPoints]) {
+    const sources = this.showBasePoints ? [this.basePoints, this.localPoints] : [this.localPoints];
+    for (const source of sources) {
       for (let i = 0; i < source.length; i += 1) {
         const point = source[i];
         if (indexes.has(point.index)) continue;
