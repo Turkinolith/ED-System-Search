@@ -8,13 +8,29 @@ records, notes, points of interest, and exploration overlays.
 The application runs entirely on your computer. Generated databases, journal
 history, and notes stay under `data/` and are excluded from Git.
 
+## Interface
+
+The map starts with nearby, full-resolution systems so the current area is
+usable while the sampled whole-galaxy layer loads in the background. The Layers
+tab includes **Local detail only**, which intentionally keeps that clearer local
+view by hiding the global LOD layer. It is useful when dense local exploration
+patterns are more useful than galaxy-wide context, and the preference persists
+between sessions.
+
+| Local detail only | Full galaxy detail |
+| --- | --- |
+| ![Local detail only mode: nearby full-resolution systems remain visible without the global LOD layer](docs/screenshots/local-detail-only.png) | ![Full galaxy mode: sampled global stars remain visible alongside nearby detail](docs/screenshots/full-galaxy-detail.png) |
+| Detailed systems near the current view, with the global LOD layer hidden. | Sampled galaxy-wide context, merged with the local detailed sphere. |
+
 ## Highlights
 
 - Interactive 3D galaxy map with orbit, pan, vertical movement, rotation,
   adaptive grids, distance guides, focus controls, and landmark bearings.
 - Full-resolution local spatial detail merged with the sampled global LOD,
-  using a 1,000 ly radius normally and adaptive 500/200/100 ly radii in dense
-  regions.
+  loaded first so the current area is responsive while galaxy-wide context
+  arrives in the background.
+- Persistent **Local detail only** mode to hide the global LOD layer and retain
+  the clear, exploration-pattern-focused nearby view on purpose.
 - Fast fuzzy system search with suggestions and filter-overriding results.
 - Star colors and sprites based on primary-star class, including distinct
   treatment for black holes, neutron stars, white dwarfs, protostars, giants,
@@ -26,6 +42,11 @@ history, and notes stay under `data/` and are excluded from Git.
   depth guides.
 - Persistent visited-system braces, latest-journal focus, carrier tracking, and
   incremental or full journal rescans.
+- Current ship summary from journals, including a per-ship manual maximum-jump
+  override that remains separate from the recorded Loadout value.
+- Optional live route overlay from Elite's `NavRoute.json`, refreshed about
+  every five seconds while the app is visible and resilient to temporary file
+  writes.
 - Journal-only systems and discovered body data are preserved even when the
   system is absent from the current Spansh dataset.
 - Per-system notes with tooltip display, an all-notes view, and keyword search.
@@ -36,6 +57,8 @@ history, and notes stay under `data/` and are excluded from Git.
   government, atmospheres, volcanism, rings, signals, and other system details.
 - Rich map filters for stations, population, body counts, body types,
   atmospheres, ring materials, volcanism, economies, security, and government.
+- Local keyword-planned search with optional configurable LLM planning and
+  summaries (OpenAI, Kobold, or another compatible endpoint).
 - Default-off **Murder Binaries** caution overlay for systems with a secondary
   star between 5 and 12 light-seconds from arrival.
 - In-app controls for system deltas, full-data imports, places, discoveries,
