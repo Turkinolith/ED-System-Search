@@ -257,24 +257,3 @@ Elite Dangerous is a trademark of Frontier Developments plc.
 This project is an unofficial community tool and is not affiliated with or
 endorsed by Frontier Developments, EDAstro, Spansh, or Explorarium.
 
-## Tests
-
-```powershell
-npm run test:galaxy
-npm run test:journals
-npm run test:stars
-```
-
-`test:galaxy` builds a small temporary rich-data fixture and verifies imports,
-map filters, system details, Places integration.
-## Repository Hygiene
-
-The following are intentionally excluded from Git:
-
-- Generated files under `data/`
-- Downloaded `.json.gz` and `.csv.gz` dumps
-- Player journals, visited history, notes, and carrier state
-- Rust build output, logs, and local development metadata
-
-Do not force-add these files. GitHub is for source code and documentation; dump
-data should be downloaded directly from its original provider.
