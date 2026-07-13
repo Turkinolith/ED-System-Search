@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=local-detail-only-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=local-rich-filters-2';
 
 const state = {
   meta: null,
@@ -34,6 +34,8 @@ const state = {
   baseLod: null,
   localPointCount: 0,
   localRadius: null,
+  localAreaCount: null,
+  localAreaComplete: true,
   localPointRequestKey: null,
   richPointFiltersActive: false,
   routeOverlay: null,
@@ -137,14 +139,12 @@ const el = {
   bodySystemSummary: document.querySelector('#bodySystemSummary'),
   bodyList: document.querySelector('#bodyList'),
   richFiltersSummary: document.querySelector('#richFiltersSummary'),
-  richDataFilter: document.querySelector('#richDataFilter'),
   stationFilter: document.querySelector('#stationFilter'),
   populatedFilter: document.querySelector('#populatedFilter'),
   landableFilter: document.querySelector('#landableFilter'),
   marketFilter: document.querySelector('#marketFilter'),
   shipyardFilter: document.querySelector('#shipyardFilter'),
   outfittingFilter: document.querySelector('#outfittingFilter'),
-  signalsFilter: document.querySelector('#signalsFilter'),
   minBodyCount: document.querySelector('#minBodyCount'),
   bodyTypeFilter: document.querySelector('#bodyTypeFilter'),
   atmosphereFilter: document.querySelector('#atmosphereFilter'),
@@ -169,10 +169,12 @@ let systemUpdatePollTimer = null;
 let murderBinariesRefreshTimer = null;
 let murderBinariesRequestId = 0;
 let localPointsRefreshTimer = null;
+let pointStatusTimer = null;
 let localPointsRequestId = 0;
 let localPointsController = null;
 let pointLoadController = null;
 let pointLoadRequestId = 0;
+let richFilterApplyId = 0;
 let starScaleFrame = null;
 let tooltipOwner = null;
 let clientToastTimer = null;
@@ -544,14 +546,12 @@ function setStarScaleAuto(enabled, persist = false) {
 
 function richFilterControls() {
   return [
-    ['richData', el.richDataFilter],
     ['hasStations', el.stationFilter],
     ['populated', el.populatedFilter],
     ['landable', el.landableFilter],
     ['markets', el.marketFilter],
     ['shipyards', el.shipyardFilter],
     ['outfitting', el.outfittingFilter],
-    ['signals', el.signalsFilter],
   ];
 }
 
@@ -620,13 +620,51 @@ function richFilterSettings() {
   return filters;
 }
 
-function saveAndApplyRichFilters() {
+function appendRichFilterParams(params) {
+  if (!richFiltersAvailable()) return false;
+  const rich = richFilterSettings();
+  for (const name of ['hasStations', 'populated', 'landable', 'markets', 'shipyards', 'outfitting']) {
+    if (rich[name]) params.set(name, '1');
+  }
+  if (rich.minBodies > 0) params.set('minBodies', String(rich.minBodies));
+  if (richCategoryFiltersAvailable()) {
+    for (const name of ['bodyType', 'atmosphere', 'ringType', 'volcanism', 'economy', 'security', 'government']) {
+      if (rich[name]) params.set(name, rich[name]);
+    }
+  }
+  return ['hasStations', 'populated', 'landable', 'markets', 'shipyards', 'outfitting', 'minBodies',
+    'bodyType', 'atmosphere', 'ringType', 'volcanism', 'economy', 'security', 'government']
+    .some((name) => params.has(name));
+}
+
+async function saveAndApplyRichFilters() {
+  const applyId = ++richFilterApplyId;
   writeViewSettings({ richFilters: richFilterSettings() });
-  setStatus('Applying full-data filters...');
-  loadPoints().catch((error) => {
+  cancelLocalPointsRefresh();
+  state.localPointCount = 0;
+  state.localAreaCount = null;
+  state.localPointRequestKey = null;
+  el.status.classList.add('loading');
+  el.richFiltersSummary.classList.add('filter-applying');
+  el.richFiltersSummary.textContent = 'Applying filters to the galaxy and nearby systems...';
+  setStatus('Applying System Features filters...');
+  try {
+    await state.renderer.setLocalPoints(new ArrayBuffer(0), state.meta);
+    await loadPoints({ awaitLocal: true });
+    if (applyId !== richFilterApplyId) return;
+    state.renderer.requestRender();
+    configureRichFilters();
+    updatePointStatus();
+  } catch (error) {
+    if (isAbortError(error) || applyId !== richFilterApplyId) return;
     console.error(error);
     setStatus(`Could not apply full-data filters: ${error.message}`);
-  });
+  } finally {
+    if (applyId === richFilterApplyId) {
+      el.status.classList.remove('loading');
+      el.richFiltersSummary.classList.remove('filter-applying');
+    }
+  }
 }
 
 function clearRichFilters() {
@@ -2147,6 +2185,7 @@ async function loadPoints(options = {}) {
     state.renderer.setLocalPoints(new ArrayBuffer(0), state.meta);
     state.basePointCount = 0;
     state.localPointCount = 0;
+    state.localAreaCount = null;
     if (pointLoadController === controller) pointLoadController = null;
     setStatus('0 systems · filters hidden · search still works');
     return;
@@ -2160,33 +2199,7 @@ async function loadPoints(options = {}) {
   });
   if (!el.updatedFrom.disabled && el.updatedFrom.value) params.set('updatedFrom', el.updatedFrom.value);
   if (!el.updatedBefore.disabled && el.updatedBefore.value) params.set('updatedBefore', el.updatedBefore.value);
-  let richActive = false;
-  if (richFiltersAvailable()) {
-    const rich = richFilterSettings();
-    if (rich.richData) params.set('richData', '1');
-    if (rich.hasStations) params.set('hasStations', '1');
-    if (rich.populated) params.set('populated', '1');
-    if (rich.landable) params.set('landable', '1');
-    if (rich.markets) params.set('markets', '1');
-    if (rich.shipyards) params.set('shipyards', '1');
-    if (rich.outfitting) params.set('outfitting', '1');
-    if (rich.signals) params.set('signals', '1');
-    if (rich.minBodies > 0) params.set('minBodies', String(rich.minBodies));
-    if (richCategoryFiltersAvailable()) {
-      if (rich.bodyType) params.set('bodyType', rich.bodyType);
-      if (rich.atmosphere) params.set('atmosphere', rich.atmosphere);
-      if (rich.ringType) params.set('ringType', rich.ringType);
-      if (rich.volcanism) params.set('volcanism', rich.volcanism);
-      if (rich.economy) params.set('economy', rich.economy);
-      if (rich.security) params.set('security', rich.security);
-      if (rich.government) params.set('government', rich.government);
-    }
-    richActive = ['richData', 'hasStations', 'populated', 'landable', 'markets', 'shipyards', 'outfitting', 'signals', 'minBodies', 'bodyType', 'atmosphere', 'ringType', 'volcanism', 'economy', 'security', 'government']
-      .some((name) => params.has(name));
-  }
-  // Rich filters replace the unfiltered nearby-detail layer, so stop any
-  // pending local point request before it can repopulate the map.
-  if (richActive) cancelLocalPointsRefresh();
+  appendRichFilterParams(params);
   const fetchStage = async (limit, { reportProgress = false } = {}) => {
     const stageParams = new URLSearchParams(params);
     stageParams.set('limit', String(limit));
@@ -2209,14 +2222,9 @@ async function loadPoints(options = {}) {
     return requestId === pointLoadRequestId;
   };
   try {
-    if (options.progressive && !richActive) {
-      // Coarse pass fills in the wider galaxy quickly; the full-detail pass
-      // below replaces it under the same request id. With rich filters the
-      // server scans a deep LOD either way, so one request avoids paying for
-      // that scan twice.
-      if (!(await applyStage(await fetchStage(40000)))) return;
-      updatePointStatus();
-    }
+    // Nearby full-resolution points are already rendered first during startup,
+    // so decoding an intermediate 40k global LOD only adds another merge,
+    // spatial-index build, and GPU upload before the final layer replaces it.
     if (!(await applyStage(await fetchStage(300000, { reportProgress: options.progressive })))) return;
   } catch (error) {
     if (isAbortError(error)) return;
@@ -2224,14 +2232,20 @@ async function loadPoints(options = {}) {
   } finally {
     if (pointLoadController === controller) pointLoadController = null;
   }
-  if (state.richPointFiltersActive || !state.spatialIndex) {
+  if (!state.spatialIndex) {
     cancelLocalPointsRefresh();
     state.localPointCount = 0;
     state.localRadius = null;
+    state.localAreaCount = null;
+    state.localAreaComplete = true;
     state.localPointRequestKey = null;
     state.renderer.setLocalPoints(new ArrayBuffer(0), state.meta);
   } else {
-    scheduleLocalPointsRefresh(0);
+    if (options.awaitLocal) {
+      await refreshLocalPointsNow();
+    } else {
+      scheduleLocalPointsRefresh(0);
+    }
   }
   updatePointStatus();
 }
@@ -2272,14 +2286,29 @@ function updatePointStatus() {
     ? ` + ${fmt(state.localPointCount)} local within ${fmt(state.localRadius)} ly`
     : '';
   const displayed = fmt(state.renderer?.allPoints?.length ?? state.basePointCount);
+  const drawn = fmt(state.renderer?.count ?? 0);
+  const hasAreaCount = Number.isFinite(state.localAreaCount);
+  const areaCount = hasAreaCount
+    ? `${state.localAreaComplete ? '' : 'at least '}${fmt(state.localAreaCount)} systems in viewed area · ${drawn} drawn`
+    : null;
   setStatus(
+    areaCount
+      ? `${areaCount} · ${localOnly ? 'global LOD hidden' : `LOD ${state.baseLod}${richSuffix}`} · search overrides filters`
+      : localOnly
+        ? `${displayed} local systems within ${fmt(state.localRadius)} ly · global LOD hidden · search overrides filters`
+        : `${displayed} systems · LOD ${state.baseLod}${localSuffix}${richSuffix} · search overrides filters`,
     localOnly
-      ? `${displayed} local systems within ${fmt(state.localRadius)} ly · global LOD hidden · search overrides filters`
-      : `${displayed} systems · LOD ${state.baseLod}${localSuffix}${richSuffix} · search overrides filters`,
-    localOnly
-      ? `Displaying detailed systems near the current view only. The ${fmt(state.basePointCount)}-system global LOD layer remains loaded and can be restored instantly.`
-      : `Displaying ${fmt(state.basePointCount)} global systems from LOD ${state.baseLod}${localSuffix}${state.richPointFiltersActive ? ' with full-data filters applied' : ''}. Nearby spatial detail receives rendering priority.`
+      ? `${areaCount ? `${state.localAreaComplete ? 'Exact' : 'Lower-bound'} database count within ${fmt(state.localRadius)} ly. ` : ''}Displaying detailed systems near the current view only. The ${fmt(state.basePointCount)}-system global LOD layer remains loaded and can be restored instantly.`
+      : `${areaCount ? `${state.localAreaComplete ? 'Exact' : 'Lower-bound'} database count within ${fmt(state.localRadius)} ly; ${fmt(state.localPointCount)} local systems remain after query filters and limits. ` : ''}Displaying ${fmt(state.basePointCount)} global systems from LOD ${state.baseLod}${state.richPointFiltersActive ? ' with full-data filters applied' : ''}.`
   );
+}
+
+function schedulePointStatusUpdate() {
+  if (pointStatusTimer !== null) return;
+  pointStatusTimer = setTimeout(() => {
+    pointStatusTimer = null;
+    updatePointStatus();
+  }, 0);
 }
 
 function localPointRadius() {
@@ -2302,9 +2331,7 @@ function abortLocalPointsRequest() {
   localPointsController = null;
 }
 
-// Drop any scheduled or in-flight local point refresh and invalidate responses
-// that already left the server, so a stale request can never repopulate the
-// local layer after rich filters clear it.
+// Drop any scheduled or in-flight local point refresh and invalidate responses.
 function cancelLocalPointsRefresh() {
   clearTimeout(localPointsRefreshTimer);
   localPointsRefreshTimer = null;
@@ -2316,12 +2343,14 @@ function scheduleLocalPointsRefresh(delay = 160, options = {}) {
   clearTimeout(localPointsRefreshTimer);
   abortLocalPointsRequest();
   const requestId = ++localPointsRequestId;
-  if (!state.spatialIndex || state.richPointFiltersActive || state.enabledTypes.size === 0) return;
+  if (!state.spatialIndex || state.enabledTypes.size === 0) return;
   const limit = Math.max(0, Math.min(Number(options.limit ?? localPointLimit()) || 0, 50000));
   if (limit <= 0) {
     if (state.localPointCount > 0) {
       state.localPointCount = 0;
       state.localRadius = null;
+      state.localAreaCount = null;
+      state.localAreaComplete = true;
       state.localPointRequestKey = null;
       state.renderer.setLocalPoints(new ArrayBuffer(0), state.meta);
       updatePointStatus();
@@ -2340,6 +2369,8 @@ async function refreshLocalPoints(requestId, limit, options = {}) {
   const coords = state.renderer.targetCoords();
   const radius = Math.max(25, Math.min(1000, Number(options.radius ?? localPointRadius()) || localPointRadius()));
   const tileSize = Math.max(200, Math.min(1000, state.renderer.gridStep?.() ?? 250));
+  const richParams = new URLSearchParams();
+  appendRichFilterParams(richParams);
   const tileKey = [
     Math.floor(coords.x / tileSize),
     Math.floor(coords.y / tileSize),
@@ -2350,6 +2381,7 @@ async function refreshLocalPoints(requestId, limit, options = {}) {
     [...state.enabledTypes].join(','),
     el.updatedFrom.disabled ? '' : el.updatedFrom.value,
     el.updatedBefore.disabled ? '' : el.updatedBefore.value,
+    richParams.toString(),
   ].join(':');
   if (!options.force && state.localPointRequestKey === tileKey && state.localPointCount > 0) return;
   const params = new URLSearchParams({
@@ -2362,6 +2394,7 @@ async function refreshLocalPoints(requestId, limit, options = {}) {
   });
   if (!el.updatedFrom.disabled && el.updatedFrom.value) params.set('updatedFrom', el.updatedFrom.value);
   if (!el.updatedBefore.disabled && el.updatedBefore.value) params.set('updatedBefore', el.updatedBefore.value);
+  for (const [name, value] of richParams) params.set(name, value);
   const controller = new AbortController();
   localPointsController = controller;
   let response;
@@ -2378,13 +2411,17 @@ async function refreshLocalPoints(requestId, limit, options = {}) {
   if (requestId !== localPointsRequestId) return;
   state.localPointCount = buffer.byteLength / 20;
   state.localRadius = Number(response.headers.get('x-local-radius') ?? 0);
+  const areaCountHeader = response.headers.get('x-local-area-count');
+  const areaCount = areaCountHeader === null ? Number.NaN : Number(areaCountHeader);
+  state.localAreaCount = Number.isFinite(areaCount) ? areaCount : null;
+  state.localAreaComplete = response.headers.get('x-local-area-complete') !== '0';
   state.localPointRequestKey = tileKey;
   await state.renderer.setLocalPoints(buffer, state.meta);
   updatePointStatus();
 }
 
 async function refreshLocalPointsNow(options = {}) {
-  if (!state.spatialIndex || state.richPointFiltersActive || state.enabledTypes.size === 0) return false;
+  if (!state.spatialIndex || state.enabledTypes.size === 0) return false;
   const limit = Math.max(1000, Math.min(Number(options.limit ?? localPointLimit()) || 25000, 50000));
   const radius = Math.max(25, Math.min(1000, Number(options.radius ?? localPointRadius()) || localPointRadius()));
   const requestId = ++localPointsRequestId;
@@ -3007,6 +3044,7 @@ function bindControls() {
   state.renderer.onRouteSelect = (hop) => focusRouteHop(hop);
   state.renderer.onPlaceSelect = (place) => focusPlace(place);
   state.renderer.onPlaceHover = (hover) => showPlaceTooltip(hover);
+  state.renderer.onDrawCountChange = () => schedulePointStatusUpdate();
   state.renderer.onTargetChange = () => {
     scheduleMurderBinariesRefresh();
     scheduleLocalPointsRefresh();

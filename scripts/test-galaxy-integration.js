@@ -355,6 +355,8 @@ try {
   const localBytes = Buffer.from(await localResponse.arrayBuffer());
   assert.equal(localBytes.byteLength, systems.length * 20);
   assert.equal(localResponse.headers.get('x-local-radius'), '1000');
+  assert.equal(localResponse.headers.get('x-local-area-count'), String(systems.length));
+  assert.equal(localResponse.headers.get('x-local-area-complete'), '1');
 } finally {
   server.kill();
   await new Promise((resolve) => server.once('exit', resolve));

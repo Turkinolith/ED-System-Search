@@ -178,6 +178,7 @@ let discoveriesCache = null;
 let murderBinariesIndexCache = null;
 let greenGasGiantsCache = null;
 let spatialIndexCache = null;
+let localRichFilterCache = null;
 let notesCache = null;
 let updateMetaCache = null;
 let updateIndexCache = null;
@@ -608,12 +609,16 @@ function richPointAllowed(buffer, offset, filters, recordBytes) {
   const bodyCount = buffer.readUInt32LE(offset + 4);
   const stationCount = buffer.readUInt32LE(offset + 8);
   if (filters.richData && !(flags & richFlags.richData)) return false;
-  if (filters.stations && stationCount === 0) return false;
+  // Fleet carriers can advertise station services but are mobile Places, not
+  // permanent system infrastructure. Requiring population keeps carrier-only
+  // systems out of these filters while retaining inhabited stations.
+  const hasPermanentInfrastructure = Boolean(flags & richFlags.populated);
+  if (filters.stations && (stationCount === 0 || !hasPermanentInfrastructure)) return false;
   if (filters.populated && !(flags & richFlags.populated)) return false;
   if (filters.landable && !(flags & richFlags.landable)) return false;
-  if (filters.markets && !(flags & richFlags.markets)) return false;
-  if (filters.shipyards && !(flags & richFlags.shipyards)) return false;
-  if (filters.outfitting && !(flags & richFlags.outfitting)) return false;
+  if (filters.markets && (!(flags & richFlags.markets) || !hasPermanentInfrastructure)) return false;
+  if (filters.shipyards && (!(flags & richFlags.shipyards) || !hasPermanentInfrastructure)) return false;
+  if (filters.outfitting && (!(flags & richFlags.outfitting) || !hasPermanentInfrastructure)) return false;
   if (filters.signals && !(flags & richFlags.signals)) return false;
   if (bodyCount < filters.minBodies) return false;
   if (filters.advanced) {
@@ -1683,7 +1688,7 @@ function readPagedRecord(cache, recordIndex, recordBytes, pageRecords) {
     const bytesRead = readSync(cache.fd, buffer, 0, maxBytes, pageByteStart);
     page = buffer.subarray(0, bytesRead);
     cache.pages.set(pageIndex, page);
-    if (cache.pages.size > maxIndexPages) {
+    if (cache.pages.size > (cache.maxPages ?? maxIndexPages)) {
       const oldest = cache.pages.keys().next().value;
       cache.pages.delete(oldest);
     }
@@ -1773,6 +1778,33 @@ async function readSpatialMeta() {
   return existsSync(spatialMetaPath) ? readJson(spatialMetaPath, null) : null;
 }
 
+async function getLocalRichFilterIndex(meta, manifest) {
+  const importedCount = Number(meta?.importedCount ?? meta?.count ?? 0);
+  const fullLod = meta?.lodLevels?.find((entry) => Number(entry.count) === importedCount);
+  const richLod = manifest?.mapFilters?.lodLevels?.find((entry) => (
+    Number(entry.level) === Number(fullLod?.level) && Number(entry.count) === importedCount
+  ));
+  const recordBytes = Number(manifest?.mapFilters?.recordBytes ?? 0);
+  if (!fullLod || !richLod || !recordBytes) return null;
+  const source = galaxyDataPath(richLod.file);
+  const stat = existsSync(source) ? await fs.stat(source) : null;
+  if (!stat || stat.size < importedCount * recordBytes) return null;
+  const cacheKey = `${source}:${stat.mtimeMs}:${stat.size}:${recordBytes}`;
+  if (localRichFilterCache?.cacheKey === cacheKey) return localRichFilterCache;
+  closeCachedFd(localRichFilterCache);
+  localRichFilterCache = {
+    cacheKey,
+    fd: openSync(source, 'r'),
+    count: importedCount,
+    size: stat.size,
+    headerBytes: 0,
+    recordBytes,
+    pages: new Map(),
+    maxPages: 4096,
+  };
+  return localRichFilterCache;
+}
+
 async function queryLocalPoints(reqUrl, res) {
   const index = await getSpatialIndex();
   if (!index) {
@@ -1792,6 +1824,18 @@ async function queryLocalPoints(reqUrl, res) {
       .filter(Number.isFinite)
   );
   const range = updateRange(reqUrl);
+  const richFilters = richPointFilters(reqUrl);
+  let localRichIndex = null;
+  if (richFilters.active) {
+    const meta = await getMeta();
+    const manifest = await getGalaxyManifest();
+    const compatibility = richMapFiltersCompatibility(meta, manifest);
+    if (!compatibility.compatible) return sendJson(res, { error: compatibility.reason }, 409);
+    localRichIndex = await getLocalRichFilterIndex(meta, manifest);
+    if (!localRichIndex || (richFilters.advanced && localRichIndex.recordBytes < 40)) {
+      return sendJson(res, { error: 'Full-resolution local map filter data is unavailable.' }, 409);
+    }
+  }
   const updates = range.active ? await getUpdateIndex() : null;
   await getVisited();
   const cellSize = Number(index.meta.cellSizeLy ?? 100);
@@ -1849,8 +1893,10 @@ async function queryLocalPoints(reqUrl, res) {
     selectedPointCount += cell.count;
     if (selectedPointCount >= readTarget) break;
   }
+  const areaScanComplete = selectedCells.length === eligibleCells.length;
   selectedCells.sort((a, b) => a.offset - b.offset);
   let candidates = [];
+  let localAreaCount = 0;
   const dataFd = await fs.open(spatialDataPath, 'r');
   try {
     for (const cell of selectedCells) {
@@ -1865,9 +1911,19 @@ async function queryLocalPoints(reqUrl, res) {
         const dz = pz - z;
         const distanceSq = dx * dx + dy * dy + dz * dz;
         if (distanceSq > radius * radius) continue;
+        localAreaCount += 1;
         const typeCode = bytes.readUInt16LE(offset + 12);
         if (!typeAllowed(typeCode, typeSet)) continue;
         const recordIndex = bytes.readUInt32LE(offset + 16);
+        if (richFilters.active) {
+          const summary = readPagedRecord(
+            localRichIndex,
+            recordIndex,
+            localRichIndex.recordBytes,
+            Math.max(1, Math.floor(4096 / localRichIndex.recordBytes))
+          );
+          if (!summary || !richPointAllowed(summary, 0, richFilters, localRichIndex.recordBytes)) continue;
+        }
         const record = Buffer.allocUnsafe(spatialPointBytes);
         bytes.copy(record, 0, offset, offset + spatialPointBytes);
         record.writeUInt16LE(record.readUInt16LE(14) | (visitedIndexSet.has(recordIndex) ? 4 : 0), 14);
@@ -1896,6 +1952,9 @@ async function queryLocalPoints(reqUrl, res) {
     'x-local-radius': String(radius),
     'x-local-count': String(selected.length),
     'x-local-density': String(densityCounts.get(radius) ?? selected.length),
+    'x-local-area-count': String(localAreaCount),
+    'x-local-area-complete': areaScanComplete ? '1' : '0',
+    'x-rich-filters': richFilters.active ? '1' : '0',
     'cache-control': 'no-store',
   });
   res.end(body);
@@ -3115,6 +3174,8 @@ async function runSystemUpdate(reqUrl, res) {
     greenGasGiantsCache = null;
     closeCachedFd(spatialIndexCache);
     spatialIndexCache = null;
+    closeCachedFd(localRichFilterCache);
+    localRichFilterCache = null;
     supplementalCache = null;
     visitedCache = null;
     journalBodiesCache = null;

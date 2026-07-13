@@ -2274,6 +2274,26 @@ body {
   gap: 12px;
 }
 
+#richFiltersSummary.filter-applying {
+  color: var(--accent-2);
+}
+
+#richFiltersSummary.filter-applying::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  border: 1px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: filter-spinner 0.75s linear infinite;
+}
+
+@keyframes filter-spinner {
+  to { transform: rotate(360deg); }
+}
+
 .rich-filter-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -221,7 +221,7 @@ function routeStarColor(starClass = '') {
 }
 
 export function colorsForType(typeName = '') {
-  return starVisual(typeName).color;
+  return cachedStarVisual(typeName).color;
 }
 
 export function isGiantStarType(typeName = '') {
@@ -349,6 +349,14 @@ export function visitedBraceGeometry(radius = 9) {
   }));
 }
 
+const defaultVisitedBraceGeometry = visitedBraceGeometry();
+const giantCageVertices = Array.from({ length: 6 }, (_, index) => {
+  const angle = Math.PI / 6 + index * Math.PI / 3;
+  return [Math.cos(angle) * 9, Math.sin(angle) * 9];
+});
+const starVisualCache = new Map();
+const specialKindCache = new Map();
+
 export function starVisual(typeName = '') {
   let color = [0.72, 0.78, 0.82];
   let size = 5.2;
@@ -378,6 +386,16 @@ export function starVisual(typeName = '') {
   return { color, size, style };
 }
 
+function cachedStarVisual(typeName = '') {
+  const key = String(typeName ?? '');
+  let visual = starVisualCache.get(key);
+  if (!visual) {
+    visual = starVisual(key);
+    starVisualCache.set(key, visual);
+  }
+  return visual;
+}
+
 export function specialKind(typeName = '') {
   if (typeName.includes('Black Hole')) return 'blackHole';
   if (typeName.includes('Neutron')) return 'neutron';
@@ -386,6 +404,12 @@ export function specialKind(typeName = '') {
   if (isGiantStarType(typeName)) return 'giant';
   if (/Wolf-Rayet|C Star|CJ Star|CN Star|S-type|MS-type/i.test(typeName)) return 'other';
   return '';
+}
+
+function cachedSpecialKind(typeName = '') {
+  const key = String(typeName ?? '');
+  if (!specialKindCache.has(key)) specialKindCache.set(key, specialKind(key));
+  return specialKindCache.get(key);
 }
 
 function isPrioritySpecial(point) {
@@ -432,6 +456,19 @@ export class GalaxyRenderer {
     this.gl = canvas.getContext('webgl', { antialias: true, alpha: true });
     this.ctx = overlay.getContext('2d');
     this.program = program(this.gl);
+    this.uniformLocations = {
+      matrix: this.gl.getUniformLocation(this.program, 'u_matrix'),
+      pixelRatio: this.gl.getUniformLocation(this.program, 'u_pixel_ratio'),
+    };
+    this.attributeLocations = {
+      position: this.gl.getAttribLocation(this.program, 'a_position'),
+      color: this.gl.getAttribLocation(this.program, 'a_color'),
+      size: this.gl.getAttribLocation(this.program, 'a_size'),
+      style: this.gl.getAttribLocation(this.program, 'a_style'),
+      phase: this.gl.getAttribLocation(this.program, 'a_phase'),
+      alpha: this.gl.getAttribLocation(this.program, 'a_alpha'),
+    };
+    this.matrixData = new Float32Array(16);
     this.positionBuffer = this.gl.createBuffer();
     this.colorBuffer = this.gl.createBuffer();
     this.sizeBuffer = this.gl.createBuffer();
@@ -483,6 +520,8 @@ export class GalaxyRenderer {
     this.starScale = 4;
     this.autoStarScale = true;
     this.onStarScaleChange = null;
+    this.onDrawCountChange = null;
+    this.lastReportedDrawCount = -1;
     this.onTargetChange = null;
     this.lastReportedStarScale = null;
     this.drag = null;
@@ -492,6 +531,12 @@ export class GalaxyRenderer {
     this.hoverScreen = null;
     this.hoverPoint = null;
     this.lastHoverAt = 0;
+    this.frameRect = null;
+    this.renderSerial = 0;
+    this.pickCacheSerial = -1;
+    this.pickCellSize = 48;
+    this.pickBuckets = new Map();
+    this.searchResultIndexes = new Set();
     this.keys = new Set();
     this.onSelect = null;
     this.onHover = null;
@@ -727,10 +772,11 @@ export class GalaxyRenderer {
         ...toRenderCoords(system.coords),
         typeName: system.mainStar,
         flags: system.visited ? 4 : 0,
-        special: specialKind(system.mainStar),
+        special: cachedSpecialKind(system.mainStar),
       }
       : null;
     if (system) this.selectedPlace = null;
+    this.pickCacheSerial = -1;
     this.requestRender();
   }
 
@@ -846,7 +892,7 @@ export class GalaxyRenderer {
       const flags = view.getUint16(offset + 14, true);
       const index = view.getUint32(offset + 16, true);
       const typeName = meta.typeNames[typeCode] ?? '';
-      points.push({ ...toRenderCoords({ x, y, z }), typeName, flags, index, special: specialKind(typeName), bucket: stableBucket(index) });
+      points.push({ ...toRenderCoords({ x, y, z }), typeName, flags, index, special: cachedSpecialKind(typeName), bucket: stableBucket(index) });
       if (++recordsInChunk >= chunkRecords) {
         recordsInChunk = 0;
         await yieldToUi();
@@ -882,6 +928,7 @@ export class GalaxyRenderer {
     this.alwaysPriorityPoints = spatial.alwaysPriority;
     this.visitedPriorityPoints = spatial.visitedPriority;
     this.lastBufferKey = '';
+    this.pickCacheSerial = -1;
     this.rebuildDrawBuffers(true);
     this.requestRender();
   }
@@ -979,12 +1026,6 @@ export class GalaxyRenderer {
       this.selectedSystem?.index,
     ].filter((index) => Number.isInteger(index) && index >= 0));
     const pointCandidates = this.pointCandidatesForBuffer(maxDistance, required);
-    const positions = [];
-    const colors = [];
-    const sizes = [];
-    const styles = [];
-    const phases = [];
-    const alphas = [];
     const importantPoints = [];
     const candidates = [];
     const densityRadiusSq = this.priorityDensityRadius() ** 2;
@@ -1013,32 +1054,50 @@ export class GalaxyRenderer {
       ...prioritized.map((candidate) => candidate.point),
     ];
     this.updateGridAnchors(drawPoints);
+    const positions = new Float32Array(drawPoints.length * 3);
+    const colors = new Float32Array(drawPoints.length * 3);
+    const sizes = new Float32Array(drawPoints.length);
+    const styles = new Float32Array(drawPoints.length);
+    const phases = new Float32Array(drawPoints.length);
+    const alphas = new Float32Array(drawPoints.length);
     const gridAnchorIndexes = new Set(this.gridAnchorPoints.map((point) => point.index));
     const sizeScale = this.starSizeScale();
-    for (const point of drawPoints) {
-      const visual = starVisual(point.typeName);
+    for (let pointIndex = 0; pointIndex < drawPoints.length; pointIndex += 1) {
+      const point = drawPoints[pointIndex];
+      const visual = cachedStarVisual(point.typeName);
       const distanceAlpha = this.starDistanceAlpha(this.distanceFromTarget(point));
       const gridAnchor = gridAnchorIndexes.has(point.index);
       const depthExempt = required.has(point.index) || (this.showVisited && (point.flags & 4));
       const depth = this.showDepthEmphasis && !depthExempt
         ? gridDepthEmphasis(point.y - this.target[1], gridStep)
-        : { alpha: 1, size: 1 };
-      const combinedAlpha = distanceAlpha * depth.alpha;
-      positions.push(point.x, point.y, point.z);
-      colors.push(...visual.color);
-      sizes.push(visual.size * sizeScale * (0.62 + distanceAlpha * 0.38) * depth.size * (gridAnchor ? 1.5 : 1));
-      styles.push(visual.style);
-      phases.push((point.bucket % 4096) / 4096);
-      alphas.push(gridAnchor ? Math.max(0.9, combinedAlpha) : combinedAlpha);
+        : null;
+      const depthAlpha = depth?.alpha ?? 1;
+      const depthSize = depth?.size ?? 1;
+      const combinedAlpha = distanceAlpha * depthAlpha;
+      const vectorOffset = pointIndex * 3;
+      positions[vectorOffset] = point.x;
+      positions[vectorOffset + 1] = point.y;
+      positions[vectorOffset + 2] = point.z;
+      colors[vectorOffset] = visual.color[0];
+      colors[vectorOffset + 1] = visual.color[1];
+      colors[vectorOffset + 2] = visual.color[2];
+      sizes[pointIndex] = visual.size * sizeScale * (0.62 + distanceAlpha * 0.38) * depthSize * (gridAnchor ? 1.5 : 1);
+      styles[pointIndex] = visual.style;
+      phases[pointIndex] = (point.bucket % 4096) / 4096;
+      alphas[pointIndex] = gridAnchor ? Math.max(0.9, combinedAlpha) : combinedAlpha;
     }
     this.points = drawPoints;
     this.count = drawPoints.length;
-    this.upload(this.positionBuffer, new Float32Array(positions));
-    this.upload(this.colorBuffer, new Float32Array(colors));
-    this.upload(this.sizeBuffer, new Float32Array(sizes));
-    this.upload(this.styleBuffer, new Float32Array(styles));
-    this.upload(this.phaseBuffer, new Float32Array(phases));
-    this.upload(this.alphaBuffer, new Float32Array(alphas));
+    if (this.count !== this.lastReportedDrawCount) {
+      this.lastReportedDrawCount = this.count;
+      this.onDrawCountChange?.(this.count);
+    }
+    this.upload(this.positionBuffer, positions);
+    this.upload(this.colorBuffer, colors);
+    this.upload(this.sizeBuffer, sizes);
+    this.upload(this.styleBuffer, styles);
+    this.upload(this.phaseBuffer, phases);
+    this.upload(this.alphaBuffer, alphas);
   }
 
   starSizeScale() {
@@ -1109,8 +1168,10 @@ export class GalaxyRenderer {
       ...result,
       coords: toRenderCoords(result.coords),
       typeName: meta.typeNames[result.typeCode] ?? '',
-      special: specialKind(meta.typeNames[result.typeCode] ?? ''),
+      special: cachedSpecialKind(meta.typeNames[result.typeCode] ?? ''),
     }));
+    this.searchResultIndexes = new Set(this.searchResults.map((result) => result.index));
+    this.pickCacheSerial = -1;
     this.rebuildDrawBuffers(true);
     this.requestRender();
   }
@@ -1144,27 +1205,26 @@ export class GalaxyRenderer {
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
     gl.useProgram(this.program);
-    const matrixLoc = gl.getUniformLocation(this.program, 'u_matrix');
-    gl.uniformMatrix4fv(matrixLoc, false, new Float32Array(matrix));
-    gl.uniform1f(gl.getUniformLocation(this.program, 'u_pixel_ratio'), Math.min(window.devicePixelRatio || 1, 2));
-    this.attrib('a_position', this.positionBuffer, 3);
-    this.attrib('a_color', this.colorBuffer, 3);
-    this.attrib('a_size', this.sizeBuffer, 1);
-    this.attrib('a_style', this.styleBuffer, 1);
-    this.attrib('a_phase', this.phaseBuffer, 1);
-    this.attrib('a_alpha', this.alphaBuffer, 1);
+    this.matrixData.set(matrix);
+    gl.uniformMatrix4fv(this.uniformLocations.matrix, false, this.matrixData);
+    gl.uniform1f(this.uniformLocations.pixelRatio, Math.min(window.devicePixelRatio || 1, 2));
+    this.attrib(this.attributeLocations.position, this.positionBuffer, 3);
+    this.attrib(this.attributeLocations.color, this.colorBuffer, 3);
+    this.attrib(this.attributeLocations.size, this.sizeBuffer, 1);
+    this.attrib(this.attributeLocations.style, this.styleBuffer, 1);
+    this.attrib(this.attributeLocations.phase, this.phaseBuffer, 1);
+    this.attrib(this.attributeLocations.alpha, this.alphaBuffer, 1);
     gl.drawArrays(gl.POINTS, 0, this.count);
   }
 
-  attrib(name, buffer, size) {
+  attrib(location, buffer, size) {
     const gl = this.gl;
-    const loc = gl.getAttribLocation(this.program, name);
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(location);
+    gl.vertexAttribPointer(location, size, gl.FLOAT, false, 0, 0);
   }
 
-  screen(point, rect = this.canvas.getBoundingClientRect()) {
+  screen(point, rect = this.frameRect ?? this.canvas.getBoundingClientRect()) {
     const projected = transform(this.matrix, [point.x, point.y, point.z]);
     if (projected[3] <= 0 || projected[2] < -1 || projected[2] > 1) return null;
     return {
@@ -1176,7 +1236,7 @@ export class GalaxyRenderer {
 
   projected(point) {
     const projected = transform(this.matrix, [point.x, point.y, point.z]);
-    const rect = this.canvas.getBoundingClientRect();
+    const rect = this.frameRect ?? this.canvas.getBoundingClientRect();
     const visible = projected[3] > 0 && projected[2] >= -1 && projected[2] <= 1
       && projected[0] >= -1 && projected[0] <= 1
       && projected[1] >= -1 && projected[1] <= 1;
@@ -1238,7 +1298,7 @@ export class GalaxyRenderer {
       ctx.lineWidth = index === 1 ? 2.4 : 1.8;
       ctx.strokeStyle = index === 1 ? 'rgba(103, 233, 255, 0.82)' : 'rgba(102, 224, 194, 0.56)';
       ctx.shadowColor = index === 1 ? 'rgba(103, 233, 255, 0.34)' : 'rgba(102, 224, 194, 0.2)';
-      ctx.shadowBlur = index === 1 ? 10 : 5;
+      ctx.shadowBlur = this.isNavigating() ? 0 : index === 1 ? 10 : 5;
       this.drawWorldLine(previous, current);
       ctx.restore();
     }
@@ -1262,7 +1322,7 @@ export class GalaxyRenderer {
     ctx.fillStyle = color;
     ctx.lineWidth = hover ? 2.2 : 1.6;
     ctx.shadowColor = color;
-    ctx.shadowBlur = hover ? 12 : 7;
+    ctx.shadowBlur = this.isNavigating() ? 0 : hover ? 12 : 7;
     ctx.beginPath();
     if (final && !first) {
       ctx.moveTo(0, -radius - 1);
@@ -1794,7 +1854,7 @@ export class GalaxyRenderer {
     ctx.lineWidth = lineWidth;
     ctx.strokeStyle = strokeStyle;
     ctx.shadowColor = center ? strokeStyle : major ? 'rgba(72, 220, 230, 0.18)' : 'transparent';
-    ctx.shadowBlur = center ? 8 : major ? 5 : 0;
+    ctx.shadowBlur = this.isNavigating() ? 0 : center ? 8 : major ? 5 : 0;
     this.drawWorldLine(a, b);
     ctx.restore();
   }
@@ -2022,7 +2082,7 @@ export class GalaxyRenderer {
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
       ctx.shadowColor = shadowColor;
-      ctx.shadowBlur = shadowBlur;
+      ctx.shadowBlur = this.isNavigating() ? 0 : shadowBlur;
       ctx.setLineDash(dash ?? []);
       ctx.stroke(path);
       ctx.restore();
@@ -2306,7 +2366,7 @@ export class GalaxyRenderer {
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
       ctx.beginPath();
-      for (const brace of visitedBraceGeometry()) {
+      for (const brace of defaultVisitedBraceGeometry) {
         ctx.moveTo(...brace.start);
         for (const curve of brace.curves) ctx.bezierCurveTo(...curve);
       }
@@ -2343,13 +2403,11 @@ export class GalaxyRenderer {
       ctx.save();
       ctx.lineWidth = search ? 2.2 : 1.6;
       ctx.shadowColor = search ? this.accentColor : css;
-      ctx.shadowBlur = search ? 9 : 7;
+      ctx.shadowBlur = this.isNavigating() ? 0 : search ? 9 : 7;
       ctx.beginPath();
-      for (let i = 0; i < 6; i += 1) {
-        const angle = Math.PI / 6 + i * Math.PI / 3;
-        const x = Math.cos(angle) * radius;
-        const y = Math.sin(angle) * radius;
-        if (i === 0) ctx.moveTo(x, y);
+      for (let index = 0; index < giantCageVertices.length; index += 1) {
+        const [x, y] = giantCageVertices[index];
+        if (index === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       }
       ctx.closePath();
@@ -2493,27 +2551,59 @@ export class GalaxyRenderer {
     return best;
   }
 
+  rebuildPickBuckets() {
+    if (this.pickCacheSerial === this.renderSerial) return;
+    const buckets = new Map();
+    const seen = new Set();
+    const rect = this.frameRect ?? this.canvas.getBoundingClientRect();
+    const margin = 32;
+    const add = (point) => {
+      if (!point || seen.has(point.index)) return;
+      seen.add(point.index);
+      const screen = this.screen(point, rect);
+      if (!screen
+        || screen.x < -margin || screen.x > rect.width + margin
+        || screen.y < -margin || screen.y > rect.height + margin) return;
+      const key = `${Math.floor(screen.x / this.pickCellSize)}:${Math.floor(screen.y / this.pickCellSize)}`;
+      let bucket = buckets.get(key);
+      if (!bucket) {
+        bucket = [];
+        buckets.set(key, bucket);
+      }
+      bucket.push({ point, screen });
+    };
+    if (Number.isInteger(this.selectedSystem?.index) && this.selectedSystem.index >= 0) add(this.selectedSystem);
+    for (const result of this.searchResults) add({ ...result.coords, ...result, flags: 0 });
+    for (const point of this.points) add(point);
+    this.pickBuckets = buckets;
+    this.pickCacheSerial = this.renderSerial;
+  }
+
   findPointNear(x, y, radius) {
+    this.rebuildPickBuckets();
     let best = null;
     let bestScore = Infinity;
-    const candidates = [
-      ...(Number.isInteger(this.selectedSystem?.index) && this.selectedSystem.index >= 0 ? [this.selectedSystem] : []),
-      ...this.searchResults.map((r) => ({ ...r.coords, index: r.index })),
-      ...this.points,
-    ];
-    for (const point of candidates) {
-      const screen = this.screen(point);
-      if (!screen) continue;
-      const hitRadius = this.hitRadius(point, radius);
-      const dist = Math.hypot(screen.x - x, screen.y - y);
-      if (dist > hitRadius) continue;
-      const depthBias = (screen.z + 1) * 4;
-      const selectedBias = point.index === this.selectedSystem?.index ? -8 : 0;
-      const importantBias = isPrioritySpecial(point) || (point.flags & 4) ? -2 : 0;
-      const score = dist + depthBias + selectedBias + importantBias;
-      if (score < bestScore) {
-        best = { point, screen };
-        bestScore = score;
+    const cellX = Math.floor(x / this.pickCellSize);
+    const cellY = Math.floor(y / this.pickCellSize);
+    const reach = Math.max(1, Math.ceil(Math.max(radius, 28) / this.pickCellSize));
+    for (let dx = -reach; dx <= reach; dx += 1) {
+      for (let dy = -reach; dy <= reach; dy += 1) {
+        const bucket = this.pickBuckets.get(`${cellX + dx}:${cellY + dy}`);
+        if (!bucket) continue;
+        for (const item of bucket) {
+          const { point, screen } = item;
+          const hitRadius = this.hitRadius(point, radius);
+          const dist = Math.hypot(screen.x - x, screen.y - y);
+          if (dist > hitRadius) continue;
+          const depthBias = (screen.z + 1) * 4;
+          const selectedBias = point.index === this.selectedSystem?.index ? -8 : 0;
+          const importantBias = isPrioritySpecial(point) || (point.flags & 4) ? -2 : 0;
+          const score = dist + depthBias + selectedBias + importantBias;
+          if (score < bestScore) {
+            best = item;
+            bestScore = score;
+          }
+        }
       }
     }
     return best;
@@ -2539,7 +2629,7 @@ export class GalaxyRenderer {
 
   hitRadius(point, fallback) {
     if (point.index === this.selectedSystem?.index) return Math.max(fallback, 28);
-    if (this.searchResults.some((result) => result.index === point.index)) return Math.max(fallback, 24);
+    if (this.searchResultIndexes.has(point.index)) return Math.max(fallback, 24);
     if (point.special || (point.flags & 4)) return Math.max(fallback, 20);
     return fallback;
   }
@@ -2551,16 +2641,23 @@ export class GalaxyRenderer {
     this.frameHandle = requestAnimationFrame(() => this.renderFrame());
   }
 
+  isNavigating() {
+    return Boolean(this.drag || this.keys.size > 0 || performance.now() < this.continuousUntil);
+  }
+
   updatePerformanceQuality(frameCost) {
     this.frameCostMs = this.frameCostMs * 0.86 + frameCost * 0.14;
     const now = performance.now();
     if (now - this.lastQualityUpdate < 450) return;
     this.lastQualityUpdate = now;
-    if (this.frameCostMs > 28) {
-      this.performanceScale = Math.max(0.55, this.performanceScale * 0.9);
+    // Keep the controller centered on a 60 Hz frame budget. Scale down before
+    // sustained work reaches a visibly choppy 28 ms, and recover conservatively
+    // so quality changes do not oscillate during navigation.
+    if (this.frameCostMs > 19) {
+      this.performanceScale = Math.max(0.5, this.performanceScale * 0.88);
       this.lastBufferKey = '';
-    } else if (this.frameCostMs < 15 && this.performanceScale < 1) {
-      this.performanceScale = Math.min(1, this.performanceScale * 1.06 + 0.02);
+    } else if (this.frameCostMs < 13.5 && this.performanceScale < 1) {
+      this.performanceScale = Math.min(1, this.performanceScale * 1.04 + 0.015);
       this.lastBufferKey = '';
     }
   }
@@ -2568,6 +2665,8 @@ export class GalaxyRenderer {
   renderFrame() {
     this.frameHandle = null;
     const started = performance.now();
+    this.frameRect = this.canvas.getBoundingClientRect();
+    this.renderSerial += 1;
     this.keyboardMove();
     this.rebuildDrawBuffers();
     const matrix = this.camera();

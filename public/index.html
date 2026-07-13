@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Elite Dangerous System Search</title>
-    <link rel="stylesheet" href="/styles.css?v=region-map-1">
+    <link rel="stylesheet" href="/styles.css?v=local-rich-filters-2">
   </head>
   <body>
     <main class="app">
@@ -226,14 +226,12 @@
               <div class="disclosure-body rich-filter-panel">
                 <div id="richFiltersSummary" class="muted">Import galaxy.json.gz to enable these filters.</div>
                 <div class="rich-filter-grid">
-                  <label class="toggle"><input id="richDataFilter" type="checkbox"><span>Has full data</span></label>
                   <label class="toggle"><input id="stationFilter" type="checkbox"><span>Has stations</span></label>
                   <label class="toggle"><input id="populatedFilter" type="checkbox"><span>Populated</span></label>
                   <label class="toggle"><input id="landableFilter" type="checkbox"><span>Landable bodies</span></label>
                   <label class="toggle"><input id="marketFilter" type="checkbox"><span>Has markets</span></label>
                   <label class="toggle"><input id="shipyardFilter" type="checkbox"><span>Has shipyards</span></label>
                   <label class="toggle"><input id="outfittingFilter" type="checkbox"><span>Has outfitting</span></label>
-                  <label class="toggle"><input id="signalsFilter" type="checkbox"><span>Body signals</span></label>
                 </div>
                 <label class="number-filter">
                   <span>Minimum body count</span>
@@ -454,6 +452,6 @@
         </div>
       </aside>
     </main>
-    <script type="module" src="/app.js?v=local-detail-only-1"></script>
+    <script type="module" src="/app.js?v=local-rich-filters-2"></script>
   </body>
 </html>
