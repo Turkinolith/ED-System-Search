@@ -548,6 +548,7 @@ export class GalaxyRenderer {
     this.lastBufferKey = '';
     this.lastBufferBuild = 0;
     this.renderRequested = false;
+    this.dropLinePulseTimer = null;
     this.frameHandle = null;
     this.continuousUntil = 0;
     this.frameCostMs = 16;
@@ -2221,18 +2222,19 @@ export class GalaxyRenderer {
       ctx.lineTo(end.x, end.y);
       ctx.stroke();
 
-      const footSize = 3 + prominence * 1.4;
-      ctx.strokeStyle = `rgba(128, 242, 244, ${0.66 + prominence * 0.28})`;
-      ctx.lineWidth = 1 + prominence * 0.5;
+      const pulsePhase = ((performance.now() / 1400) + index * 0.117) % 1;
+      const cameraScale = 0.62 + 0.38 / (1 + this.distance / 1800);
+      const ringWorldScale = Math.min(grid.step, 10);
+      const ringRadius = ringWorldScale * (0.055 + pulsePhase * 0.17) * cameraScale;
+      const ringAlpha = (1 - pulsePhase) ** 1.35 * (0.52 + prominence * 0.34);
+      this.drawGridPlaneRing(point.x, grid.y, point.z, ringRadius, {
+        strokeStyle: `rgba(128, 242, 244, ${ringAlpha})`,
+        lineWidth: 1 + prominence * 0.55,
+      });
+
+      ctx.fillStyle = `rgba(224, 255, 255, ${0.7 + prominence * 0.22})`;
       ctx.beginPath();
-      ctx.moveTo(end.x - footSize, end.y);
-      ctx.lineTo(end.x + footSize, end.y);
-      ctx.moveTo(end.x, end.y - footSize);
-      ctx.lineTo(end.x, end.y + footSize);
-      ctx.stroke();
-      ctx.fillStyle = `rgba(224, 255, 255, ${0.72 + prominence * 0.24})`;
-      ctx.beginPath();
-      ctx.arc(end.x, end.y, 1.2 + prominence * 0.7, 0, Math.PI * 2);
+      ctx.arc(end.x, end.y, 1.15 + prominence * 0.65, 0, Math.PI * 2);
       ctx.fill();
 
       ctx.strokeStyle = `rgba(${colorText}, ${0.62 + prominence * 0.32})`;
@@ -2246,6 +2248,36 @@ export class GalaxyRenderer {
       ctx.fill();
     }
     this.drawHoverDepthCue(grid);
+    ctx.restore();
+  }
+
+  drawGridPlaneRing(centerX, y, centerZ, radius, style) {
+    const ctx = this.ctx;
+    const segments = 18;
+    let drawing = false;
+    ctx.save();
+    ctx.strokeStyle = style.strokeStyle;
+    ctx.lineWidth = style.lineWidth;
+    ctx.beginPath();
+    for (let index = 0; index <= segments; index += 1) {
+      const angle = index / segments * Math.PI * 2;
+      const screen = this.screen({
+        x: centerX + Math.cos(angle) * radius,
+        y,
+        z: centerZ + Math.sin(angle) * radius,
+      });
+      if (!screen) {
+        drawing = false;
+        continue;
+      }
+      if (!drawing) {
+        ctx.moveTo(screen.x, screen.y);
+        drawing = true;
+      } else {
+        ctx.lineTo(screen.x, screen.y);
+      }
+    }
+    ctx.stroke();
     ctx.restore();
   }
 
@@ -2676,6 +2708,23 @@ export class GalaxyRenderer {
     if (this.keys.size > 0 || this.drag || performance.now() < this.continuousUntil) {
       this.requestRender();
     }
+    this.scheduleDropLinePulse();
+  }
+
+  scheduleDropLinePulse() {
+    const shouldAnimate = this.showDropLines
+      && !this.isolatePlaces
+      && (this.gridAnchorPoints.length > 0 || (this.showDepthEmphasis && this.hoverPoint))
+      && this.gridFadeAlpha() > 0.02
+      && document.visibilityState !== 'hidden';
+    if (!shouldAnimate || this.dropLinePulseTimer !== null) return;
+    // Navigation already renders at the display refresh rate. At rest, a
+    // restrained cadence keeps the pulse alive without turning the whole map
+    // into a permanent 60 FPS workload.
+    this.dropLinePulseTimer = window.setTimeout(() => {
+      this.dropLinePulseTimer = null;
+      this.requestRender();
+    }, 80);
   }
 
   start() {
