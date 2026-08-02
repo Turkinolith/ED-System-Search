@@ -7,6 +7,7 @@ const state = {
   enabledTypes: new Set(),
   searchResults: [],
   places: [],
+  placeCategoryData: new Map(),
   murderBinaryPlaces: [],
   visiblePlaces: [],
   placesMeta: null,
@@ -173,6 +174,9 @@ let pointStatusTimer = null;
 let localPointsRequestId = 0;
 let localPointsController = null;
 let pointLoadController = null;
+let searchController = null;
+let placesLoadController = null;
+let placesLoadRequestId = 0;
 let pointLoadRequestId = 0;
 let richFilterApplyId = 0;
 let starScaleFrame = null;
@@ -2431,20 +2435,20 @@ async function refreshLocalPointsNow(options = {}) {
 }
 
 async function loadPlaces() {
+  placesLoadController?.abort();
+  const requestId = ++placesLoadRequestId;
+  const controller = new AbortController();
+  placesLoadController = controller;
   try {
-    const response = await fetch('/api/places', {
-      headers: state.placesEtag && state.places.length ? { 'If-None-Match': state.placesEtag } : {},
-    });
-    if (response.status === 304) return;
+    const response = await fetch('/api/places-summary', { signal: controller.signal });
     if (!response.ok) throw new Error(response.statusText);
-    const etag = response.headers.get('etag');
-    if (etag && etag === state.placesEtag && state.places.length) return;
     const data = await response.json();
-    state.placesEtag = etag;
-    state.places = applyCarrierOverride(data.places ?? []);
+    if (requestId !== placesLoadRequestId) return;
     state.placesMeta = data.imported ? data : state.placesMeta;
+    state.placeCategoryData.clear();
+    state.places = [];
     renderPlaceFilters();
-    applyPlaceFilters();
+    await loadEnabledPlaceCategories({ force: true });
     if (el.murderBinariesToggle.checked && !el.murderBinariesToggle.disabled) {
       scheduleMurderBinariesRefresh(0);
     }
@@ -2452,9 +2456,53 @@ async function loadPlaces() {
       updatePlacesSummary();
     }
   } catch (error) {
+    if (isAbortError(error)) return;
     console.warn(error);
     state.places = [];
     state.renderer.setPlaces([]);
+  } finally {
+    if (placesLoadController === controller) placesLoadController = null;
+  }
+}
+
+function rebuildLoadedPlaces() {
+  state.places = [...state.placeCategoryData.values()].flat();
+}
+
+async function loadEnabledPlaceCategories(options = {}) {
+  const categories = [...state.enabledPlaceCategories].filter((category) => category !== murderBinariesCategory);
+  if (options.force) state.placeCategoryData.clear();
+  const missing = categories.filter((category) => !state.placeCategoryData.has(category));
+  if (!missing.length) {
+    rebuildLoadedPlaces();
+    applyPlaceFilters();
+    return;
+  }
+
+  placesLoadController?.abort();
+  const requestId = ++placesLoadRequestId;
+  const controller = new AbortController();
+  placesLoadController = controller;
+  const params = new URLSearchParams();
+  for (const category of missing) params.append('category', category);
+  try {
+    const response = await fetch(`/api/places?${params.toString()}`, { signal: controller.signal });
+    if (!response.ok) throw new Error(response.statusText);
+    const data = await response.json();
+    if (requestId !== placesLoadRequestId) return;
+    const groups = new Map(missing.map((category) => [category, []]));
+    for (const place of applyCarrierOverride(data.places ?? [])) {
+      const category = place.category ?? 'Other POIs';
+      if (!groups.has(category)) groups.set(category, []);
+      groups.get(category).push(place);
+    }
+    for (const [category, places] of groups) state.placeCategoryData.set(category, places);
+    rebuildLoadedPlaces();
+    applyPlaceFilters();
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+  } finally {
+    if (placesLoadController === controller) placesLoadController = null;
   }
 }
 
@@ -2472,7 +2520,7 @@ function updatePlacesSummary() {
   const filtered = state.visiblePlaces.length !== state.places.length
     ? ` ${fmt(state.visiblePlaces.length)} after filters;`
     : '';
-  el.placesSummary.textContent = `${fmt(meta.count)} places loaded from ${meta.source};${discoveryText}${filtered} ${shown}.`;
+  el.placesSummary.textContent = `${fmt(meta.count)} places indexed from ${meta.source};${discoveryText}${filtered} ${shown}.`;
 }
 
 function setPlaceIsolation(enabled, persist = false) {
@@ -2503,6 +2551,15 @@ function setPoiMode(mode, persist = false) {
 }
 
 function placeCategories() {
+  if (Array.isArray(state.placesMeta?.categoryDetails)) {
+    return state.placesMeta.categoryDetails
+      .map((item) => ({
+        category: item.category,
+        count: Number(item.count ?? 0),
+        defaultEnabled: item.defaultEnabled !== false,
+      }))
+      .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
+  }
   const counts = new Map();
   const defaultEnabled = new Map();
   for (const place of state.places) {
@@ -2546,6 +2603,9 @@ function renderPlaceFilters() {
       }
       persistPlaceCategories();
       applyPlaceFilters();
+      loadEnabledPlaceCategories().catch((error) => {
+        if (!isAbortError(error)) console.warn(error);
+      });
     });
     el.placeFilterActions.append(button);
   }
@@ -2563,6 +2623,9 @@ function renderPlaceFilters() {
       else state.enabledPlaceCategories.delete(item.category);
       persistPlaceCategories();
       applyPlaceFilters();
+      loadEnabledPlaceCategories().catch((error) => {
+        if (!isAbortError(error)) console.warn(error);
+      });
     });
     const text = document.createElement('span');
     text.textContent = item.category;
@@ -2813,16 +2876,26 @@ async function runLlmSearch() {
 
 async function search() {
   const q = el.search.value.trim();
+  searchController?.abort();
+  searchController = null;
   if (q.length < 3) {
     searchRequestId += 1;
     renderSearchResults([]);
     return;
   }
   const requestId = ++searchRequestId;
-  const response = await api(`/api/search?q=${encodeURIComponent(q)}&limit=25`);
-  const data = await response.json();
-  if (requestId !== searchRequestId) return;
-  renderSearchResults(data.results, data.message);
+  const controller = new AbortController();
+  searchController = controller;
+  try {
+    const response = await api(`/api/search?q=${encodeURIComponent(q)}&limit=25`, { signal: controller.signal });
+    const data = await response.json();
+    if (requestId !== searchRequestId) return;
+    renderSearchResults(data.results, data.message);
+  } catch (error) {
+    if (!isAbortError(error)) console.warn(error);
+  } finally {
+    if (searchController === controller) searchController = null;
+  }
 }
 
 function bindControls() {

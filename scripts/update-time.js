@@ -16,6 +16,14 @@ export function secondsToIso(seconds) {
   return new Date(epochMs + seconds * 1000).toISOString();
 }
 
+export function latestPlausibleUpdateTime(updateTime, importedAt) {
+  if (!updateTime || !importedAt) return null;
+  const updateMs = Date.parse(updateTime);
+  const importedMs = Date.parse(importedAt);
+  if (!Number.isFinite(updateMs) || !Number.isFinite(importedMs) || updateMs > importedMs) return null;
+  return new Date(updateMs).toISOString();
+}
+
 export function dateInputToSeconds(value, exclusiveEnd = false) {
   if (!value) return null;
   const date = new Date(`${value}T00:00:00`);

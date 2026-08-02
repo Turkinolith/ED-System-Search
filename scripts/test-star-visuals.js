@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { GalaxyRenderer, densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, specialKind, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
+import { GalaxyRenderer, densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, specialKind, starViewVolumeContains, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
 
 const o = starVisual('O (Blue-White) Star');
 const a = starVisual('A (Blue-White) Star');
@@ -66,6 +66,12 @@ assert.equal(bandEdge.alpha, 1, 'Stars inside two grid cells should retain full 
 assert.ok(farOffGrid.alpha <= 0.23 && farOffGrid.size < 0.8, 'Stars beyond eight grid cells should recede strongly.');
 assert.deepEqual(gridDepthEmphasis(-40, 5), farOffGrid, 'Depth emphasis should be symmetric above and below the grid.');
 
+assert.equal(starViewVolumeContains(50, 10), true, 'The 10 ly view should include the top edge of its 100 ly star band.');
+assert.equal(starViewVolumeContains(-50, 10), true, 'The 10 ly view should include the bottom edge of its 100 ly star band.');
+assert.equal(starViewVolumeContains(50.01, 10), false, 'The 10 ly view should omit stars above the band.');
+assert.equal(starViewVolumeContains(-50.01, 5), false, 'Closer views should retain the same Elite-style star band.');
+assert.equal(starViewVolumeContains(5000, 25), true, 'The 25 ly view should restore the existing spherical star volume.');
+
 const dropLineRange = dropLineAnchorRange([
   { x: 3, y: 4, z: 0 },
   { x: -6, y: 0, z: 8 },
@@ -92,6 +98,18 @@ assert.deepEqual(
   [nearGrid.centerX, nearGrid.centerZ],
   [gridRenderer.target[0], gridRenderer.target[2]],
   'The emphasized grid intersection should use the exact map target coordinate.',
+);
+
+gridRenderer.overlay = { getBoundingClientRect: () => ({ width: 1500, height: 900 }) };
+assert.deepEqual(
+  gridRenderer.renderClipRect(),
+  { x: 0, y: 0, width: 1500, height: 900 },
+  'The grid and its drop lines should cover the full render viewport.',
+);
+assert.deepEqual(
+  gridRenderer.centerClipRect(),
+  { x: 250, y: 150, width: 1000, height: 600 },
+  'HUD overlays should retain the existing centered safe area.',
 );
 
 const placeRenderer = Object.assign(Object.create(GalaxyRenderer.prototype), {

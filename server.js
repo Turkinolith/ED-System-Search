@@ -8,8 +8,15 @@ import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { zstdDecompressSync } from 'node:zlib';
-import { dateInputToSeconds, parseUpdateSeconds, secondsToIso, unknownUpdateSeconds } from './scripts/update-time.js';
+import {
+  dateInputToSeconds,
+  latestPlausibleUpdateTime,
+  parseUpdateSeconds,
+  secondsToIso,
+  unknownUpdateSeconds,
+} from './scripts/update-time.js';
 import { suggestKey } from './scripts/suggest-key.js';
+import { buildPlaceIndex, readPlaceIndexCategories, readPlaceIndexMeta } from './scripts/place-index.js';
 import { loadLocalConfig } from './local-config.js';
 import { createShutdownController } from './shutdown-guard.js';
 
@@ -40,6 +47,8 @@ const updatesPath = path.join(dataDir, 'systems-updates.u32');
 const updatesMetaPath = path.join(dataDir, 'systems-updates-meta.json');
 const suggestDir = path.join(dataDir, 'suggest');
 const suggestOverlayPath = path.join(dataDir, 'suggest-overlay.tsv');
+const suggestOverlayIndexDir = path.join(dataDir, 'suggest-overlay-index');
+const suggestOverlayIndexMetaPath = path.join(suggestOverlayIndexDir, 'meta.json');
 const galaxyDir = path.join(dataDir, 'galaxy');
 const galaxyManifestPath = path.join(galaxyDir, 'manifest.json');
 const spatialMetaPath = path.join(dataDir, 'systems-spatial-meta.json');
@@ -182,10 +191,11 @@ let localRichFilterCache = null;
 let notesCache = null;
 let updateMetaCache = null;
 let updateIndexCache = null;
-let suggestOverlayCache = null;
+let suggestOverlayIndexCache = null;
 let galaxyManifestCache = null;
 let journalBodiesCache = null;
 let carrierRefreshPromise = null;
+let placeIndexBuildPromise = null;
 let visitedIndexSet = new Set();
 const systemDetailCache = new Map();
 let journalScanStatus = {
@@ -302,6 +312,16 @@ async function getNotes() {
 
 async function getSystemUpdateLog() {
   return readJson(systemUpdateLogPath, { updatedAt: null, runs: [] });
+}
+
+function displaySystemUpdateLog(log) {
+  return {
+    ...log,
+    runs: (log?.runs ?? []).map((run) => ({
+      ...run,
+      lastDataUpdateTime: latestPlausibleUpdateTime(run.lastDataUpdateTime, run.finishedAt),
+    })),
+  };
 }
 
 async function appendSystemUpdateLog(entry) {
@@ -440,6 +460,7 @@ async function getMeta() {
           minUpdateTime: updateMeta?.minUpdateTime ?? base?.updateTimeRange?.minUpdateTime ?? null,
           maxUpdateTime: updateMeta?.maxUpdateTime ?? base?.updateTimeRange?.maxUpdateTime ?? null,
         },
+        updateIndexImportedAt: updateMeta?.importedAt ?? null,
       },
     };
   }
@@ -1778,6 +1799,36 @@ async function readSpatialMeta() {
   return existsSync(spatialMetaPath) ? readJson(spatialMetaPath, null) : null;
 }
 
+function latestManifestUpdateTime(manifest) {
+  let latest = null;
+  for (const segment of manifest?.segments ?? []) {
+    const updateTime = latestPlausibleUpdateTime(segment.maxUpdateTime, segment.importedAt);
+    if (updateTime && (!latest || Date.parse(updateTime) > Date.parse(latest))) latest = updateTime;
+  }
+  return latest;
+}
+
+function effectiveSystemDataTime(meta, manifest = null) {
+  const importedAt = meta?.lastDeltaImport?.importedAt
+    ?? meta?.updateIndexImportedAt
+    ?? meta?.importedAt;
+  return latestPlausibleUpdateTime(meta?.updateTimeRange?.maxUpdateTime, importedAt)
+    ?? latestManifestUpdateTime(manifest);
+}
+
+function statusMeta(meta, manifest) {
+  if (!meta) return null;
+  const maxUpdateTime = effectiveSystemDataTime(meta, manifest);
+  return {
+    ...meta,
+    updateTimeRange: {
+      ...meta.updateTimeRange,
+      available: Boolean(meta.updateTimeRange?.minUpdateTime && maxUpdateTime),
+      maxUpdateTime,
+    },
+  };
+}
+
 async function getLocalRichFilterIndex(meta, manifest) {
   const importedCount = Number(meta?.importedCount ?? meta?.count ?? 0);
   const fullLod = meta?.lodLevels?.find((entry) => Number(entry.count) === importedCount);
@@ -1973,6 +2024,19 @@ async function getDiscoveries() {
 }
 
 function placesSummary(places) {
+  const defaultEnabled = new Map();
+  for (const place of places?.places ?? []) {
+    const category = place.category ?? 'Other POIs';
+    defaultEnabled.set(category, (defaultEnabled.get(category) ?? false) || place.defaultEnabled !== false);
+  }
+  const categoryDetails = places?.categoryDetails ?? Object.entries(places?.categories ?? {})
+    .map(([category, count]) => ({
+      category,
+      count,
+      defaultEnabled: category === 'Murder Binaries' ? false : defaultEnabled.get(category) ?? true,
+      file: null,
+    }))
+    .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
   return {
     imported: Boolean(places?.imported),
     importedAt: places?.importedAt ?? null,
@@ -1983,9 +2047,53 @@ function placesSummary(places) {
     sourceGroups: places?.sourceGroups ?? {},
     types: places?.types ?? {},
     carrierRefresh: places?.carrierRefresh ?? null,
+    rawSource: places?.rawSource ?? null,
     discoveries: places?.discoveries ?? null,
     murderBinaries: places?.murderBinaries ?? null,
+    greenGasGiants: places?.greenGasGiants ?? null,
+    categoryDetails,
   };
+}
+
+async function indexedPlacesSummary() {
+  const index = await readPlaceIndexMeta(dataDir);
+  if (index) return { ...index.summary, indexBuiltAt: index.builtAt };
+  rebuildPlaceIndex();
+  return placesSummary(await getPlaces());
+}
+
+async function indexedPlacesForCategories(categories) {
+  const unique = [...new Set(categories.map((category) => String(category ?? '').trim()).filter(Boolean))];
+  const index = await readPlaceIndexMeta(dataDir);
+  if (index) {
+    return {
+      ...index.summary,
+      places: await readPlaceIndexCategories(dataDir, index, unique) ?? [],
+      selectedCategories: unique,
+      indexBuiltAt: index.builtAt,
+    };
+  }
+  rebuildPlaceIndex();
+  const places = await getPlaces();
+  const selected = new Set(unique);
+  return {
+    ...places,
+    places: (places.places ?? []).filter((place) => selected.has(place.category ?? 'Other POIs')),
+    selectedCategories: unique,
+  };
+}
+
+function rebuildPlaceIndex() {
+  if (placeIndexBuildPromise) return placeIndexBuildPromise;
+  placeIndexBuildPromise = buildPlaceIndex(dataDir)
+    .catch((error) => {
+      console.warn(`Place category index rebuild failed: ${error.message}`);
+      return null;
+    })
+    .finally(() => {
+      placeIndexBuildPromise = null;
+    });
+  return placeIndexBuildPromise;
 }
 
 function todayKey() {
@@ -2172,7 +2280,7 @@ function shouldRefreshCarriers(payload) {
 
 async function refreshCarrierPlacesOnceDaily() {
   if (carrierRefreshPromise) return carrierRefreshPromise;
-  const summary = existsSync(placesPath) ? await getPlaces() : null;
+  const summary = existsSync(placesPath) ? await indexedPlacesSummary() : null;
   if (!summary?.imported) return;
   if (summary.rawSource !== 'EDAstro Combined POI' || summary.carrierRefresh?.date === todayKey()) return;
   const payload = await readJson(placesPath, null);
@@ -2235,6 +2343,7 @@ async function refreshCarrierPlacesOnceDaily() {
       await writeFileAtomic(placesPath, JSON.stringify(next, null, 2));
       placesCache = null;
     } finally {
+      await rebuildPlaceIndex();
       carrierRefreshPromise = null;
     }
   })();
@@ -2700,49 +2809,129 @@ function searchMatch(query, candidate) {
   return { score: Math.max(1, 350 - gaps - candidate.length), matchType: 'fuzzy' };
 }
 
-async function getSuggestOverlayBucket(key) {
-  if (!existsSync(suggestOverlayPath)) {
-    suggestOverlayCache = null;
-    return [];
-  }
-  const stat = await fs.stat(suggestOverlayPath);
-  if (!suggestOverlayCache || suggestOverlayCache.mtimeMs !== stat.mtimeMs || suggestOverlayCache.size !== stat.size) {
-    const buckets = new Map();
-    const rl = readline.createInterface({
-      input: createReadStream(suggestOverlayPath, { encoding: 'utf8' }),
-      crlfDelay: Infinity,
-    });
-    for await (const line of rl) {
-      const lowerName = line.slice(0, line.indexOf('\t'));
-      const bucketKey = suggestKey(lowerName);
-      if (!bucketKey) continue;
-      if (!buckets.has(bucketKey)) buckets.set(bucketKey, []);
-      buckets.get(bucketKey).push(line);
-    }
-    suggestOverlayCache = { mtimeMs: stat.mtimeMs, size: stat.size, buckets };
-  }
-  return suggestOverlayCache.buckets.get(key) ?? [];
+function searchResultBetter(a, b) {
+  return a.score > b.score || (a.score === b.score && a.name.localeCompare(b.name) < 0);
 }
 
-async function searchSystems(reqUrl, res) {
+function searchResultWorse(a, b) {
+  return a.score < b.score || (a.score === b.score && a.name.localeCompare(b.name) > 0);
+}
+
+// A bounded worst-first heap keeps the same highest-scoring result set without
+// sorting after every fuzzy match in multi-million-row suggestion shards.
+class SearchResultHeap {
+  constructor(limit) {
+    this.limit = limit;
+    this.items = [];
+  }
+
+  add(item) {
+    if (this.items.length < this.limit) {
+      this.items.push(item);
+      this.bubbleUp(this.items.length - 1);
+      return;
+    }
+    if (!searchResultBetter(item, this.items[0])) return;
+    this.items[0] = item;
+    this.sinkDown(0);
+  }
+
+  bubbleUp(index) {
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (!searchResultWorse(this.items[index], this.items[parent])) break;
+      [this.items[index], this.items[parent]] = [this.items[parent], this.items[index]];
+      index = parent;
+    }
+  }
+
+  sinkDown(index) {
+    for (;;) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let worst = index;
+      if (left < this.items.length && searchResultWorse(this.items[left], this.items[worst])) worst = left;
+      if (right < this.items.length && searchResultWorse(this.items[right], this.items[worst])) worst = right;
+      if (worst === index) return;
+      [this.items[index], this.items[worst]] = [this.items[worst], this.items[index]];
+      index = worst;
+    }
+  }
+
+  sorted() {
+    return [...this.items].sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+  }
+}
+
+async function suggestOverlaySearchSource(key) {
+  if (!existsSync(suggestOverlayPath)) {
+    suggestOverlayIndexCache = null;
+    return null;
+  }
+  const [sourceStat, metaStat] = await Promise.all([
+    fs.stat(suggestOverlayPath),
+    fs.stat(suggestOverlayIndexMetaPath).catch(() => null),
+  ]);
+  const cacheKey = `${sourceStat.mtimeMs}:${sourceStat.size}:${metaStat?.mtimeMs ?? 0}:${metaStat?.size ?? 0}`;
+  if (!suggestOverlayIndexCache || suggestOverlayIndexCache.cacheKey !== cacheKey) {
+    const meta = metaStat ? await readJson(suggestOverlayIndexMetaPath, null) : null;
+    const valid = Number(meta?.formatVersion) === 1
+      && Number(meta?.sourceSize) === sourceStat.size
+      && Math.abs(Number(meta?.sourceMtimeMs) - sourceStat.mtimeMs) < 1;
+    suggestOverlayIndexCache = { cacheKey, valid };
+  }
+  if (!suggestOverlayIndexCache.valid) {
+    // Compatibility fallback for a direct/native delta import that did not run
+    // the sharding step. It is memory-bounded and retains complete results.
+    return { path: suggestOverlayPath, indexed: false };
+  }
+  const bucketPath = path.join(suggestOverlayIndexDir, `${key}.tsv`);
+  return { path: existsSync(bucketPath) ? bucketPath : null, indexed: true };
+}
+
+function searchRequestClosed(req, res) {
+  return req.aborted || req.destroyed || res.destroyed || res.writableEnded;
+}
+
+async function scanSuggestionFile(filePath, addSearchLine, req, res) {
+  if (!filePath || !existsSync(filePath)) return true;
+  const input = createReadStream(filePath, { encoding: 'utf8', highWaterMark: 4 * 1024 * 1024 });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  let scanned = 0;
+  for await (const line of lines) {
+    addSearchLine(line);
+    scanned += 1;
+    if ((scanned & 4095) === 0 && searchRequestClosed(req, res)) {
+      lines.close();
+      input.destroy();
+      return false;
+    }
+  }
+  return !searchRequestClosed(req, res);
+}
+
+async function searchSystems(req, reqUrl, res) {
   const q = (reqUrl.searchParams.get('q') ?? '').trim().toLowerCase();
   if (q.length < 3) return sendJson(res, { query: q, results: [] });
   const max = Math.max(5, Math.min(Number(reqUrl.searchParams.get('limit') ?? 30), 100));
-  const results = [];
+  const results = new SearchResultHeap(max * 4);
   const seenIndexes = new Set();
   const seenNames = new Set();
   const key = suggestKey(q);
   const bucketPath = path.join(suggestDir, `${key}.tsv`);
 
   function addSearchLine(line, scoreBoost = 0, source = null) {
-    const [lowerName, name, indexText, typeText, xText, yText, zText] = line.split('\t');
+    const firstTab = line.indexOf('\t');
+    if (firstTab <= 0) return;
+    const lowerName = line.slice(0, firstTab);
     const match = searchMatch(q, lowerName);
     if (!match) return;
+    const [, name, indexText, typeText, xText, yText, zText] = line.split('\t');
     const index = Number(indexText);
     if (seenIndexes.has(index)) return;
     seenIndexes.add(index);
     seenNames.add(lowerName);
-    results.push({
+    results.add({
       name,
       index,
       typeCode: Number(typeText),
@@ -2752,23 +2941,22 @@ async function searchSystems(reqUrl, res) {
       overridesFilters: true,
       source,
     });
-    results.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
-    if (results.length > max * 4) results.length = max * 2;
   }
 
-  for (const line of await getSuggestOverlayBucket(key)) {
-    addSearchLine(line, 25, 'delta-overlay');
+  const overlay = await suggestOverlaySearchSource(key);
+  if (overlay?.path) {
+    const complete = await scanSuggestionFile(
+      overlay.path,
+      (line) => addSearchLine(line, 25, 'delta-overlay'),
+      req,
+      res
+    );
+    if (!complete) return;
   }
 
   if (existsSync(bucketPath)) {
-    const rl = readline.createInterface({
-      input: createReadStream(bucketPath, { encoding: 'utf8' }),
-      crlfDelay: Infinity,
-    });
-
-    for await (const line of rl) {
-      addSearchLine(line);
-    }
+    const complete = await scanSuggestionFile(bucketPath, addSearchLine, req, res);
+    if (!complete) return;
   } else if (!existsSync(suggestDir) && !existsSync(suggestOverlayPath)) {
     return sendJson(res, {
       query: q,
@@ -2786,7 +2974,7 @@ async function searchSystems(reqUrl, res) {
     if (seenIndexes.has(system.index)) continue;
     seenIndexes.add(system.index);
     seenNames.add(lowerName);
-    results.push({
+    results.add({
       name: system.name,
       index: system.index,
       typeCode: system.typeCode,
@@ -2796,8 +2984,6 @@ async function searchSystems(reqUrl, res) {
       overridesFilters: true,
       source: system.source,
     });
-    results.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
-    if (results.length > max * 4) results.length = max * 2;
   }
 
   const meta = await getMeta();
@@ -2813,7 +2999,7 @@ async function searchSystems(reqUrl, res) {
     if (seenIndexes.has(index)) continue;
     seenIndexes.add(index);
     seenNames.add(lowerName);
-    results.push({
+    results.add({
       name: system.name,
       index,
       typeCode: typeCodeForVisitedSystem(meta, system),
@@ -2823,11 +3009,9 @@ async function searchSystems(reqUrl, res) {
       overridesFilters: true,
       source: 'Player Journal',
     });
-    results.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
-    if (results.length > max * 4) results.length = max * 2;
   }
 
-  sendJson(res, { query: q, results: results.slice(0, max) });
+  sendJson(res, { query: q, results: results.sorted().slice(0, max) });
 }
 
 async function readSystemDetail(reqUrl, res) {
@@ -3202,7 +3386,7 @@ async function runSystemUpdate(reqUrl, res) {
       finishedAt,
       ok,
       message: final.message,
-      lastDataUpdateTime: meta?.updateTimeRange?.maxUpdateTime ?? null,
+      lastDataUpdateTime: effectiveSystemDataTime(meta),
       lastDeltaImport: meta?.lastDeltaImport ?? null,
     };
     await appendSystemUpdateLog(logEntry).catch(() => null);
@@ -3305,27 +3489,30 @@ const server = http.createServer(async (req, res) => {
     const reqUrl = new URL(req.url, `http://${req.headers.host}`);
     if (reqUrl.pathname === '/api/status') {
       refreshCarrierPlacesOnceDaily().catch((error) => console.warn(`Carrier POI refresh failed: ${error.message}`));
-      const [meta, visited, places, systemUpdateLog, galaxyManifest, spatialIndex] = await Promise.all([
+      const [rawMeta, visited, places, systemUpdateLog, galaxyManifest, spatialIndex] = await Promise.all([
         getMeta(),
         getVisited(),
-        getPlaces(),
+        indexedPlacesSummary(),
         getSystemUpdateLog(),
         getGalaxyManifest(),
         readSpatialMeta(),
       ]);
+      const meta = statusMeta(rawMeta, galaxyManifest);
+      const lastDataUpdateTime = effectiveSystemDataTime(rawMeta, galaxyManifest);
+      const displayUpdateLog = displaySystemUpdateLog(systemUpdateLog);
       return sendJson(res, {
         imported: Boolean(meta),
         meta,
         visited: visitedSummary(visited),
-        places: placesSummary(places),
+        places,
         galaxyDetails: galaxyDetailsSummary(galaxyManifest, meta),
         spatialIndex,
         systemUpdates: {
           running: systemUpdateStatus.running,
           current: systemUpdateStatus,
-          log: systemUpdateLog,
-          lastRun: systemUpdateLog.runs?.[0] ?? null,
-          lastDataUpdateTime: meta?.updateTimeRange?.maxUpdateTime ?? null,
+          log: displayUpdateLog,
+          lastRun: displayUpdateLog.runs?.[0] ?? null,
+          lastDataUpdateTime,
           lastDeltaImport: meta?.lastDeltaImport ?? null,
         },
         runtimeConfig: {
@@ -3342,13 +3529,23 @@ const server = http.createServer(async (req, res) => {
     }
     if (reqUrl.pathname === '/api/points') return await readPoints(reqUrl, res);
     if (reqUrl.pathname === '/api/local-points') return await queryLocalPoints(reqUrl, res);
-    if (reqUrl.pathname === '/api/search') return await searchSystems(reqUrl, res);
+    if (reqUrl.pathname === '/api/search') return await searchSystems(req, reqUrl, res);
     if (reqUrl.pathname === '/api/nav-route') return await readNavRoute(res);
     if (reqUrl.pathname === '/api/llm-search' && req.method === 'POST') return await llmAugmentedSearch(req, res);
     if (reqUrl.pathname === '/api/system') return await readSystemDetail(reqUrl, res);
     if (reqUrl.pathname === '/api/system-rich') return await readRichSystem(reqUrl, res);
     if (reqUrl.pathname === '/api/notes' && req.method === 'GET') return await listSystemNotes(req, reqUrl, res);
     if (reqUrl.pathname === '/api/notes' && req.method === 'POST') return await saveSystemNote(req, res);
+    if (reqUrl.pathname === '/api/places-summary') {
+      const summary = await indexedPlacesSummary();
+      return sendJsonWithEtag(req, res, summary, `"places-summary-${summary.indexBuiltAt ?? summary.importedAt ?? 'empty'}-${summary.count ?? 0}"`);
+    }
+    if (reqUrl.pathname === '/api/places' && reqUrl.searchParams.has('category')) {
+      const categories = reqUrl.searchParams.getAll('category');
+      const places = await indexedPlacesForCategories(categories);
+      const categoryKey = createHash('sha1').update(categories.slice().sort().join('\n')).digest('hex').slice(0, 16);
+      return sendJsonWithEtag(req, res, places, `"places-categories-${places.indexBuiltAt ?? places.importedAt ?? 'fallback'}-${categoryKey}"`);
+    }
     if (reqUrl.pathname === '/api/places') {
       const places = await getPlaces();
       return sendJsonWithEtag(req, res, places, `"places-${placesCache?.cacheKey ?? 'empty'}"`);
@@ -3363,7 +3560,12 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/visited') return sendJson(res, await getVisited());
     if (reqUrl.pathname === '/api/journal-scan-status') return sendJson(res, journalScanStatus);
     if (reqUrl.pathname === '/api/refresh-journals' && req.method === 'POST') return await runJournalRefresh(reqUrl, res);
-    if (reqUrl.pathname === '/api/system-update-status') return sendJson(res, { ...systemUpdateStatus, log: await getSystemUpdateLog() });
+    if (reqUrl.pathname === '/api/system-update-status') {
+      return sendJson(res, {
+        ...systemUpdateStatus,
+        log: displaySystemUpdateLog(await getSystemUpdateLog()),
+      });
+    }
     if (reqUrl.pathname === '/api/system-update' && req.method === 'POST') return await runSystemUpdate(reqUrl, res);
     if (reqUrl.pathname === '/api/ping') {
       const activity = currentWriteActivity();

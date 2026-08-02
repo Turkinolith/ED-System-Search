@@ -349,6 +349,12 @@ export function visitedBraceGeometry(radius = 9) {
   }));
 }
 
+export function starViewVolumeContains(height, step) {
+  const gridStep = Math.max(1, Number(step) || 1);
+  if (gridStep > 10) return true;
+  return Math.abs(Number(height) || 0) <= 50;
+}
+
 const defaultVisitedBraceGeometry = visitedBraceGeometry();
 const giantCageVertices = Array.from({ length: 6 }, (_, index) => {
   const angle = Math.PI / 6 + index * Math.PI / 3;
@@ -1037,7 +1043,9 @@ export class GalaxyRenderer {
       const dy = point.y - this.target[1];
       const dz = point.z - this.target[2];
       const distanceSq = dx * dx + dy * dy + dz * dz;
-      const important = required.has(point.index) || isPrioritySpecial(point) || (point.flags & 2) || (this.showVisited && (point.flags & 4));
+      const requiredForNavigation = required.has(point.index);
+      if (!requiredForNavigation && !starViewVolumeContains(dy, gridStep)) continue;
+      const important = requiredForNavigation || isPrioritySpecial(point) || (point.flags & 2) || (this.showVisited && (point.flags & 4));
       if (!important && distanceSq > maxDistance * maxDistance) continue;
       if (important) importantPoints.push(point);
       else {
@@ -1783,7 +1791,7 @@ export class GalaxyRenderer {
     const alpha = this.gridFadeAlpha();
     if (alpha <= 0.01) return grid;
     const ctx = this.ctx;
-    const clip = this.centerClipRect();
+    const clip = this.renderClipRect();
     ctx.save();
     ctx.beginPath();
     ctx.rect(clip.x, clip.y, clip.width, clip.height);
@@ -2163,6 +2171,16 @@ export class GalaxyRenderer {
     };
   }
 
+  renderClipRect() {
+    const rect = this.overlay.getBoundingClientRect();
+    return {
+      x: 0,
+      y: 0,
+      width: rect.width,
+      height: rect.height,
+    };
+  }
+
   drawWorldLine(a, b) {
     const ctx = this.ctx;
     const segments = 32;
@@ -2192,7 +2210,7 @@ export class GalaxyRenderer {
 
   drawDropLines(grid) {
     const ctx = this.ctx;
-    const clip = this.centerClipRect();
+    const clip = this.renderClipRect();
     ctx.save();
     ctx.beginPath();
     ctx.rect(clip.x, clip.y, clip.width, clip.height);

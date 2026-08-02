@@ -4,6 +4,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync 
 import { gzipSync } from 'node:zlib';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildSuggestOverlayIndex } from './import-suggest-overlay-index.js';
+import { buildPlaceIndex } from './place-index.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const fixtureRoot = path.join(root, '.tmp-galaxy-integration');
@@ -157,6 +159,10 @@ writeFileSync(path.join(dataDir, 'systems-names.txt'), Buffer.concat(nameParts))
 writeFileSync(path.join(dataDir, 'systems-search.tsv'), `${searchLines.join('\n')}\n`);
 mkdirSync(path.join(dataDir, 'suggest'), { recursive: true });
 writeFileSync(path.join(dataDir, 'suggest', 'fix.tsv'), `${searchLines.join('\n')}\n`);
+writeFileSync(path.join(dataDir, 'suggest-overlay.tsv'), [
+  searchLines[1],
+  'fix marker fixture hidden\tFix Marker Fixture Hidden\t99\t0\t40\t50\t60',
+].join('\n') + '\n');
 writeFileSync(path.join(dataDir, 'systems-meta.json'), JSON.stringify({
   count: systems.length,
   importedCount: systems.length,
@@ -273,6 +279,12 @@ assert.equal(rebuiltManifest.mapFilters.lodLevels[0].count, coarseLodCount);
 assert.equal(rebuiltManifest.mapFilters.lodLevels[1].count, systems.length + 1);
 assert.equal(readFileSync(path.join(dataDir, 'galaxy', 'systems-lod-1-rich.bin')).byteLength, (systems.length + 1) * 40);
 
+const suggestOverlayIndex = await buildSuggestOverlayIndex(dataDir);
+assert.equal(suggestOverlayIndex.count, 2);
+assert.equal(suggestOverlayIndex.bucketCount, 1);
+const placeIndex = await buildPlaceIndex(dataDir);
+assert.equal(placeIndex.summary.categoryDetails.some((entry) => entry.category === 'Green Gas Giants' && entry.file), true);
+
 const server = spawn(process.execPath, ['server.js'], {
   cwd: root,
   env: { ...process.env, EDSS_DATA_DIR: dataDir, PORT: String(port) },
@@ -331,6 +343,34 @@ try {
   assert.equal(rich.system.name, 'Fixture Station');
   assert.equal(rich.system.bodies.length, 2);
   assert.equal(rich.summary.stationCount, 1);
+
+  const prefixSearchResponse = await fetch(`http://localhost:${port}/api/search?q=fixture%20green&limit=12`);
+  assert.equal(prefixSearchResponse.status, 200);
+  const prefixSearch = await prefixSearchResponse.json();
+  assert.equal(prefixSearch.results[0].name, 'Fixture Green');
+  assert.equal(prefixSearch.results[0].matchType, 'startsWith');
+  assert.equal(prefixSearch.results[0].source, 'delta-overlay', 'The delta overlay should retain precedence over the base shard.');
+
+  const containsSearchResponse = await fetch(`http://localhost:${port}/api/search?q=fixture%20hidden&limit=12`);
+  const containsSearch = await containsSearchResponse.json();
+  assert.equal(containsSearch.results[0].name, 'Fix Marker Fixture Hidden');
+  assert.equal(containsSearch.results[0].matchType, 'contains');
+
+  const fuzzySearchResponse = await fetch(`http://localhost:${port}/api/search?q=fixgrn&limit=12`);
+  const fuzzySearch = await fuzzySearchResponse.json();
+  assert.equal(fuzzySearch.results.some((result) => result.name === 'Fixture Green' && result.matchType === 'fuzzy'), true);
+
+  const placesSummaryResponse = await fetch(`http://localhost:${port}/api/places-summary`);
+  assert.equal(placesSummaryResponse.status, 200);
+  const placesSummary = await placesSummaryResponse.json();
+  assert.equal(Array.isArray(placesSummary.places), false, 'The startup summary must not include the full place array.');
+  assert.equal(placesSummary.categoryDetails.some((entry) => entry.category === 'Green Gas Giants' && entry.count === 1), true);
+
+  const selectedPlacesResponse = await fetch(`http://localhost:${port}/api/places?category=${encodeURIComponent('Green Gas Giants')}`);
+  assert.equal(selectedPlacesResponse.status, 200);
+  const selectedPlaces = await selectedPlacesResponse.json();
+  assert.equal(selectedPlaces.places.length, 1);
+  assert.equal(selectedPlaces.places[0].category, 'Green Gas Giants');
 
   const placesResponse = await fetch(`http://localhost:${port}/api/places`);
   assert.equal(placesResponse.status, 200);

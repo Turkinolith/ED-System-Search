@@ -249,16 +249,32 @@ struct ImportState {
     name_bytes: u64,
     min_update_seconds: u32,
     max_update_seconds: u32,
+    max_valid_update_seconds: u32,
+    ignored_future_update_times: u64,
 }
 
 impl ImportState {
     fn new(types: TypeState) -> Self {
+        let max_valid_update_seconds = parse_update_seconds(Some(
+            &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ));
         Self {
             types,
             lod_counts: vec![0; LODS.len()],
             name_bytes: 0,
             min_update_seconds: UNKNOWN_UPDATE_SECONDS,
             max_update_seconds: 0,
+            max_valid_update_seconds,
+            ignored_future_update_times: 0,
+        }
+    }
+
+    fn sanitize_update(&mut self, seconds: u32) -> u32 {
+        if seconds != UNKNOWN_UPDATE_SECONDS && seconds > self.max_valid_update_seconds {
+            self.ignored_future_update_times += 1;
+            UNKNOWN_UPDATE_SECONDS
+        } else {
+            seconds
         }
     }
 
@@ -762,7 +778,7 @@ fn write_output_system(
     system: OutputSystem,
     index: usize,
 ) -> Result<LookupRow> {
-    let (name, star, x, y, z, flags, id64, update_seconds, maybe_type_code) = match system {
+    let (name, star, x, y, z, flags, id64, raw_update_seconds, maybe_type_code) = match system {
         OutputSystem::New(system) => {
             let name = system
                 .name
@@ -812,6 +828,7 @@ fn write_output_system(
         ),
     };
 
+    let update_seconds = state.sanitize_update(raw_update_seconds);
     let type_code = maybe_type_code.unwrap_or_else(|| state.types.code_for(&star));
     state.types.observe(type_code);
 
@@ -1107,6 +1124,7 @@ fn write_meta(
             "count": state.lod_counts[i],
         })).collect::<Vec<_>>(),
         "updateTimeRange": update_range,
+        "ignoredFutureUpdateTimes": state.ignored_future_update_times,
         "sol": existing.and_then(|m| m.sol.clone()).unwrap_or_else(|| json!({ "name": "Sol", "coords": { "x": 0, "y": 0, "z": 0 } })),
     });
     if let Some(last_delta) = last_delta.clone() {
@@ -1125,6 +1143,7 @@ fn write_meta(
         "maxSeconds": if state.max_update_seconds == 0 { Value::Null } else { Value::from(state.max_update_seconds) },
         "minUpdateTime": seconds_to_iso(state.min_update_seconds),
         "maxUpdateTime": if state.max_update_seconds == 0 { Value::Null } else { seconds_to_iso(state.max_update_seconds) },
+        "ignoredFutureUpdateTimes": state.ignored_future_update_times,
         "lastDeltaImport": last_delta,
     });
     serde_json::to_writer_pretty(File::create(&paths.updates_meta)?, &updates_meta)?;
@@ -1193,6 +1212,24 @@ fn seconds_to_iso(seconds: u32) -> Value {
         (epoch + chrono::Duration::seconds(seconds as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     )
+}
+
+#[cfg(test)]
+mod update_time_tests {
+    use super::*;
+
+    #[test]
+    fn future_update_times_are_stored_as_unknown() {
+        let mut state = ImportState::new(TypeState::new());
+        state.max_valid_update_seconds =
+            parse_update_seconds(Some("2026-07-24T23:59:59Z"));
+        let future = parse_update_seconds(Some("2026-07-30T22:44:38Z"));
+        let valid = parse_update_seconds(Some("2026-07-07T22:00:01Z"));
+
+        assert_eq!(state.sanitize_update(future), UNKNOWN_UPDATE_SECONDS);
+        assert_eq!(state.sanitize_update(valid), valid);
+        assert_eq!(state.ignored_future_update_times, 1);
+    }
 }
 
 fn base_type(star: &str) -> String {

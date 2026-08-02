@@ -11,6 +11,7 @@ const searchPath = path.join(dataDir, 'systems-search.tsv');
 const suggestDir = path.join(dataDir, 'suggest');
 const suggestOverlayPath = path.join(dataDir, 'suggest-overlay.tsv');
 const suggestOverlayMetaPath = path.join(dataDir, 'suggest-overlay-meta.json');
+const suggestOverlayIndexDir = path.join(dataDir, 'suggest-overlay-index');
 const maxOpenWriters = 96;
 
 const writers = new Map();
@@ -80,6 +81,7 @@ async function main() {
   await fs.writeFile(path.join(dataDir, 'suggest-meta.json'), JSON.stringify(meta, null, 2));
   await fs.rm(suggestOverlayPath, { force: true });
   await fs.rm(suggestOverlayMetaPath, { force: true });
+  await fs.rm(suggestOverlayIndexDir, { recursive: true, force: true });
   console.log(`Indexed ${count.toLocaleString()} suggestion rows into ${meta.bucketCount.toLocaleString()} buckets.`);
 }
 
