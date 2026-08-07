@@ -6,6 +6,7 @@ import { createGunzip } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { getHeapStatistics } from 'node:v8';
 import { parseUpdateSeconds, secondsToIso, unknownUpdateSeconds } from './update-time.js';
+import { withImportActivity } from './import-activity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.dirname(__dirname);
@@ -442,14 +443,13 @@ async function removeTempFiles() {
 async function main() {
   const heapLimit = getHeapStatistics().heap_size_limit;
   console.log(`Node heap limit: ${formatBytes(heapLimit)}`);
+  // Thrown rather than process.exit so the caller's activity lease is released.
   if (!isUrl(sourcePath) && !existsSync(sourcePath)) {
-    console.error(`Cannot find ${sourcePath}`);
-    process.exit(1);
+    throw new Error(`Cannot find ${sourcePath}`);
   }
   for (const required of [paths.meta, paths.records, paths.search, paths.updates]) {
     if (!existsSync(required)) {
-      console.error(`Cannot find ${required}. Run npm run import:systems first.`);
-      process.exit(1);
+      throw new Error(`Cannot find ${required}. Run npm run import:systems first.`);
     }
   }
 
@@ -514,7 +514,10 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+// The lease lives here rather than only in run-native-importer.js so a direct
+// `node scripts/import-systems-delta.js ...` is protected too. Nested leases
+// compose - the wrapper's marker and this one are independent files.
+withImportActivity(dataDir, 'systems delta import', main).catch((error) => {
   console.error(error);
   process.exit(1);
 });

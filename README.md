@@ -225,6 +225,65 @@ npm run import:galaxy-filters
 System-only updates preserve local journal systems and notes. Rich-data deltas
 are searched newest-first when a system appears in multiple segments.
 
+### Disk cleanup
+
+The native importers, index builders, and server-managed JSON writers use temp
+files that are renamed into place. If one of those operations is killed or
+crashes it can strand `.tmp` files — a failed full-galaxy import can leave well
+over 100 GB behind. The server clears these automatically at startup and after
+each update, so no action is normally needed.
+
+To run it by hand:
+
+```powershell
+npm run cleanup
+```
+
+Preview exactly what it would remove, without touching anything:
+
+```powershell
+npm run cleanup:dry-run
+```
+
+Cleanup only automatically removes `.tmp` files and directories under `data/`.
+Live database files are never matched. Partial browser downloads
+(`.crdownload`, `.part`, `.partial`, `.download`) in the project root are
+reported but kept because they may be resumable. After confirming one is not
+recoverable, opt in to removing aged partials with:
+
+```powershell
+node scripts/cleanup.js --include-partials
+```
+
+Cleanup is deferred while a known importer, index builder, or server-managed
+atomic writer is active, and a temp file or directory is kept when it or any
+descendant was modified within the last hour. Newly orphaned files are checked
+again after that safety window.
+
+Writers announce themselves with a lease file under `data/.active-imports`,
+refreshed every 30 seconds while they run. Lease creation and destructive
+cleanup also share `data/.cleanup-coordinator.lock`, so a writer cannot start in
+the gap between cleanup's activity check and deletion. A stale lease is pruned
+when its owner is no longer running. If a marker or coordinator lock's old PID
+has been recycled by Windows, cleanup conservatively keeps treating it as
+active; inspect the file and running process before manually removing it. There
+is no portable way to distinguish a recycled PID from the original suspended
+process using a PID alone, and retaining possibly active work is the safer
+failure mode.
+
+Downloaded source dumps such as `galaxy.json.gz` are **reported but kept**,
+because re-downloading one is expensive. Delta updates stream directly from
+Spansh and never write a dump to disk, so these only exist if you downloaded one
+manually. Once the import has finished, the dump is no longer read by the app
+and can be removed with:
+
+```powershell
+node scripts/cleanup.js --include-dumps
+```
+
+Note that `.git` can also grow unexpectedly if a large file is ever staged with
+`git add` without being committed; `git gc --prune=now` reclaims that space.
+
 ## Map Controls
 
 | Input | Action |
@@ -256,4 +315,3 @@ requirements. Explorarium data used with permission.
 Elite Dangerous is a trademark of Frontier Developments plc.
 This project is an unofficial community tool and is not affiliated with or
 endorsed by Frontier Developments, EDAstro, Spansh, or Explorarium.
-

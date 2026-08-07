@@ -3,6 +3,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { suggestKey } from './suggest-key.js';
+import { withImportActivity } from './import-activity.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,7 +22,7 @@ function partitionFor(key) {
   return (hash >>> 0) % partitionCount;
 }
 
-export async function buildSuggestOverlayIndex(dataDir = defaultDataDir) {
+async function buildSuggestOverlayIndexUnlocked(dataDir) {
   const sourcePath = path.join(dataDir, 'suggest-overlay.tsv');
   const outputDir = path.join(dataDir, 'suggest-overlay-index');
   if (!existsSync(sourcePath)) {
@@ -127,6 +128,10 @@ export async function buildSuggestOverlayIndex(dataDir = defaultDataDir) {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => null);
     throw error;
   }
+}
+
+export async function buildSuggestOverlayIndex(dataDir = defaultDataDir) {
+  return withImportActivity(dataDir, 'suggestion overlay index build', () => buildSuggestOverlayIndexUnlocked(dataDir));
 }
 
 async function main() {

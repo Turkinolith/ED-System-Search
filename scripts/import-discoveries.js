@@ -2,6 +2,8 @@ import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { writeFileAtomic } from './atomic-file.js';
+import { withImportActivity } from './import-activity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.dirname(__dirname);
@@ -327,7 +329,7 @@ function countsBy(items, field) {
   return counts;
 }
 
-async function main() {
+async function importDiscoveries() {
   await fs.mkdir(dataDir, { recursive: true });
   const discoveries = [];
   const sourceSummaries = [];
@@ -371,11 +373,11 @@ async function main() {
     sources: sourceSummaries,
     places: unique,
   };
-  await fs.writeFile(outputPath, JSON.stringify(payload, null, 2));
+  await writeFileAtomic(outputPath, JSON.stringify(payload, null, 2));
   console.log(`Imported ${unique.length.toLocaleString()} discovery markers into ${outputPath}`);
 }
 
-main().catch((error) => {
+withImportActivity(dataDir, 'discoveries import', importDiscoveries).catch((error) => {
   console.error(error);
   process.exit(1);
 });

@@ -1,5 +1,6 @@
 import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
+import { withImportActivity } from './import-activity.js';
 
 const formatVersion = 1;
 const murderBinariesCategory = 'Murder Binaries';
@@ -107,7 +108,7 @@ function summarizeSources(data, discoveries, murderBinaries, greenGasGiants, pla
   };
 }
 
-export async function buildPlaceIndex(dataDir) {
+async function buildPlaceIndexUnlocked(dataDir) {
   const paths = sourcePaths(dataDir);
   const signatureBefore = await sourceSignature(dataDir);
   const [data, discoveries, murderBinaries, greenGasGiants] = await Promise.all([
@@ -172,6 +173,10 @@ export async function buildPlaceIndex(dataDir) {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => null);
     throw error;
   }
+}
+
+export async function buildPlaceIndex(dataDir) {
+  return withImportActivity(dataDir, 'place index build', () => buildPlaceIndexUnlocked(dataDir));
 }
 
 export async function readPlaceIndexMeta(dataDir) {

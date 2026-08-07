@@ -2,6 +2,8 @@ import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { writeFileAtomic } from './atomic-file.js';
+import { withImportActivity } from './import-activity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.dirname(__dirname);
@@ -254,7 +256,7 @@ function countsBy(places, field) {
   return counts;
 }
 
-async function main() {
+async function importPlaces() {
   await fs.mkdir(dataDir, { recursive: true });
   console.log(`Importing places from ${sourceArg}`);
   const text = await readSource(sourceArg);
@@ -272,11 +274,11 @@ async function main() {
     types: countsBy(places, 'type'),
     places,
   };
-  await fs.writeFile(path.join(dataDir, 'places.json'), JSON.stringify(payload, null, 2));
+  await writeFileAtomic(path.join(dataDir, 'places.json'), JSON.stringify(payload, null, 2));
   console.log(`Imported ${places.length.toLocaleString()} places.`);
 }
 
-main().catch((error) => {
+withImportActivity(dataDir, 'places import', importPlaces).catch((error) => {
   console.error(error);
   process.exit(1);
 });

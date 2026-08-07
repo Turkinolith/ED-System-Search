@@ -19,6 +19,10 @@ import { suggestKey } from './scripts/suggest-key.js';
 import { buildPlaceIndex, readPlaceIndexCategories, readPlaceIndexMeta } from './scripts/place-index.js';
 import { loadLocalConfig } from './local-config.js';
 import { createShutdownController } from './shutdown-guard.js';
+import { cleanupJunkFiles, DEFAULT_MIN_AGE_MS, describeCleanup } from './scripts/cleanup-junk.js';
+import { createCleanupScheduler } from './scripts/cleanup-scheduler.js';
+import { writeFileAtomic } from './scripts/atomic-file.js';
+import { withImportActivity } from './scripts/import-activity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
@@ -58,6 +62,10 @@ const spatialIndexPath = path.join(dataDir, 'systems-spatial.idx');
 const combinedPoiUrl = 'https://edastro.com/mapcharts/files/edsmPOI.csv';
 const appIdentity = 'ed-system-search';
 
+async function writeServerFileAtomic(filePath, data, label, options) {
+  return withImportActivity(dataDir, label, () => writeFileAtomic(filePath, data, options));
+}
+
 // Describe any long-running data write in progress, or null when idle. Used to
 // warn a second instance before it takes over the port and interrupts a write.
 function currentWriteActivity() {
@@ -72,18 +80,34 @@ function currentWriteActivity() {
   return null;
 }
 
-// Write via a temp file + rename so a crash or forced shutdown mid-write can
-// never leave a truncated/corrupt file in place of the real one.
-async function writeFileAtomic(filePath, data) {
-  const tmp = `${filePath}.${process.pid}.tmp`;
-  await fs.writeFile(tmp, data);
+// Remove import temps left behind by a crash or a killed import. Cleanup stays
+// age-gated and also honors cross-process activity leases created by importers.
+async function runJunkCleanup(reason, options = {}) {
+  if (currentWriteActivity()) return null;
   try {
-    await fs.rename(tmp, filePath);
+    const result = await cleanupJunkFiles({ rootDir: __dirname, dataDir, ...options });
+    if (result.errors.length) {
+      console.error(`[cleanup:${reason}] ${describeCleanup(result)}`);
+    } else if (result.removed.length || result.activeImports.length) {
+      console.log(`[cleanup:${reason}] ${describeCleanup(result)}`);
+    }
+    return result;
   } catch (error) {
-    await fs.rm(tmp, { force: true }).catch(() => {});
-    throw error;
+    console.error(`[cleanup:${reason}] failed: ${error.message}`);
+    return null;
   }
 }
+
+const junkCleanupScheduler = createCleanupScheduler({
+  runCleanup: runJunkCleanup,
+  defaultDelayMs: DEFAULT_MIN_AGE_MS + 1000,
+  retryDelayMs: 5 * 60 * 1000,
+});
+
+function scheduleJunkCleanup(reason, delayMs) {
+  junkCleanupScheduler.schedule(reason, delayMs);
+}
+
 const recordBytes = 32;
 const lodBytes = 20;
 const richIndexHeaderBytes = 32;
@@ -331,7 +355,7 @@ async function appendSystemUpdateLog(entry) {
     updatedAt: new Date().toISOString(),
     runs,
   };
-  await writeFileAtomic(systemUpdateLogPath, JSON.stringify(next, null, 2));
+  await writeServerFileAtomic(systemUpdateLogPath, JSON.stringify(next, null, 2), 'system update log write');
   return next;
 }
 
@@ -381,7 +405,7 @@ async function writeNotes(notes) {
     notes: notes.sort((a, b) => a.systemName.localeCompare(b.systemName)),
   };
   await fs.mkdir(dataDir, { recursive: true });
-  await writeFileAtomic(notesPath, JSON.stringify(payload, null, 2));
+  await writeServerFileAtomic(notesPath, JSON.stringify(payload, null, 2), 'system notes write');
   notesCache = null;
   return payload;
 }
@@ -2327,7 +2351,7 @@ async function refreshCarrierPlacesOnceDaily() {
         },
         places,
       };
-      await writeFileAtomic(placesPath, JSON.stringify(next, null, 2));
+      await writeServerFileAtomic(placesPath, JSON.stringify(next, null, 2), 'carrier place refresh write');
       placesCache = null;
     } catch (error) {
       const next = {
@@ -2340,7 +2364,7 @@ async function refreshCarrierPlacesOnceDaily() {
           sourceUrl: combinedPoiUrl,
         },
       };
-      await writeFileAtomic(placesPath, JSON.stringify(next, null, 2));
+      await writeServerFileAtomic(placesPath, JSON.stringify(next, null, 2), 'carrier refresh error write');
       placesCache = null;
     } finally {
       await rebuildPlaceIndex();
@@ -3426,6 +3450,11 @@ async function runSystemUpdate(reqUrl, res) {
       code: -1,
       stderr: `${systemUpdateStatus.stderr}\n${error.stack ?? error.message}`,
     };
+  }).then(() => {
+    // Clear already-old artifacts now, then revisit newly orphaned files after
+    // the safety threshold instead of globally deleting every fresh temp.
+    runJunkCleanup('post-update');
+    scheduleJunkCleanup('post-update-delayed');
   });
 
   return sendJson(res, { started: true, update: systemUpdateStatus }, 202);
@@ -3788,6 +3817,11 @@ async function start() {
     await listen(port);
   }
   console.log(`Elite Dangerous System Search running at http://localhost:${port}`);
+  // Fire and forget: a previous run may have been killed mid-import, and the
+  // stranded temps should not delay the port being served. Uses the default age
+  // threshold so a hand-run CLI import in another terminal keeps its temps.
+  runJunkCleanup('startup');
+  scheduleJunkCleanup('startup-delayed');
 }
 
 function gracefulExit(code) {
