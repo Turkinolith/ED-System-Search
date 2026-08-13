@@ -406,7 +406,7 @@ export function specialKind(typeName = '') {
   if (typeName.includes('Black Hole')) return 'blackHole';
   if (typeName.includes('Neutron')) return 'neutron';
   if (typeName.includes('White Dwarf')) return 'whiteDwarf';
-  if (typeName.includes('T Tauri') || typeName.includes('Herbig')) return 'triangle';
+  if (typeName.includes('T Tauri') || typeName.includes('Herbig')) return 'protostar';
   if (isGiantStarType(typeName)) return 'giant';
   if (/Wolf-Rayet|C Star|CJ Star|CN Star|S-type|MS-type/i.test(typeName)) return 'other';
   return '';
@@ -2441,6 +2441,25 @@ export class GalaxyRenderer {
     } else if (point.special === 'whiteDwarf') {
       ctx.rotate(Math.PI / 4);
       ctx.strokeRect(-4, -4, 8, 8);
+    } else if (point.special === 'protostar') {
+      // Young stars use a flare rather than a warning-like triangle. Keep this
+      // open so it remains readable over dense points and search rings.
+      const flareRadius = 7;
+      const diagonalRadius = 4.8;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(-flareRadius, 0);
+      ctx.lineTo(flareRadius, 0);
+      ctx.moveTo(0, -flareRadius);
+      ctx.lineTo(0, flareRadius);
+      ctx.moveTo(-diagonalRadius, -diagonalRadius);
+      ctx.lineTo(diagonalRadius, diagonalRadius);
+      ctx.moveTo(diagonalRadius, -diagonalRadius);
+      ctx.lineTo(-diagonalRadius, diagonalRadius);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(0, 0, 2.2, 0, Math.PI * 2);
+      ctx.stroke();
     } else if (point.special === 'triangle') {
       ctx.beginPath();
       ctx.moveTo(0, -7);

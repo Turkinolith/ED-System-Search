@@ -16,6 +16,8 @@ assert.ok(g.color[0] >= g.color[2], 'G stars should read white-warm.');
 assert.ok(m.color[0] > m.color[2], 'M stars should read orange-red.');
 assert.ok(t.size < m.size, 'T dwarfs should be more compact than M dwarfs.');
 assert.equal(young.style, 6, 'Herbig and T Tauri stars should use the young-star ray profile.');
+assert.equal(specialKind('T Tauri Star'), 'protostar', 'T Tauri stars should use the distinct protostar flare marker.');
+assert.equal(specialKind('Herbig Ae/Be Star'), 'protostar', 'Herbig stars should use the distinct protostar flare marker.');
 assert.ok(giant.size > m.size, 'Giants should be larger than their base spectral class.');
 assert.ok(supergiant.size > giant.size, 'Supergiants should be larger than giants.');
 assert.equal(isGiantStarType('M (Red giant) Star'), true, 'Giant stars should match the Giants preset.');
