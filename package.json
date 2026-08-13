@@ -17,6 +17,7 @@
     "import:systems-delta:finish": "npm run import:spatial-index && npm run import:journals",
     "import:galaxy": "node scripts/run-native-importer.js galaxy --source galaxy.json.gz",
     "import:galaxy:download": "node scripts/run-native-importer.js galaxy --source https://downloads.spansh.co.uk/galaxy.json.gz",
+    "repack:galaxy": "node scripts/run-native-importer.js galaxy-repack",
     "import:galaxy-filters": "node scripts/run-native-importer.js galaxy-filters",
     "build:green-gas-giants": "node scripts/run-native-importer.js green-gas-giants && npm run build:places-index",
     "import:galaxy-delta:1day": "node scripts/run-native-importer.js galaxy-delta --source https://downloads.spansh.co.uk/galaxy_1day.json.gz && npm run import:galaxy-filters",

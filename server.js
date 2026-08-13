@@ -217,6 +217,7 @@ let updateMetaCache = null;
 let updateIndexCache = null;
 let suggestOverlayIndexCache = null;
 let galaxyManifestCache = null;
+const richDictionaryCache = new Map();
 let journalBodiesCache = null;
 let carrierRefreshPromise = null;
 let placeIndexBuildPromise = null;
@@ -745,6 +746,28 @@ function galaxyDataPath(filename) {
   return path.join(galaxyDir, filename);
 }
 
+async function richDictionaryForSegment(segment) {
+  const descriptor = segment?.dictionary;
+  if (!descriptor) return null;
+  const file = String(descriptor.file ?? '');
+  const expectedBytes = Number(descriptor.bytes ?? 0);
+  const expectedId = Number(descriptor.dictId ?? 0);
+  if (!file || !Number.isSafeInteger(expectedBytes) || expectedBytes <= 0 || !Number.isInteger(expectedId) || expectedId <= 0) {
+    throw new Error(`Invalid rich galaxy dictionary descriptor for ${segment?.dataFile ?? 'segment'}.`);
+  }
+  const cacheKey = `${file}:${expectedBytes}:${expectedId}`;
+  if (!richDictionaryCache.has(cacheKey)) {
+    richDictionaryCache.set(cacheKey, (async () => {
+      const dictionary = await fs.readFile(galaxyDataPath(file));
+      if (dictionary.length !== expectedBytes) {
+        throw new Error(`Rich galaxy dictionary ${file} has an unexpected size.`);
+      }
+      return dictionary;
+    })());
+  }
+  return richDictionaryCache.get(cacheKey);
+}
+
 async function richIndexEntry(segment, id64) {
   const indexPath = galaxyDataPath(segment.indexFile);
   const fd = await fs.open(indexPath, 'r');
@@ -828,7 +851,8 @@ async function readRichSystem(reqUrl, res) {
         const compressed = Buffer.allocUnsafe(entry.compressedLength);
         const result = await fd.read(compressed, 0, compressed.length, Number(entry.offset));
         if (result.bytesRead !== compressed.length) throw new Error(`Truncated rich galaxy pack ${segment.dataFile}`);
-        const raw = zstdDecompressSync(compressed, { maxOutputLength: entry.rawLength });
+        const dictionary = await richDictionaryForSegment(segment);
+        const raw = zstdDecompressSync(compressed, { maxOutputLength: entry.rawLength, ...(dictionary ? { dictionary } : {}) });
         richResult = {
           segment,
           entry,
@@ -1223,7 +1247,8 @@ async function readRichSystemFromIndexResult(richIndexResult) {
     const compressed = Buffer.allocUnsafe(entry.compressedLength);
     const result = await fd.read(compressed, 0, compressed.length, Number(entry.offset));
     if (result.bytesRead !== compressed.length) throw new Error(`Truncated rich galaxy pack ${segment.dataFile}`);
-    const raw = zstdDecompressSync(compressed, { maxOutputLength: entry.rawLength });
+    const dictionary = await richDictionaryForSegment(segment);
+    const raw = zstdDecompressSync(compressed, { maxOutputLength: entry.rawLength, ...(dictionary ? { dictionary } : {}) });
     return {
       entry,
       segment,
@@ -3393,6 +3418,7 @@ async function runSystemUpdate(reqUrl, res) {
     updateIndexCache = null;
     suggestOverlayCache = null;
     galaxyManifestCache = null;
+    richDictionaryCache.clear();
     // Warm the heavy caches before clients see running:false, so their next
     // /api/status and /api/places calls don't stall on the re-parse.
     await getVisited().catch(() => null);

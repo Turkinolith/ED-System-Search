@@ -185,6 +185,22 @@ alter the rich database.
 The Data panel exposes the normal update workflows with progress and safeguards
 for large downloads. Equivalent command-line updates are:
 
+### Double-click updater
+
+On Windows, double-click `Update ED System Search.cmd` in the project folder to
+choose a system-map delta, rich-galaxy delta, journal refresh, or rebuild task.
+It runs only the selected data-import command; it does **not** start the web
+server. Choose **J** to import `galaxy.json.gz` already in the project folder,
+or **K** to paste/drag any other local galaxy-dump path; neither option
+downloads it again. Rich-data options build the native importer automatically
+when needed. The full-galaxy download remains a separately confirmed choice
+because it is a very large download.
+
+After a completed full-galaxy import, option **N** performs a source-free,
+dictionary-compression repack of the rich base pack. It does not download or
+parse `galaxy.json.gz` again, but it is long-running and needs substantial
+temporary disk space. The updater requires typing `REPACK` before it begins.
+
 ```powershell
 npm run import:systems-delta:1day
 npm run import:systems-delta:1week

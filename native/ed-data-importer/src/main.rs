@@ -331,6 +331,12 @@ fn main() -> Result<()> {
             compression_level: config.compression_level,
             batch_size: config.batch_size,
         }),
+        "galaxy-repack" => rich::repack(rich::RichRepackConfig {
+            data_dir: &config.data_dir,
+            threads: config.threads,
+            compression_level: config.compression_level,
+            batch_size: config.batch_size,
+        }),
         "galaxy-filters" => rich::rebuild_map_filters(&config.data_dir),
         "green-gas-giants" => ggg::run(ggg::GreenGasGiantConfig {
             data_dir: &config.data_dir,
@@ -348,7 +354,7 @@ fn main() -> Result<()> {
             threads: config.threads,
         }),
         _ => bail!(
-            "Unknown mode '{}'. Use full, delta, galaxy, galaxy-delta, galaxy-filters, green-gas-giants, murder-binaries, murder-index, or spatial-index.",
+            "Unknown mode '{}'. Use full, delta, galaxy, galaxy-delta, galaxy-repack, galaxy-filters, green-gas-giants, murder-binaries, murder-index, or spatial-index.",
             config.mode
         ),
     }
@@ -368,7 +374,7 @@ impl Config {
         let mut args = env::args().skip(1);
         let mode = args.next().ok_or_else(|| {
             anyhow!(
-                "Usage: ed-data-importer <full|delta|galaxy|galaxy-delta|galaxy-filters|green-gas-giants|murder-binaries|murder-index|spatial-index> [--source <path-or-url>] [--data-dir data] [--threads N] [--compression-level 1-19] [--batch-size N]"
+                "Usage: ed-data-importer <full|delta|galaxy|galaxy-delta|galaxy-repack|galaxy-filters|green-gas-giants|murder-binaries|murder-index|spatial-index> [--source <path-or-url>] [--data-dir data] [--threads N] [--compression-level 1-19] [--batch-size N]"
             )
         })?;
         let mut source = None;
@@ -423,6 +429,7 @@ impl Config {
         }
 
         let source = if mode == "galaxy-filters"
+            || mode == "galaxy-repack"
             || mode == "green-gas-giants"
             || mode == "murder-binaries"
             || mode == "murder-index"

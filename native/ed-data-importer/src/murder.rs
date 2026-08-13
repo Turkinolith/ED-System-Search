@@ -36,6 +36,16 @@ struct ManifestSegment {
     kind: String,
     data_file: String,
     index_file: String,
+    #[serde(default)]
+    dictionary: Option<Dictionary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Dictionary {
+    file: String,
+    bytes: u64,
+    dict_id: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -379,6 +389,7 @@ fn scan_segment(
         .with_context(|| format!("Cannot open {}", pack_path.display()))?;
     let mut reader = BufReader::with_capacity(32 * 1024 * 1024, file);
     validate_data_header(&mut reader)?;
+    let dictionary = load_dictionary(galaxy_dir, segment)?;
     let mut position = DATA_HEADER_BYTES;
     let mut batch = Vec::with_capacity(batch_size);
     let mut scanned = 0u64;
@@ -393,7 +404,7 @@ fn scan_segment(
         position += entry.compressed_len as u64;
         batch.push((entry, compressed));
         if batch.len() >= batch_size {
-            process_batch(pool, &mut batch, updated_at, matches)?;
+            process_batch(pool, &mut batch, dictionary.as_deref(), updated_at, matches)?;
         }
         scanned += 1;
         if scanned % 1_000_000 == 0 {
@@ -405,7 +416,7 @@ fn scan_segment(
         }
     }
     if !batch.is_empty() {
-        process_batch(pool, &mut batch, updated_at, matches)?;
+        process_batch(pool, &mut batch, dictionary.as_deref(), updated_at, matches)?;
     }
     Ok(())
 }
@@ -413,6 +424,7 @@ fn scan_segment(
 fn process_batch(
     pool: &rayon::ThreadPool,
     batch: &mut Vec<(PackEntry, Vec<u8>)>,
+    dictionary: Option<&[u8]>,
     updated_at: &str,
     matches: &mut FxHashMap<u64, MurderPlace>,
 ) -> Result<()> {
@@ -420,7 +432,12 @@ fn process_batch(
         batch
             .par_iter()
             .map(|(entry, compressed)| -> Result<(u64, Option<MurderPlace>)> {
-                let raw = zstd::bulk::decompress(compressed, entry.raw_len as usize)
+                let raw = match dictionary {
+                    Some(dictionary) => zstd::bulk::Decompressor::with_dictionary(dictionary)
+                        .context("Could not load the rich galaxy dictionary")?
+                        .decompress(compressed, entry.raw_len as usize),
+                    None => zstd::bulk::decompress(compressed, entry.raw_len as usize),
+                }
                     .context("Could not decompress a rich galaxy record")?;
                 let system: RichSystem = serde_json::from_slice(&raw)
                     .context("Could not parse a rich galaxy record")?;
@@ -438,6 +455,16 @@ fn process_batch(
     }
     batch.clear();
     Ok(())
+}
+
+fn load_dictionary(galaxy_dir: &Path, segment: &ManifestSegment) -> Result<Option<Vec<u8>>> {
+    let Some(descriptor) = &segment.dictionary else { return Ok(None); };
+    if Path::new(&descriptor.file).file_name().is_none() { bail!("Invalid rich galaxy dictionary filename."); }
+    let path = galaxy_dir.join(&descriptor.file);
+    let dictionary = fs::read(&path).with_context(|| format!("Could not read {}", path.display()))?;
+    if dictionary.len() as u64 != descriptor.bytes { bail!("Rich galaxy dictionary has an unexpected size."); }
+    if zstd::zstd_safe::get_dict_id_from_dict(&dictionary).map(|id| id.get()) != Some(descriptor.dict_id) { bail!("Rich galaxy dictionary has an unexpected dictionary ID."); }
+    Ok(Some(dictionary))
 }
 
 fn murder_place(id64: u64, system: RichSystem, updated_at: &str) -> Option<MurderPlace> {

@@ -27,7 +27,11 @@ struct Manifest { updated_at: String, segments: Vec<Segment> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Segment { kind: String, data_file: String, index_file: String }
+struct Segment { kind: String, data_file: String, index_file: String, #[serde(default)] dictionary: Option<Dictionary> }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Dictionary { file: String, bytes: u64, dict_id: u32 }
 
 #[derive(Clone, Copy)]
 struct Entry { id64: u64, offset: u64, compressed_len: u32, raw_len: u32 }
@@ -131,21 +135,27 @@ fn scan_segment(galaxy_dir: &Path, segment: &Segment, pool: &rayon::ThreadPool, 
     pool.install(|| entries.par_sort_unstable_by_key(|entry| entry.offset));
     let mut reader = BufReader::with_capacity(32 * 1024 * 1024, File::open(galaxy_dir.join(&segment.data_file))?);
     validate_data_header(&mut reader)?;
+    let dictionary = load_dictionary(galaxy_dir, segment)?;
     let mut position = DATA_HEADER_BYTES; let mut batch = Vec::with_capacity(batch_size); let mut scanned = 0u64;
     for entry in entries {
         if position != entry.offset { reader.seek(SeekFrom::Start(entry.offset))?; position = entry.offset; }
         let mut compressed = vec![0; entry.compressed_len as usize]; reader.read_exact(&mut compressed)?; position += entry.compressed_len as u64;
         batch.push((entry, compressed)); scanned += 1;
-        if batch.len() >= batch_size { process_batch(pool, &mut batch, candidates, known)?; }
+        if batch.len() >= batch_size { process_batch(pool, &mut batch, dictionary.as_deref(), candidates, known)?; }
         if scanned % 1_000_000 == 0 { println!("Scanned {} systems; {} strict candidates...", scanned, candidates.len()); }
     }
-    if !batch.is_empty() { process_batch(pool, &mut batch, candidates, known)?; }
+    if !batch.is_empty() { process_batch(pool, &mut batch, dictionary.as_deref(), candidates, known)?; }
     Ok(())
 }
 
-fn process_batch(pool: &rayon::ThreadPool, batch: &mut Vec<(Entry, Vec<u8>)>, candidates: &mut FxHashMap<u64, Record>, known: &mut FxHashMap<String, Record>) -> Result<()> {
+fn process_batch(pool: &rayon::ThreadPool, batch: &mut Vec<(Entry, Vec<u8>)>, dictionary: Option<&[u8]>, candidates: &mut FxHashMap<u64, Record>, known: &mut FxHashMap<String, Record>) -> Result<()> {
     let results = pool.install(|| batch.par_iter().map(|(entry, compressed)| -> Result<(u64, RichSystem)> {
-        let raw = zstd::bulk::decompress(compressed, entry.raw_len as usize).context("Could not decompress a rich galaxy record")?;
+        let raw = match dictionary {
+            Some(dictionary) => zstd::bulk::Decompressor::with_dictionary(dictionary)
+                .context("Could not load the rich galaxy dictionary")?
+                .decompress(compressed, entry.raw_len as usize),
+            None => zstd::bulk::decompress(compressed, entry.raw_len as usize),
+        }.context("Could not decompress a rich galaxy record")?;
         Ok((entry.id64, serde_json::from_slice(&raw).context("Could not parse a rich galaxy record")?))
     }).collect::<Vec<_>>());
     for result in results {
@@ -155,6 +165,16 @@ fn process_batch(pool: &rayon::ThreadPool, batch: &mut Vec<(Entry, Vec<u8>)>, ca
         candidates.insert(id64, Record { id64: Some(id64.to_string()), name: system.name, coords: system.coords, classification: "candidate", known: known_record.is_some(), confidence: "very-high", bodies: matches, poi_names: known_record.and_then(|item| item.poi_names) });
     }
     batch.clear(); Ok(())
+}
+
+fn load_dictionary(galaxy_dir: &Path, segment: &Segment) -> Result<Option<Vec<u8>>> {
+    let Some(descriptor) = &segment.dictionary else { return Ok(None); };
+    if std::path::Path::new(&descriptor.file).file_name().is_none() { bail!("Invalid rich galaxy dictionary filename."); }
+    let path = galaxy_dir.join(&descriptor.file);
+    let dictionary = fs::read(&path).with_context(|| format!("Could not read {}", path.display()))?;
+    if dictionary.len() as u64 != descriptor.bytes { bail!("Rich galaxy dictionary has an unexpected size."); }
+    if zstd::zstd_safe::get_dict_id_from_dict(&dictionary).map(|id| id.get()) != Some(descriptor.dict_id) { bail!("Rich galaxy dictionary has an unexpected dictionary ID."); }
+    Ok(Some(dictionary))
 }
 
 fn matched_bodies(bodies: &[Body]) -> Vec<BodyMatch> {

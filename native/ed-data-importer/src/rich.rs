@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -17,6 +17,10 @@ const DATA_HEADER_BYTES: u64 = 16;
 const INDEX_HEADER_BYTES: u64 = 32;
 const INDEX_RECORD_BYTES: u32 = 68;
 const FILTER_RECORD_BYTES: u32 = 40;
+const REPACK_BUCKET_COUNT: usize = 256;
+const REPACK_DICTIONARY_BYTES: usize = 112_640;
+const REPACK_DICTIONARY_SAMPLES: usize = 4_096;
+const REPACK_VERIFY_SAMPLES: usize = 64;
 const SYSTEM_RECORD_BYTES: usize = 32;
 const LOD_RECORD_BYTES: usize = 20;
 const UNKNOWN_UPDATE_SECONDS: u32 = u32::MAX;
@@ -127,6 +131,13 @@ pub(crate) struct RichImportConfig<'a> {
     pub batch_size: usize,
 }
 
+pub(crate) struct RichRepackConfig<'a> {
+    pub data_dir: &'a Path,
+    pub threads: usize,
+    pub compression_level: i32,
+    pub batch_size: usize,
+}
+
 #[derive(Clone)]
 struct PendingRecord {
     id64: u64,
@@ -196,11 +207,21 @@ struct ManifestSegment {
     compression: String,
     compression_level: i32,
     #[serde(default)]
+    dictionary: Option<DictionaryManifest>,
+    #[serde(default)]
     min_update_time: Option<String>,
     #[serde(default)]
     max_update_time: Option<String>,
     #[serde(default)]
     summary: Value,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DictionaryManifest {
+    file: String,
+    bytes: u64,
+    dict_id: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -291,6 +312,11 @@ pub(crate) fn run(config: RichImportConfig<'_>) -> Result<()> {
             "Cannot import a galaxy delta before a base galaxy import. Run the galaxy mode first."
         );
     }
+    let compression_dictionary = if config.delta {
+        dictionary_from_manifest(&rich_dir, previous_manifest.as_ref())?
+    } else {
+        None
+    };
 
     let imported_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let file_stem = if config.delta {
@@ -348,6 +374,7 @@ pub(crate) fn run(config: RichImportConfig<'_>) -> Result<()> {
                     &mut offset,
                     &mut batch,
                     config.compression_level,
+                    compression_dictionary.as_ref().map(|(bytes, _)| bytes.as_slice()),
                 )?;
             }
             if input_count % 100_000 == 0 {
@@ -367,6 +394,7 @@ pub(crate) fn run(config: RichImportConfig<'_>) -> Result<()> {
                 &mut offset,
                 &mut batch,
                 config.compression_level,
+                compression_dictionary.as_ref().map(|(bytes, _)| bytes.as_slice()),
             )?;
         }
         writer.flush()?;
@@ -405,6 +433,7 @@ pub(crate) fn run(config: RichImportConfig<'_>) -> Result<()> {
                 index_bytes,
                 compression: "zstd".to_string(),
                 compression_level: config.compression_level,
+                dictionary: compression_dictionary.as_ref().map(|(_, descriptor)| descriptor.clone()),
                 min_update_time: seconds_to_iso(min_update),
                 max_update_time: seconds_to_iso(max_update),
                 summary: serde_json::to_value(summary)?,
@@ -474,12 +503,20 @@ fn remove_superseded_segments(
     let retained = current
         .segments
         .iter()
-        .flat_map(|segment| [&segment.data_file, &segment.index_file])
+        .flat_map(|segment| {
+            std::iter::once(&segment.data_file)
+                .chain(std::iter::once(&segment.index_file))
+                .chain(segment.dictionary.as_ref().map(|dictionary| &dictionary.file))
+        })
         .collect::<std::collections::HashSet<_>>();
     for filename in previous
         .segments
         .iter()
-        .flat_map(|segment| [&segment.data_file, &segment.index_file])
+        .flat_map(|segment| {
+            std::iter::once(&segment.data_file)
+                .chain(std::iter::once(&segment.index_file))
+                .chain(segment.dictionary.as_ref().map(|dictionary| &dictionary.file))
+        })
     {
         if retained.contains(filename) || Path::new(filename).file_name().is_none() {
             continue;
@@ -487,6 +524,489 @@ fn remove_superseded_segments(
         let path = rich_dir.join(filename);
         if path.parent() == Some(rich_dir) && path.exists() {
             fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn dictionary_from_manifest(
+    rich_dir: &Path,
+    manifest: Option<&Manifest>,
+) -> Result<Option<(Vec<u8>, DictionaryManifest)>> {
+    let Some(descriptor) = manifest
+        .and_then(|manifest| manifest.segments.iter().find_map(|segment| segment.dictionary.clone()))
+    else {
+        return Ok(None);
+    };
+    if Path::new(&descriptor.file).file_name().is_none() {
+        bail!("Invalid rich galaxy dictionary filename in manifest.");
+    }
+    let path = rich_dir.join(&descriptor.file);
+    let dictionary = fs::read(&path)
+        .with_context(|| format!("Could not read rich galaxy dictionary {}", path.display()))?;
+    if dictionary.len() as u64 != descriptor.bytes {
+        bail!("Rich galaxy dictionary {} has an unexpected size.", path.display());
+    }
+    let dictionary_id = zstd::zstd_safe::get_dict_id_from_dict(&dictionary)
+        .map(|value| value.get())
+        .ok_or_else(|| anyhow!("Rich galaxy dictionary {} is invalid.", path.display()))?;
+    if dictionary_id != descriptor.dict_id {
+        bail!("Rich galaxy dictionary {} has an unexpected dictionary ID.", path.display());
+    }
+    Ok(Some((dictionary, descriptor)))
+}
+
+pub(crate) fn repack(config: RichRepackConfig<'_>) -> Result<()> {
+    let rich_dir = config.data_dir.join("galaxy");
+    let manifest_path = rich_dir.join("manifest.json");
+    let mut manifest: Manifest = serde_json::from_reader(
+        File::open(&manifest_path).context("Could not read the rich galaxy manifest")?,
+    )?;
+    if manifest.segments.len() != 1 || manifest.segments[0].kind != "base" {
+        bail!(
+            "The dictionary repack currently requires one base galaxy segment and no deltas. Import or consolidate deltas first."
+        );
+    }
+    let original = manifest.segments[0].clone();
+    if original.dictionary.is_some() {
+        bail!("The current rich galaxy base already uses a dictionary; no repack is needed.");
+    }
+    let source_pack = rich_dir.join(&original.data_file);
+    let source_index = rich_dir.join(&original.index_file);
+    let source_bytes = fs::metadata(&source_pack)
+        .with_context(|| format!("Could not inspect {}", source_pack.display()))?
+        .len();
+    if source_bytes != original.data_bytes {
+        bail!("Rich galaxy pack size does not match its manifest; refusing to repack it.");
+    }
+
+    let started = Instant::now();
+    let tag = Utc::now().timestamp_millis();
+    let work_dir = rich_dir.join(format!(".repack-{tag}.tmp"));
+    fs::create_dir(&work_dir)?;
+    let result = repack_impl(
+        &mut manifest,
+        &rich_dir,
+        &source_pack,
+        &source_index,
+        &work_dir,
+        config,
+    );
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(error);
+    }
+    let new_segment = manifest.segments.first().expect("repack retains base segment");
+    println!(
+        "Rich galaxy dictionary repack complete: {} systems, {:.1} GiB packed, {:.1} GiB index in {} seconds.",
+        format_count(new_segment.count),
+        new_segment.data_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+        new_segment.index_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+        started.elapsed().as_secs()
+    );
+    Ok(())
+}
+
+fn repack_impl(
+    manifest: &mut Manifest,
+    rich_dir: &Path,
+    source_pack: &Path,
+    source_index: &Path,
+    work_dir: &Path,
+    config: RichRepackConfig<'_>,
+) -> Result<()> {
+    let original = manifest.segments[0].clone();
+    let dictionary = train_repack_dictionary(source_pack, source_index, original.count)?;
+    let dictionary_id = zstd::zstd_safe::get_dict_id_from_dict(&dictionary)
+        .map(|value| value.get())
+        .ok_or_else(|| anyhow!("The trained rich galaxy dictionary is invalid."))?;
+    let tag = Utc::now().timestamp_millis();
+    let data_file = format!("base-dict-{tag}.pack");
+    let index_file = format!("base-dict-{tag}.idx");
+    let dictionary_file = format!("base-dict-{tag}.dict");
+    let temp_data = work_dir.join(&data_file);
+    let temp_index = work_dir.join(&index_file);
+    let temp_dictionary = work_dir.join(&dictionary_file);
+    fs::write(&temp_dictionary, &dictionary)?;
+
+    println!("Preparing bounded sequential-read shards for {} rich index entries...", format_count(original.count));
+    distribute_repack_order(source_index, work_dir, original.count, original.data_bytes)?;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.threads)
+        .build()
+        .context("Could not create dictionary repack compression worker pool")?;
+    let mut data_writer = BufWriter::with_capacity(32 * 1024 * 1024, File::create(&temp_data)?);
+    write_data_header(&mut data_writer)?;
+    let mut mapping_writers = open_repack_mapping_writers(work_dir)?;
+    let mut output_offset = DATA_HEADER_BYTES;
+    let mut processed = 0u64;
+    let mut source_reader = BufReader::with_capacity(32 * 1024 * 1024, File::open(source_pack)?);
+    validate_data_header(&mut source_reader, source_pack)?;
+
+    for bucket in 0..REPACK_BUCKET_COUNT {
+        let entries = read_repack_order_bucket(work_dir, bucket)?;
+        if entries.is_empty() {
+            continue;
+        }
+        let bucket_count = entries.len() as u64;
+        let mut batch = Vec::with_capacity(config.batch_size);
+        let mut position = 0u64;
+        for item in entries {
+            if position != item.entry.offset {
+                source_reader.seek(SeekFrom::Start(item.entry.offset))?;
+                position = item.entry.offset;
+            }
+            let mut compressed = vec![0u8; item.entry.compressed_len as usize];
+            source_reader.read_exact(&mut compressed)?;
+            position += item.entry.compressed_len as u64;
+            let raw = zstd::bulk::decompress(&compressed, item.entry.raw_len as usize)
+                .context("Could not decompress a source rich galaxy record during repack")?;
+            batch.push(RepackRecord { ordinal: item.ordinal, raw });
+            if batch.len() >= config.batch_size {
+                write_repack_batch(
+                    &pool,
+                    &mut data_writer,
+                    &mut mapping_writers,
+                    &mut output_offset,
+                    &mut batch,
+                    &dictionary,
+                    config.compression_level,
+                    original.count,
+                )?;
+            }
+        }
+        if !batch.is_empty() {
+            write_repack_batch(
+                &pool,
+                &mut data_writer,
+                &mut mapping_writers,
+                &mut output_offset,
+                &mut batch,
+                &dictionary,
+                config.compression_level,
+                original.count,
+            )?;
+        }
+        processed += bucket_count;
+        println!("Repacked {} / {} systems...", format_count(processed), format_count(original.count));
+    }
+    if processed != original.count {
+        bail!("The dictionary repack processed {processed} records but expected {}.", original.count);
+    }
+    data_writer.flush()?;
+    for writer in &mut mapping_writers {
+        writer.flush()?;
+    }
+
+    println!("Writing the updated rich index in system-ID order...");
+    write_repacked_index(source_index, &temp_index, work_dir, original.count)?;
+    verify_repacked_samples(
+        source_pack,
+        source_index,
+        &temp_data,
+        &temp_index,
+        &dictionary,
+        original.count,
+    )?;
+
+    let final_data = rich_dir.join(&data_file);
+    let final_index = rich_dir.join(&index_file);
+    let final_dictionary = rich_dir.join(&dictionary_file);
+    fs::rename(&temp_data, &final_data)?;
+    fs::rename(&temp_index, &final_index)?;
+    fs::rename(&temp_dictionary, &final_dictionary)?;
+    let data_bytes = fs::metadata(&final_data)?.len();
+    let index_bytes = fs::metadata(&final_index)?.len();
+    let mut replacement = original.clone();
+    replacement.data_file = data_file;
+    replacement.index_file = index_file;
+    replacement.data_bytes = data_bytes;
+    replacement.index_bytes = index_bytes;
+    replacement.compression = "zstd-dictionary".to_string();
+    replacement.compression_level = config.compression_level;
+    replacement.dictionary = Some(DictionaryManifest {
+        file: dictionary_file,
+        bytes: dictionary.len() as u64,
+        dict_id: dictionary_id,
+    });
+    manifest.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    manifest.segments = vec![replacement];
+    let manifest_path = rich_dir.join("manifest.json");
+    write_manifest(&manifest_path, manifest)?;
+    remove_superseded_segments(rich_dir, Some(&Manifest {
+        format_version: manifest.format_version,
+        schema_url: manifest.schema_url.clone(),
+        updated_at: original.imported_at.clone(),
+        index_header_bytes: manifest.index_header_bytes,
+        index_record_bytes: manifest.index_record_bytes,
+        data_header_bytes: manifest.data_header_bytes,
+        map_filters: None,
+        segments: vec![original],
+    }), manifest)?;
+    fs::remove_dir_all(work_dir)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RepackOrderEntry {
+    ordinal: u64,
+    entry: IndexEntry,
+}
+
+struct RepackRecord {
+    ordinal: u64,
+    raw: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct RepackMapping {
+    ordinal: u64,
+    offset: u64,
+    compressed_len: u32,
+}
+
+fn repack_bucket(value: u64, total: u64) -> usize {
+    ((value.saturating_mul(REPACK_BUCKET_COUNT as u64) / total)
+        .min(REPACK_BUCKET_COUNT as u64 - 1)) as usize
+}
+
+fn repack_order_path(work_dir: &Path, bucket: usize) -> PathBuf {
+    work_dir.join(format!("pack-order-{bucket:03}.bin"))
+}
+
+fn repack_mapping_path(work_dir: &Path, bucket: usize) -> PathBuf {
+    work_dir.join(format!("index-map-{bucket:03}.bin"))
+}
+
+fn validate_data_header(reader: &mut BufReader<File>, path: &Path) -> Result<()> {
+    let mut header = [0u8; DATA_HEADER_BYTES as usize];
+    reader.read_exact(&mut header)?;
+    if &header[..8] != DATA_MAGIC || u32::from_le_bytes(header[8..12].try_into().unwrap()) != FORMAT_VERSION {
+        bail!("Unsupported rich galaxy pack format in {}", path.display());
+    }
+    Ok(())
+}
+
+fn write_index_entry(writer: &mut BufWriter<File>, entry: &IndexEntry) -> Result<()> {
+    writer.write_all(&entry.id64.to_le_bytes())?;
+    writer.write_all(&entry.offset.to_le_bytes())?;
+    writer.write_all(&entry.compressed_len.to_le_bytes())?;
+    writer.write_all(&entry.raw_len.to_le_bytes())?;
+    writer.write_all(&entry.update_seconds.to_le_bytes())?;
+    writer.write_all(&entry.body_count.to_le_bytes())?;
+    writer.write_all(&entry.station_count.to_le_bytes())?;
+    writer.write_all(&entry.flags.to_le_bytes())?;
+    writer.write_all(&entry.body_types.to_le_bytes())?;
+    writer.write_all(&entry.atmosphere_types.to_le_bytes())?;
+    writer.write_all(&entry.ring_types.to_le_bytes())?;
+    writer.write_all(&entry.volcanism_types.to_le_bytes())?;
+    writer.write_all(&entry.economy_types.to_le_bytes())?;
+    writer.write_all(&entry.security_types.to_le_bytes())?;
+    writer.write_all(&entry.government_types.to_le_bytes())?;
+    Ok(())
+}
+
+fn train_repack_dictionary(source_pack: &Path, source_index: &Path, count: u64) -> Result<Vec<u8>> {
+    println!("Training a shared rich-galaxy dictionary from {} representative records...", REPACK_DICTIONARY_SAMPLES);
+    let mut index_reader = BufReader::with_capacity(8 * 1024 * 1024, File::open(source_index)?);
+    let (record_bytes, indexed_count) = read_index_header(&mut index_reader, source_index)?;
+    if indexed_count != count {
+        bail!("Rich galaxy index count does not match its manifest; refusing to repack it.");
+    }
+    let mut pack_reader = BufReader::with_capacity(32 * 1024 * 1024, File::open(source_pack)?);
+    validate_data_header(&mut pack_reader, source_pack)?;
+    let sample_count = usize::try_from(count.min(REPACK_DICTIONARY_SAMPLES as u64)).unwrap();
+    let mut record = vec![0u8; record_bytes as usize];
+    let mut samples = Vec::with_capacity(sample_count);
+    for sample in 0..sample_count {
+        let ordinal = ((sample as u64 + 1) * count / (sample_count as u64 + 1)).min(count - 1);
+        index_reader.seek(SeekFrom::Start(INDEX_HEADER_BYTES + ordinal * record_bytes as u64))?;
+        index_reader.read_exact(&mut record)?;
+        let entry = read_index_entry(&record);
+        pack_reader.seek(SeekFrom::Start(entry.offset))?;
+        let mut compressed = vec![0u8; entry.compressed_len as usize];
+        pack_reader.read_exact(&mut compressed)?;
+        samples.push(
+            zstd::bulk::decompress(&compressed, entry.raw_len as usize)
+                .context("Could not decompress a dictionary-training record")?,
+        );
+    }
+    zstd::dict::from_samples(&samples, REPACK_DICTIONARY_BYTES)
+        .context("Could not train the rich galaxy dictionary")
+}
+
+fn distribute_repack_order(
+    source_index: &Path,
+    work_dir: &Path,
+    count: u64,
+    data_bytes: u64,
+) -> Result<()> {
+    let mut writers = (0..REPACK_BUCKET_COUNT)
+        .map(|bucket| File::create(repack_order_path(work_dir, bucket)).map(|file| BufWriter::with_capacity(256 * 1024, file)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut reader = BufReader::with_capacity(32 * 1024 * 1024, File::open(source_index)?);
+    let (record_bytes, indexed_count) = read_index_header(&mut reader, source_index)?;
+    if indexed_count != count {
+        bail!("Rich galaxy index count does not match its manifest; refusing to repack it.");
+    }
+    let mut record = vec![0u8; record_bytes as usize];
+    for ordinal in 0..count {
+        reader.read_exact(&mut record)?;
+        let entry = read_index_entry(&record);
+        let bucket = repack_bucket(entry.offset, data_bytes);
+        writers[bucket].write_all(&ordinal.to_le_bytes())?;
+        writers[bucket].write_all(&record)?;
+    }
+    for writer in &mut writers {
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn read_repack_order_bucket(work_dir: &Path, bucket: usize) -> Result<Vec<RepackOrderEntry>> {
+    let bytes = fs::read(repack_order_path(work_dir, bucket))?;
+    let item_bytes = 8 + INDEX_RECORD_BYTES as usize;
+    if bytes.len() % item_bytes != 0 {
+        bail!("A dictionary repack pack-order shard is truncated.");
+    }
+    let mut entries = bytes
+        .chunks_exact(item_bytes)
+        .map(|item| RepackOrderEntry {
+            ordinal: u64::from_le_bytes(item[..8].try_into().unwrap()),
+            entry: read_index_entry(&item[8..]),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|item| item.entry.offset);
+    Ok(entries)
+}
+
+fn open_repack_mapping_writers(work_dir: &Path) -> Result<Vec<BufWriter<File>>> {
+    (0..REPACK_BUCKET_COUNT)
+        .map(|bucket| File::create(repack_mapping_path(work_dir, bucket)).map(|file| BufWriter::with_capacity(256 * 1024, file)).map_err(Into::into))
+        .collect()
+}
+
+fn write_repack_batch(
+    pool: &rayon::ThreadPool,
+    data_writer: &mut BufWriter<File>,
+    mapping_writers: &mut [BufWriter<File>],
+    output_offset: &mut u64,
+    batch: &mut Vec<RepackRecord>,
+    dictionary: &[u8],
+    compression_level: i32,
+    total: u64,
+) -> Result<()> {
+    let compressed = compress_records(
+        pool,
+        batch.iter().map(|record| record.raw.as_slice()).collect(),
+        compression_level,
+        Some(dictionary),
+    )?;
+    for (record, compressed) in batch.iter().zip(compressed) {
+        let compressed_len = u32::try_from(compressed.len())
+            .context("One dictionary-compressed galaxy record exceeded 4 GiB")?;
+        data_writer.write_all(&compressed)?;
+        let writer = &mut mapping_writers[repack_bucket(record.ordinal, total)];
+        writer.write_all(&record.ordinal.to_le_bytes())?;
+        writer.write_all(&output_offset.to_le_bytes())?;
+        writer.write_all(&compressed_len.to_le_bytes())?;
+        *output_offset += compressed.len() as u64;
+    }
+    batch.clear();
+    Ok(())
+}
+
+fn write_repacked_index(source_index: &Path, output_index: &Path, work_dir: &Path, count: u64) -> Result<()> {
+    let mut source_reader = BufReader::with_capacity(32 * 1024 * 1024, File::open(source_index)?);
+    let (record_bytes, indexed_count) = read_index_header(&mut source_reader, source_index)?;
+    if indexed_count != count {
+        bail!("Rich galaxy index count changed while the dictionary repack was running.");
+    }
+    let mut writer = BufWriter::with_capacity(32 * 1024 * 1024, File::create(output_index)?);
+    writer.write_all(INDEX_MAGIC)?;
+    writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
+    writer.write_all(&INDEX_RECORD_BYTES.to_le_bytes())?;
+    writer.write_all(&count.to_le_bytes())?;
+    writer.write_all(&0u64.to_le_bytes())?;
+    let mut original = vec![0u8; record_bytes as usize];
+    let mut expected = 0u64;
+    for bucket in 0..REPACK_BUCKET_COUNT {
+        let bytes = fs::read(repack_mapping_path(work_dir, bucket))?;
+        if bytes.len() % 20 != 0 {
+            bail!("A dictionary repack index-map shard is truncated.");
+        }
+        let mut mappings = bytes
+            .chunks_exact(20)
+            .map(|item| RepackMapping {
+                ordinal: u64::from_le_bytes(item[..8].try_into().unwrap()),
+                offset: u64::from_le_bytes(item[8..16].try_into().unwrap()),
+                compressed_len: u32::from_le_bytes(item[16..20].try_into().unwrap()),
+            })
+            .collect::<Vec<_>>();
+        mappings.sort_unstable_by_key(|item| item.ordinal);
+        for mapping in mappings {
+            if mapping.ordinal != expected {
+                bail!("Dictionary repack index-map shards are incomplete or duplicated.");
+            }
+            source_reader.read_exact(&mut original)?;
+            let mut entry = read_index_entry(&original);
+            entry.offset = mapping.offset;
+            entry.compressed_len = mapping.compressed_len;
+            write_index_entry(&mut writer, &entry)?;
+            expected += 1;
+        }
+    }
+    if expected != count {
+        bail!("Dictionary repack produced {expected} index rows but expected {count}.");
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_index_entry_at(reader: &mut BufReader<File>, ordinal: u64) -> Result<IndexEntry> {
+    reader.seek(SeekFrom::Start(INDEX_HEADER_BYTES + ordinal * INDEX_RECORD_BYTES as u64))?;
+    let mut record = [0u8; INDEX_RECORD_BYTES as usize];
+    reader.read_exact(&mut record)?;
+    Ok(read_index_entry(&record))
+}
+
+fn verify_repacked_samples(
+    source_pack: &Path,
+    source_index: &Path,
+    repacked_pack: &Path,
+    repacked_index: &Path,
+    dictionary: &[u8],
+    count: u64,
+) -> Result<()> {
+    println!("Verifying {} representative rich records before publishing the repack...", REPACK_VERIFY_SAMPLES);
+    let mut old_index = BufReader::with_capacity(8 * 1024 * 1024, File::open(source_index)?);
+    let mut new_index = BufReader::with_capacity(8 * 1024 * 1024, File::open(repacked_index)?);
+    read_index_header(&mut old_index, source_index)?;
+    read_index_header(&mut new_index, repacked_index)?;
+    let mut old_pack = BufReader::with_capacity(32 * 1024 * 1024, File::open(source_pack)?);
+    let mut new_pack = BufReader::with_capacity(32 * 1024 * 1024, File::open(repacked_pack)?);
+    validate_data_header(&mut old_pack, source_pack)?;
+    validate_data_header(&mut new_pack, repacked_pack)?;
+    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dictionary)
+        .context("Could not create rich galaxy dictionary decompressor")?;
+    for sample in 0..REPACK_VERIFY_SAMPLES.min(count as usize) {
+        let ordinal = ((sample as u64 + 1) * count / (REPACK_VERIFY_SAMPLES.min(count as usize) as u64 + 1)).min(count - 1);
+        let old = read_index_entry_at(&mut old_index, ordinal)?;
+        let new = read_index_entry_at(&mut new_index, ordinal)?;
+        if old.id64 != new.id64 || old.raw_len != new.raw_len {
+            bail!("Dictionary repack verification found a changed rich index record.");
+        }
+        let mut old_compressed = vec![0u8; old.compressed_len as usize];
+        old_pack.seek(SeekFrom::Start(old.offset))?;
+        old_pack.read_exact(&mut old_compressed)?;
+        let old_raw = zstd::bulk::decompress(&old_compressed, old.raw_len as usize)?;
+        let mut new_compressed = vec![0u8; new.compressed_len as usize];
+        new_pack.seek(SeekFrom::Start(new.offset))?;
+        new_pack.read_exact(&mut new_compressed)?;
+        let new_raw = decompressor.decompress(&new_compressed, new.raw_len as usize)?;
+        if old_raw != new_raw {
+            bail!("Dictionary repack verification found a changed rich system payload.");
         }
     }
     Ok(())
@@ -843,18 +1363,10 @@ fn compress_batch(
     offset: &mut u64,
     batch: &mut Vec<PendingRecord>,
     compression_level: i32,
+    dictionary: Option<&[u8]>,
 ) -> Result<()> {
-    let compressed = pool.install(|| {
-        batch
-            .par_iter()
-            .map(|record| {
-                zstd::bulk::compress(&record.raw, compression_level)
-                    .context("Could not compress rich galaxy record")
-            })
-            .collect::<Vec<_>>()
-    });
+    let compressed = compress_records(pool, batch.iter().map(|record| record.raw.as_slice()).collect(), compression_level, dictionary)?;
     for (record, compressed) in batch.iter().zip(compressed) {
-        let compressed = compressed?;
         let compressed_len = u32::try_from(compressed.len())
             .context("One compressed galaxy record exceeded 4 GiB")?;
         let raw_len =
@@ -881,6 +1393,37 @@ fn compress_batch(
     }
     batch.clear();
     Ok(())
+}
+
+fn compress_records(
+    pool: &rayon::ThreadPool,
+    records: Vec<&[u8]>,
+    compression_level: i32,
+    dictionary: Option<&[u8]>,
+) -> Result<Vec<Vec<u8>>> {
+    let compressed = pool.install(|| match dictionary {
+        Some(dictionary) => records
+            .par_iter()
+            .map_init(
+                || zstd::bulk::Compressor::with_dictionary(compression_level, dictionary),
+                |compressor, record| {
+                    compressor
+                        .as_mut()
+                        .map_err(|error| anyhow!("Could not create rich galaxy dictionary compressor: {error}"))?
+                        .compress(record)
+                        .context("Could not compress rich galaxy record")
+                },
+            )
+            .collect::<Vec<_>>(),
+        None => records
+            .par_iter()
+            .map(|record| {
+                zstd::bulk::compress(record, compression_level)
+                    .context("Could not compress rich galaxy record")
+            })
+            .collect::<Vec<_>>(),
+    });
+    compressed.into_iter().collect()
 }
 
 fn deduplicate_entries(entries: &mut Vec<IndexEntry>) -> usize {
@@ -1454,5 +1997,104 @@ mod tests {
         assert_ne!(record.security_types & SECURITY_HIGH, 0);
         assert_ne!(record.government_types & GOVERNMENT_DEMOCRACY, 0);
         assert_ne!(record.update_seconds, UNKNOWN_UPDATE_SECONDS);
+    }
+
+    #[test]
+    fn repack_rewrites_a_small_base_pack_with_a_dictionary() {
+        let root = std::env::temp_dir().join(format!(
+            "edss-rich-repack-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let galaxy_dir = root.join("galaxy");
+        fs::create_dir_all(&galaxy_dir).unwrap();
+        let pack_path = galaxy_dir.join("base.pack");
+        let index_path = galaxy_dir.join("base.idx");
+        let mut pack = BufWriter::new(File::create(&pack_path).unwrap());
+        write_data_header(&mut pack).unwrap();
+        let mut offset = DATA_HEADER_BYTES;
+        let mut entries = Vec::new();
+        let mut expected = FxHashMap::default();
+        for item in 0..512u64 {
+            let id64 = 50_000 - item * 17;
+            let raw = format!(
+                "{{\"id64\":{id64},\"name\":\"Synthetic {item}\",\"bodies\":[{{\"name\":\"Synthetic {item} A\",\"subType\":\"Rocky body\",\"atmosphereType\":\"Thin nitrogen atmosphere\"}}],\"padding\":\"{}\"}}",
+                "repeated rich galaxy dictionary training data ".repeat(80)
+            ).into_bytes();
+            let compressed = zstd::bulk::compress(&raw, 3).unwrap();
+            pack.write_all(&compressed).unwrap();
+            entries.push(IndexEntry {
+                id64,
+                offset,
+                compressed_len: compressed.len() as u32,
+                raw_len: raw.len() as u32,
+                update_seconds: item as u32,
+                body_count: 1,
+                station_count: 0,
+                flags: FLAG_BODIES,
+                body_types: 0,
+                atmosphere_types: 0,
+                ring_types: 0,
+                volcanism_types: 0,
+                economy_types: 0,
+                security_types: 0,
+                government_types: 0,
+            });
+            expected.insert(id64, raw);
+            offset += compressed.len() as u64;
+        }
+        pack.flush().unwrap();
+        entries.sort_unstable_by_key(|entry| entry.id64);
+        write_index(&index_path, &entries).unwrap();
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            schema_url: SCHEMA_URL.to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+            index_header_bytes: INDEX_HEADER_BYTES,
+            index_record_bytes: INDEX_RECORD_BYTES,
+            data_header_bytes: DATA_HEADER_BYTES,
+            map_filters: None,
+            segments: vec![ManifestSegment {
+                kind: "base".to_string(),
+                source_path: "synthetic".to_string(),
+                imported_at: Utc::now().to_rfc3339(),
+                data_file: "base.pack".to_string(),
+                index_file: "base.idx".to_string(),
+                count: entries.len() as u64,
+                input_count: entries.len() as u64,
+                duplicate_count: 0,
+                data_bytes: fs::metadata(&pack_path).unwrap().len(),
+                index_bytes: fs::metadata(&index_path).unwrap().len(),
+                compression: "zstd".to_string(),
+                compression_level: 3,
+                dictionary: None,
+                min_update_time: None,
+                max_update_time: None,
+                summary: Value::Null,
+            }],
+        };
+        write_manifest(&galaxy_dir.join("manifest.json"), &manifest).unwrap();
+        repack(RichRepackConfig { data_dir: &root, threads: 2, compression_level: 3, batch_size: 32 }).unwrap();
+        let manifest: Manifest = serde_json::from_reader(File::open(galaxy_dir.join("manifest.json")).unwrap()).unwrap();
+        let segment = &manifest.segments[0];
+        let (_, dictionary_descriptor) = dictionary_from_manifest(&galaxy_dir, Some(&manifest)).unwrap().unwrap();
+        assert_eq!(segment.dictionary.as_ref().unwrap().dict_id, dictionary_descriptor.dict_id);
+        assert!(!pack_path.exists());
+        let (dictionary, _) = dictionary_from_manifest(&galaxy_dir, Some(&manifest)).unwrap().unwrap();
+        let mut index = BufReader::new(File::open(galaxy_dir.join(&segment.index_file)).unwrap());
+        let (_, count) = read_index_header(&mut index, &galaxy_dir.join(&segment.index_file)).unwrap();
+        assert_eq!(count, 512);
+        let mut record = [0u8; INDEX_RECORD_BYTES as usize];
+        index.read_exact(&mut record).unwrap();
+        let entry = read_index_entry(&record);
+        let mut pack = BufReader::new(File::open(galaxy_dir.join(&segment.data_file)).unwrap());
+        validate_data_header(&mut pack, &galaxy_dir.join(&segment.data_file)).unwrap();
+        pack.seek(SeekFrom::Start(entry.offset)).unwrap();
+        let mut compressed = vec![0u8; entry.compressed_len as usize];
+        pack.read_exact(&mut compressed).unwrap();
+        let raw = zstd::bulk::Decompressor::with_dictionary(&dictionary).unwrap()
+            .decompress(&compressed, entry.raw_len as usize).unwrap();
+        assert_eq!(raw, expected[&entry.id64]);
+        fs::remove_dir_all(root).unwrap();
     }
 }
