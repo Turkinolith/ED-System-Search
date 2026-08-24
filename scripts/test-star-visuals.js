@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { GalaxyRenderer, densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, specialKind, starViewVolumeContains, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
+import { GalaxyRenderer, densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridAxisCueLayout, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, specialKind, starViewVolumeContains, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
 
 const o = starVisual('O (Blue-White) Star');
 const a = starVisual('A (Blue-White) Star');
@@ -82,6 +82,24 @@ const dropLineRange = dropLineAnchorRange([
 assert.equal(dropLineRange, 10, 'Drop-line range should describe the farthest active anchor.');
 assert.equal(formatDistanceBadge(14.74), '14.7', 'Drop-line badges should keep local ranges compact but readable.');
 assert.equal(formatDistanceBadge(1234.4), '1,234', 'Drop-line badges should group large distances.');
+
+const eastCue = gridAxisCueLayout(
+  { x: 500, y: 400 },
+  { x: 200, y: 400 },
+  { x: 0, y: 0, width: 1000, height: 800 },
+);
+assert.ok(eastCue.tip.x <= 300 && eastCue.tip.y === 400, 'Galactic East should use the mirrored grid direction and extend beyond the crowded center area.');
+const northCue = gridAxisCueLayout(
+  { x: 500, y: 400 },
+  { x: 400, y: 200 },
+  { x: 0, y: 0, width: 1000, height: 800 },
+);
+assert.ok(northCue.tip.x < 425 && northCue.tip.y < 250, 'The +Z cue should preserve its direction and extend beyond the crowded center area.');
+assert.equal(
+  gridAxisCueLayout({ x: 500, y: 400 }, { x: 505, y: 405 }, { x: 0, y: 0, width: 1000, height: 800 }),
+  null,
+  'A nearly edge-on axis should omit its label instead of showing an unstable direction.',
+);
 
 const gridRenderer = Object.assign(Object.create(GalaxyRenderer.prototype), {
   target: [1234.5, 72, -987.25],

@@ -1,4 +1,4 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=local-rich-filters-2';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=grid-directions-3';
 
 const state = {
   meta: null,

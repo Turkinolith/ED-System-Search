@@ -156,6 +156,33 @@ function smoothstep(edge0, edge1, value) {
   return t * t * (3 - 2 * t);
 }
 
+export function gridAxisCueLayout(origin, positivePoint, clip, preferredDistance = 210, padding = 74) {
+  if (!origin || !positivePoint || !clip) return null;
+  const dx = positivePoint.x - origin.x;
+  const dy = positivePoint.y - origin.y;
+  const projectedLength = Math.hypot(dx, dy);
+  if (!Number.isFinite(projectedLength) || projectedLength < 28) return null;
+  const unit = { x: dx / projectedLength, y: dy / projectedLength };
+  const left = clip.x + padding;
+  const right = clip.x + clip.width - padding;
+  const top = clip.y + padding;
+  const bottom = clip.y + clip.height - padding;
+  const xRoom = Math.abs(unit.x) < 0.0001
+    ? Number.POSITIVE_INFINITY
+    : unit.x > 0 ? (right - origin.x) / unit.x : (left - origin.x) / unit.x;
+  const yRoom = Math.abs(unit.y) < 0.0001
+    ? Number.POSITIVE_INFINITY
+    : unit.y > 0 ? (bottom - origin.y) / unit.y : (top - origin.y) / unit.y;
+  const available = Math.min(xRoom, yRoom);
+  if (!Number.isFinite(available) || available < 54) return null;
+  const distance = Math.min(preferredDistance, available * 0.82);
+  return {
+    unit,
+    perpendicular: { x: -unit.y, y: unit.x },
+    tip: { x: origin.x + unit.x * distance, y: origin.y + unit.y * distance },
+  };
+}
+
 function roundedRect(ctx, x, y, width, height, radius = 5) {
   const r = Math.min(radius, width / 2, height / 2);
   ctx.beginPath();
@@ -1292,6 +1319,7 @@ export class GalaxyRenderer {
     if (!this.isolatePlaces) this.drawHoverMarker();
     if (!this.isolatePlaces && this.showLandmarks) this.drawLandmarkIndicators();
     this.drawOrbitPoint(grid);
+    if (this.showGrid) this.drawGridAxisDirections(grid, this.gridFadeAlpha());
   }
 
   drawRouteOverlay() {
@@ -1865,6 +1893,100 @@ export class GalaxyRenderer {
     ctx.shadowColor = center ? strokeStyle : major ? 'rgba(72, 220, 230, 0.18)' : 'transparent';
     ctx.shadowBlur = this.isNavigating() ? 0 : center ? 8 : major ? 5 : 0;
     this.drawWorldLine(a, b);
+    ctx.restore();
+  }
+
+  drawGridAxisDirections(grid, gridAlpha) {
+    if (gridAlpha <= 0.08) return;
+    const origin = this.screen({ x: grid.centerX, y: grid.y, z: grid.centerZ });
+    if (!origin) return;
+    const probeLength = grid.extent * 0.85;
+    const clip = this.renderClipRect();
+    const cues = [
+      {
+        point: { x: grid.centerX, y: grid.y, z: grid.centerZ + probeLength },
+        label: 'N  GALACTIC NORTH  +Z',
+        color: 'rgba(103, 233, 255, 0.96)',
+      },
+      {
+        point: { x: grid.centerX - probeLength, y: grid.y, z: grid.centerZ },
+        label: 'E  GALACTIC EAST  +X',
+        color: 'rgba(255, 185, 92, 0.96)',
+      },
+    ];
+    for (const cue of cues) {
+      const positivePoint = this.screen(cue.point);
+      const layout = gridAxisCueLayout(origin, positivePoint, clip);
+      if (!layout) continue;
+      this.drawGridAxisCue(layout, cue.label, cue.color, gridAlpha);
+    }
+  }
+
+  drawGridAxisCue(layout, label, color, gridAlpha) {
+    const ctx = this.ctx;
+    const { tip, unit, perpendicular } = layout;
+    const stem = { x: tip.x - unit.x * 46, y: tip.y - unit.y * 46 };
+    const wingA = {
+      x: tip.x - unit.x * 14 + perpendicular.x * 8,
+      y: tip.y - unit.y * 14 + perpendicular.y * 8,
+    };
+    const wingB = {
+      x: tip.x - unit.x * 14 - perpendicular.x * 8,
+      y: tip.y - unit.y * 14 - perpendicular.y * 8,
+    };
+    const alpha = clamp(0.72 + gridAlpha * 0.28, 0.72, 1);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(stem.x, stem.y);
+    ctx.lineTo(tip.x, tip.y);
+    ctx.moveTo(wingA.x, wingA.y);
+    ctx.lineTo(tip.x, tip.y);
+    ctx.lineTo(wingB.x, wingB.y);
+    ctx.strokeStyle = 'rgba(1, 5, 8, 0.96)';
+    ctx.lineWidth = 7;
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.95)';
+    ctx.shadowBlur = this.isNavigating() ? 0 : 8;
+    ctx.stroke();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.6;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = this.isNavigating() ? 0 : 5;
+    ctx.stroke();
+
+    const mostlyVertical = Math.abs(unit.x) < 0.28;
+    const labelGap = 15;
+    ctx.font = '800 11px "Segoe UI", system-ui, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    const textWidth = Math.ceil(ctx.measureText(label).width);
+    const plateWidth = textWidth + 18;
+    const plateHeight = 24;
+    let plateX;
+    let plateY;
+    if (mostlyVertical) {
+      plateX = tip.x - plateWidth / 2;
+      plateY = unit.y > 0 ? tip.y + labelGap : tip.y - labelGap - plateHeight;
+    } else {
+      plateX = unit.x > 0 ? tip.x + labelGap : tip.x - labelGap - plateWidth;
+      plateY = tip.y - plateHeight / 2;
+    }
+    const clip = this.renderClipRect();
+    plateX = clamp(plateX, clip.x + 6, clip.x + clip.width - plateWidth - 6);
+    plateY = clamp(plateY, clip.y + 6, clip.y + clip.height - plateHeight - 6);
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.95)';
+    ctx.shadowBlur = this.isNavigating() ? 0 : 10;
+    ctx.fillStyle = 'rgba(2, 8, 12, 0.94)';
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.4;
+    roundedRect(ctx, plateX, plateY, plateWidth, plateHeight, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = color;
+    ctx.fillText(label, plateX + 9, plateY + plateHeight / 2);
     ctx.restore();
   }
 
