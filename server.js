@@ -3416,7 +3416,7 @@ async function runSystemUpdate(reqUrl, res) {
     updateMetaCache = null;
     closeCachedFd(updateIndexCache);
     updateIndexCache = null;
-    suggestOverlayCache = null;
+    suggestOverlayIndexCache = null;
     galaxyManifestCache = null;
     richDictionaryCache.clear();
     // Warm the heavy caches before clients see running:false, so their next
