@@ -769,6 +769,27 @@ function scanModeLabel(mode) {
   return mode === 'all' ? 'All scan' : 'Latest scan';
 }
 
+function journalScanProgressPercent(scan) {
+  const message = String(scan?.message ?? '').toLowerCase();
+  let match = message.match(/\breading\s+(\d+)\/(\d+)/);
+  if (match) return 8 + (Math.min(Number(match[1]), Number(match[2])) / Math.max(1, Number(match[2]))) * 37;
+  match = message.match(/\bcarrier scan\s+(\d+)\/(\d+)/);
+  if (match) return 45 + (Math.min(Number(match[1]), Number(match[2])) / Math.max(1, Number(match[2]))) * 10;
+  match = message.match(/\b(?:exact match|matching)\s+(\d+)\/(\d+)/);
+  if (match) return 62 + (Math.min(Number(match[1]), Number(match[2])) / Math.max(1, Number(match[2]))) * 18;
+  match = message.match(/\bwriting\b.*\s(\d+)\/(\d+)/);
+  if (match) return 82 + (Math.min(Number(match[1]), Number(match[2])) / Math.max(1, Number(match[2]))) * 8;
+  if (message.includes('starting')) return 2;
+  if (message.includes('listing files')) return 5;
+  if (message.includes('merging visits')) return 56;
+  if (message.includes('exact overlay')) return 60;
+  if (message.includes('exact miss')) return 81;
+  if (message.includes('matching')) return 70;
+  if (message.includes('writing')) return 84;
+  if (message.includes('no new journal lines')) return 90;
+  return null;
+}
+
 function setDataStateText(node, message) {
   if (!node) return;
   const span = node.querySelector('span');
@@ -789,7 +810,15 @@ function setJournalScanPanel(scan = null, options = {}) {
   el.journalScanStatus?.classList.toggle('failed', failed);
   if (el.journalScanProgress) {
     el.journalScanProgress.hidden = !processing;
-    el.journalScanProgress.classList.toggle('indeterminate', processing);
+    const inferredPercent = journalScanProgressPercent(scan);
+    const requestedPercent = Number(options.percent);
+    const percent = Number.isFinite(requestedPercent) ? requestedPercent : inferredPercent;
+    const determinate = processing && Number.isFinite(percent);
+    const bar = el.journalScanProgress.querySelector('span');
+    el.journalScanProgress.classList.toggle('indeterminate', processing && !determinate);
+    if (bar) bar.style.width = determinate ? `${Math.max(0, Math.min(100, percent))}%` : '';
+    if (determinate) el.journalScanProgress.setAttribute('aria-valuenow', String(Math.round(percent)));
+    else el.journalScanProgress.removeAttribute('aria-valuenow');
     el.journalScanProgress.title = processing ? message : '';
   }
 }
@@ -1930,18 +1959,31 @@ function recenterFocus() {
 async function focusLatestJournal() {
   const latest = state.latestJournal;
   if (!latest?.name) return false;
+  const focusedFromJournal = focusLatestJournalCoordinates();
   if (await searchLatestSystem(latest.name, true)) return true;
-  if (latest.coords) {
-    focusSystem(latest.name, latest.coords);
-    state.renderer.setSelectedSystem({
-      name: latest.name,
-      coords: latest.coords,
-      mainStar: 'Unknown',
-      visited: true,
-    });
+  if (focusedFromJournal) {
+    showLatestJournalFallbackSelection();
     return true;
   }
   return false;
+}
+
+function focusLatestJournalCoordinates() {
+  const latest = state.latestJournal;
+  if (!latest?.name || !latest.coords) return false;
+  focusSystem(latest.name, latest.coords);
+  return true;
+}
+
+function showLatestJournalFallbackSelection() {
+  const latest = state.latestJournal;
+  if (!latest?.name || !latest.coords) return;
+  state.renderer.setSelectedSystem({
+    name: latest.name,
+    coords: latest.coords,
+    mainStar: 'Unknown',
+    visited: true,
+  });
 }
 
 function returnToLatestJournal() {
@@ -1987,21 +2029,24 @@ async function pollJournalScan(scan) {
     }
     const priorSupplementalCount = state.visited?.supplementalCount ?? 0;
     setWriteActivity('scan', false);
-    setJournalScanPanel(scan, { message: 'Scan complete · updating summaries', processing: true });
+    setJournalScanPanel(scan, { message: 'Scan complete · updating journal summary', processing: true, percent: 91 });
     await loadStatus();
-    setJournalScanPanel(scan, { message: 'Scan complete · refreshing places and notes', processing: true });
-    await loadPlaces();
+    setJournalScanPanel(scan, { message: 'Scan complete · moving to latest journal system', processing: true, percent: 93 });
+    const focusedFromJournal = focusLatestJournalCoordinates();
     systemCache.clear();
-    await loadNotes();
-    setJournalScanPanel(scan, { message: 'Scan complete · refreshing nearby map points', processing: true });
+    richSystemCache.clear();
+    setJournalScanPanel(scan, { message: 'Scan complete · loading nearby systems at the new location', processing: true, percent: 95 });
     await refreshLocalPointsNow({ radius: Math.max(250, localPointRadius()), limit: 25000 }).catch((error) => {
       if (isAbortError(error)) return;
       console.warn(error);
     });
-    richSystemCache.clear();
-    if (state.selectedSystem) {
-      setJournalScanPanel(scan, { message: 'Scan complete · refreshing selected system', processing: true });
-      await loadSelectedBodies();
+    setJournalScanPanel(scan, { message: 'Scan complete · loading latest system details', processing: true, percent: 97 });
+    if (state.latestJournal?.name) {
+      const resolvedLatest = await searchLatestSystem(state.latestJournal.name, true).catch((error) => {
+        console.warn(error);
+        return false;
+      });
+      if (!resolvedLatest && focusedFromJournal) showLatestJournalFallbackSelection();
     }
     const completeMessage = scan.message || 'Journal data refreshed.';
     setStatus(completeMessage);
@@ -2012,8 +2057,9 @@ async function pollJournalScan(scan) {
     const supplementalChanged = (state.visited?.supplementalCount ?? 0) !== priorSupplementalCount;
     const refreshTask = supplementalChanged ? loadPoints({ background: true }) : applyVisitedIndexUpdate();
     setJournalScanPanel(scan, {
-      message: supplementalChanged ? 'Refreshing galaxy map layer' : 'Updating visited markers',
+      message: supplementalChanged ? 'Latest location ready · refreshing galaxy map layer in background' : 'Latest location ready · updating visited markers',
       processing: true,
+      percent: 99,
     });
     refreshTask
       .then(() => {

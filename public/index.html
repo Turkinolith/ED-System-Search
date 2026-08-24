@@ -427,7 +427,7 @@
               <button id="scanLatestJournals" class="panel-button panel-button-primary" type="button">Scan latest journals</button>
               <button id="scanAllJournals" class="panel-button panel-button-tertiary" type="button">Scan all journals</button>
               <div id="journalScanStatus" class="data-state journal-scan-state"><i></i><span>Idle</span></div>
-              <div id="journalScanProgress" class="update-progress journal-scan-progress" hidden><span></span></div>
+              <div id="journalScanProgress" class="update-progress journal-scan-progress" role="progressbar" aria-label="Journal scan progress" aria-valuemin="0" aria-valuemax="100" hidden><span></span></div>
             </div>
 
             <div class="section current-ship-section">
@@ -452,6 +452,6 @@
         </div>
       </aside>
     </main>
-    <script type="module" src="/app.js?v=search-places-perf-1"></script>
+    <script type="module" src="/app.js?v=journal-progress-1"></script>
   </body>
 </html>

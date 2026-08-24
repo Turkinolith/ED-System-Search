@@ -1212,15 +1212,20 @@ async function main() {
     systems,
   };
 
+  progress('writing visits 1/5');
   await fs.writeFile(visitedPath, JSON.stringify(payload, null, 2));
+  progress('writing indexes 2/5');
   await fs.writeFile(path.join(dataDir, 'visited-indexes.json'), JSON.stringify({
     updatedAt: payload.updatedAt,
     indexes,
     matchedKeys: [...matchedKeys].sort(),
   }));
+  progress('writing journal systems 3/5');
   await fs.writeFile(path.join(dataDir, 'journal-systems.json'), JSON.stringify(supplemental, null, 2));
+  progress('writing body data 4/5');
   await fs.writeFile(journalBodiesPath, JSON.stringify(journalBodies, null, 2));
   const stateEntries = options.latest ? selectedFiles : allFiles;
+  progress('writing scan state 5/5');
   await fs.writeFile(journalStatePath, JSON.stringify(makeJournalState(options.journalDir, stateEntries, previousJournalState), null, 2));
   console.log(`Read ${files.length} changed journal files from ${options.latest ? selectedFiles.length : files.length} selected files, found ${systems.length} visited systems and ${journalBodies.bodyCount} journal body records, matched ${imported.indexes.length} imported systems, added ${supplemental.systems.length} journal-only systems.`);
 }
