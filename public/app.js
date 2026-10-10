@@ -98,7 +98,11 @@ const el = {
   colorLegend: document.querySelector('#colorLegend'),
   routeBar: document.querySelector('#routeBar'),
   landmarksToggle: document.querySelector('#landmarksToggle'),
+  carrierMarkerToggle: document.querySelector('#carrierMarkerToggle'),
   carrierRangeToggle: document.querySelector('#carrierRangeToggle'),
+  carrierNameInput: document.querySelector('#carrierNameInput'),
+  saveCarrier: document.querySelector('#saveCarrier'),
+  carrierConfigStatus: document.querySelector('#carrierConfigStatus'),
   murderBinariesToggle: document.querySelector('#murderBinariesToggle'),
   routeToggle: document.querySelector('#routeToggle'),
   refreshRoute: document.querySelector('#refreshRoute'),
@@ -1017,6 +1021,7 @@ async function loadStatus() {
   if (el.routeBar && state.routeOverlay) renderRouteBar();
   state.carrierLocation = data.visited?.carrierLocation ?? null;
   state.trackedCarrier = data.runtimeConfig?.trackedCarrier ?? null;
+  renderCarrierConfig();
   state.llmSearchDefaults = data.runtimeConfig?.llmSearch ?? null;
   state.systemUpdates = data.systemUpdates ?? null;
   state.galaxyDetails = data.galaxyDetails ?? null;
@@ -2147,6 +2152,46 @@ function setNotesMode(mode, persist = false) {
   loadNotes(state.notesMode === 'search' ? el.noteSearch.value.trim() : '').catch((error) => console.warn(error));
 }
 
+function renderCarrierConfig() {
+  const carrier = state.trackedCarrier;
+  if (document.activeElement !== el.carrierNameInput) el.carrierNameInput.value = carrier?.label ?? '';
+  if (!carrier) {
+    el.carrierConfigStatus.textContent = 'No carrier configured';
+  } else if (carrier.id === null) {
+    el.carrierConfigStatus.textContent = 'Carrier ID not found in journals yet. Open carrier management in game, then save again so the map can follow jumps.';
+  } else {
+    el.carrierConfigStatus.textContent = `Tracking carrier ID ${carrier.id}`;
+  }
+}
+
+async function saveCarrierConfig() {
+  const carrier = el.carrierNameInput.value.trim();
+  el.saveCarrier.disabled = true;
+  el.carrierConfigStatus.textContent = carrier ? 'Looking up carrier in journals…' : 'Clearing carrier…';
+  try {
+    const response = await api('/api/tracked-carrier', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ carrier }),
+    });
+    const result = await response.json();
+    state.trackedCarrier = result.trackedCarrier ?? null;
+    el.carrierNameInput.blur();
+    renderCarrierConfig();
+    // Rescan so the saved location follows the new carrier (or is cleared).
+    if (el.scanLatestJournals.disabled) {
+      setStatus('Carrier saved. It will be picked up by the next journal scan.');
+    } else {
+      await refreshJournals('latest');
+    }
+  } catch (error) {
+    console.error(error);
+    el.carrierConfigStatus.textContent = `Could not save carrier: ${error.message}`;
+  } finally {
+    el.saveCarrier.disabled = false;
+  }
+}
+
 function updateLandmarks() {
   const carrier = currentCarrierTarget();
   const landmarks = [
@@ -2156,7 +2201,9 @@ function updateLandmarks() {
   ];
   if (carrier) {
     const carrierLabel = carrier.name ?? carrierDisplayName();
-    landmarks.push({ name: carrierLabel, shortName: carrierLabel, coords: carrier.coords, color: '#b6ff00', hideWhenPlaceLabelVisible: true });
+    if (el.carrierMarkerToggle.checked) {
+      landmarks.push({ name: carrierLabel, shortName: carrierLabel, coords: carrier.coords, color: '#b6ff00', hideWhenPlaceLabelVisible: true });
+    }
     state.renderer.setCarrierRange({
       name: carrierLabel,
       coords: carrier.coords,
@@ -2167,6 +2214,7 @@ function updateLandmarks() {
     state.renderer.setCarrierRange(null);
   }
   state.renderer.setLandmarks(landmarks);
+  el.carrierMarkerToggle.disabled = !carrier;
   el.carrierRangeToggle.disabled = !carrier;
   if (!carrier) {
     el.carrierRangeToggle.checked = false;
@@ -2254,6 +2302,8 @@ async function pollJournalScan(scan) {
     setWriteActivity('scan', false);
     setJournalScanPanel(scan, { message: 'Scan complete · updating journal summary', processing: true, percent: 91 });
     await loadStatus();
+    rebuildLoadedPlaces();
+    applyPlaceFilters();
     setJournalScanPanel(scan, { message: 'Scan complete · moving to latest journal system', processing: true, percent: 93 });
     const focusedFromJournal = focusLatestJournalCoordinates();
     systemCache.clear();
@@ -2752,8 +2802,10 @@ async function loadPlaces() {
   }
 }
 
+// The journal carrier override is applied here rather than when a category is
+// fetched, so a carrier change or a fresh journal scan only needs a rebuild.
 function rebuildLoadedPlaces() {
-  state.places = [...state.placeCategoryData.values()].flat();
+  state.places = applyCarrierOverride([...state.placeCategoryData.values()].flat());
 }
 
 async function loadEnabledPlaceCategories(options = {}) {
@@ -2778,7 +2830,7 @@ async function loadEnabledPlaceCategories(options = {}) {
     const data = await response.json();
     if (requestId !== placesLoadRequestId) return;
     const groups = new Map(missing.map((category) => [category, []]));
-    for (const place of applyCarrierOverride(data.places ?? [])) {
+    for (const place of data.places ?? []) {
       const category = place.category ?? 'Other POIs';
       if (!groups.has(category)) groups.set(category, []);
       groups.get(category).push(place);
@@ -2974,7 +3026,9 @@ async function refreshMurderBinaries() {
 }
 
 function applyPlaceFilters() {
-  const regularPlaces = state.places.filter((place) => state.enabledPlaceCategories.has(place.category ?? 'Other POIs'));
+  const hideCarrier = !el.carrierMarkerToggle.checked;
+  const regularPlaces = state.places.filter((place) => state.enabledPlaceCategories.has(place.category ?? 'Other POIs')
+    && !(hideCarrier && isTrackedCarrierPlace(place)));
   state.visiblePlaces = el.murderBinariesToggle.checked
     ? [...regularPlaces, ...state.murderBinaryPlaces]
     : regularPlaces;
@@ -3306,6 +3360,15 @@ function bindControls() {
     state.renderer.requestRender();
     writeViewSettings({ showLandmarks: el.landmarksToggle.checked });
   });
+  el.carrierMarkerToggle.addEventListener('change', () => {
+    applyPlaceFilters();
+    state.renderer.requestRender();
+    writeViewSettings({ showCarrierMarker: el.carrierMarkerToggle.checked });
+  });
+  el.saveCarrier.addEventListener('click', saveCarrierConfig);
+  el.carrierNameInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') saveCarrierConfig();
+  });
   el.carrierRangeToggle.addEventListener('change', () => {
     state.renderer.showCarrierRange = el.carrierRangeToggle.checked;
     state.renderer.requestRender();
@@ -3466,6 +3529,7 @@ async function init() {
   el.boxelToggle.checked = viewSettings.showBoxel ?? true;
   el.nebulaToggle.checked = viewSettings.showNebulae ?? true;
   el.landmarksToggle.checked = viewSettings.showLandmarks ?? true;
+  el.carrierMarkerToggle.checked = viewSettings.showCarrierMarker ?? true;
   el.carrierRangeToggle.checked = viewSettings.showCarrierRange ?? false;
   el.routeToggle.checked = viewSettings.showRouteOverlay ?? false;
   const savedMurderCategory = Array.isArray(viewSettings.placeCategories)

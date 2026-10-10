@@ -27,6 +27,11 @@ const recordsPath = path.join(dataDir, 'systems.bin');
 const recordBytes = 32;
 const trackedCarrier = loadLocalConfig().trackedCarrier;
 const carrierBootstrapBytes = 4 * 1024 * 1024;
+// Saved in the journal state so a carrier change in the settings forces a
+// rescan even when no journal lines are new.
+const trackedCarrierKey = trackedCarrier
+  ? JSON.stringify([trackedCarrier.id, trackedCarrier.callsign, trackedCarrier.name])
+  : '';
 
 const visitEvents = new Set([
   'Location',
@@ -416,6 +421,19 @@ function matchesTrackedCarrier(event) {
     Number(event.CarrierID) === trackedCarrier.id
     || Number(event.MarketID) === trackedCarrier.id
   )) || configuredNames.some((name) => eventNames.includes(name));
+}
+
+// A carrier location saved by an earlier scan only counts if it was recorded
+// for the carrier that is configured now; otherwise switching carriers in the
+// settings would keep showing the old one.
+function belongsToTrackedCarrier(location) {
+  if (!trackedCarrier || !location) return false;
+  if (trackedCarrier.id !== null && location.carrierId !== null && location.carrierId !== undefined) {
+    return Number(location.carrierId) === trackedCarrier.id;
+  }
+  const same = (a, b) => Boolean(a && b) && String(a).toLocaleLowerCase() === String(b).toLocaleLowerCase();
+  if (trackedCarrier.callsign && location.callsign) return same(trackedCarrier.callsign, location.callsign);
+  return same(trackedCarrier.label, location.name) || same(trackedCarrier.name, location.name);
 }
 
 function carrierObservation(event) {
@@ -813,6 +831,7 @@ function makeJournalState(journalDir, entries, previousState = null) {
   return {
     updatedAt: new Date().toISOString(),
     journalDir,
+    trackedCarrierKey,
     files,
   };
 }
@@ -1146,7 +1165,7 @@ async function main() {
   const previousJournalState = options.mergeExisting ? await readJson(journalStatePath, null) : null;
   const previousSupplemental = await readJson(supplementalPath, { systems: [] });
   const { files, selectedFiles, allFiles, totalFileCount } = await readJournalFiles(options.journalDir, options.latest, previousJournalState);
-  if (options.latest && files.length === 0) {
+  if (options.latest && files.length === 0 && previousJournalState?.trackedCarrierKey === trackedCarrierKey) {
     progress(`no new journal lines in latest ${selectedFiles.length}`);
     await fs.writeFile(journalStatePath, JSON.stringify(makeJournalState(options.journalDir, selectedFiles, previousJournalState), null, 2));
     console.log(`Read 0 changed journal files from ${selectedFiles.length} selected files; existing journal outputs are unchanged.`);
@@ -1156,8 +1175,12 @@ async function main() {
   progress('merging visits');
   const existing = options.mergeExisting ? await readJson(visitedPath, null) : null;
   const existingBodies = options.mergeExisting ? await readJson(journalBodiesPath, null) : null;
-  if (options.mergeExisting && !existing?.carrierLocation && parsedScan.carrierObservations.length === 0 && selectedFiles.length) {
-    parsedScan.carrierObservations = await parseCarrierObservations(selectedFiles);
+  const existingCarrier = belongsToTrackedCarrier(existing?.carrierLocation) ? existing.carrierLocation : null;
+  if (options.mergeExisting && !existingCarrier && parsedScan.carrierObservations.length === 0 && selectedFiles.length) {
+    // After a carrier change the newest sighting may be older than the latest
+    // files, so search every journal (newest first, stopping at the first hit).
+    const carrierChanged = previousJournalState?.trackedCarrierKey !== trackedCarrierKey;
+    parsedScan.carrierObservations = await parseCarrierObservations(carrierChanged ? allFiles : selectedFiles);
   }
   const previousIndexes = options.mergeExisting
     ? await readJson(visitedIndexesPath, { indexes: [] })
@@ -1185,7 +1208,7 @@ async function main() {
     meta.typeNames ?? [],
     previousSupplemental,
   );
-  const carrierLocation = await resolveCarrierLocation(parsedScan.carrierObservations, existing?.carrierLocation ?? null, supplemental, parsed.systems);
+  const carrierLocation = await resolveCarrierLocation(parsedScan.carrierObservations, existingCarrier, supplemental, parsed.systems);
   const supplementalIndexes = supplemental.systems.map((system) => system.index);
   const previousIndexList = Array.isArray(previousIndexes.indexes)
     ? previousIndexes.indexes.filter((index) => Number.isInteger(index) && index >= 0 && index < (meta.count ?? 0))
