@@ -74,9 +74,9 @@ export function loadLocalConfig(configFile = process.env.EDSS_CONFIG) {
   }
 }
 
-// Rewrites only the trackedCarrier block so other keys in the file (LLM
-// settings, anything hand-added) survive a save from the UI.
-export async function saveTrackedCarrier(trackedCarrier, configFile = process.env.EDSS_CONFIG) {
+// Reads the raw file, lets `mutate` change it in place, and writes it back, so
+// keys the app does not manage (anything hand-added) survive a save.
+async function updateLocalConfigFile(mutate, configFile) {
   const resolved = localConfigPath(configFile);
   let raw = {};
   try {
@@ -85,15 +85,29 @@ export async function saveTrackedCarrier(trackedCarrier, configFile = process.en
     if (error.code !== 'ENOENT') throw new Error(`Could not read local configuration: ${error.message}`);
   }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
-  raw.trackedCarrier = trackedCarrier
-    ? {
-      id: trackedCarrier.id ?? null,
-      name: trackedCarrier.name ?? '',
-      callsign: trackedCarrier.callsign ?? '',
-      label: trackedCarrier.label ?? '',
-      fallbackCoords: trackedCarrier.fallbackCoords ?? null,
-    }
-    : null;
+  mutate(raw);
   await writeFileAtomic(resolved, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
   return normalizeLocalConfig(raw);
+}
+
+export async function saveTrackedCarrier(trackedCarrier, configFile = process.env.EDSS_CONFIG) {
+  return updateLocalConfigFile((raw) => {
+    raw.trackedCarrier = trackedCarrier
+      ? {
+        id: trackedCarrier.id ?? null,
+        name: trackedCarrier.name ?? '',
+        callsign: trackedCarrier.callsign ?? '',
+        label: trackedCarrier.label ?? '',
+        fallbackCoords: trackedCarrier.fallbackCoords ?? null,
+      }
+      : null;
+  }, configFile);
+}
+
+// Called once the key has been moved into the credential store, so the
+// plain-text copy does not linger in the file.
+export async function removeLocalConfigLlmApiKey(configFile = process.env.EDSS_CONFIG) {
+  return updateLocalConfigFile((raw) => {
+    if (raw.llmSearch && typeof raw.llmSearch === 'object') delete raw.llmSearch.apiKey;
+  }, configFile);
 }

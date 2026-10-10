@@ -33,6 +33,8 @@
     "test:galaxy": "node scripts/test-galaxy-integration.js",
     "test:journals": "node scripts/test-journal-bodies.js",
     "test:config": "node scripts/test-local-config.js",
+    "test:secrets": "node scripts/test-secret-store.js",
+    "test:planner": "node scripts/test-search-planner.js",
     "test:stars": "node scripts/test-star-visuals.js",
     "test:id64": "node scripts/test-id64.js",
     "test:shutdown": "node scripts/test-shutdown-guard.js",

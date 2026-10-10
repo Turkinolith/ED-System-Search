@@ -21,9 +21,9 @@
             <input id="search" autocomplete="off" spellcheck="false" placeholder="Search the galaxy" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="searchResults">
             <div id="searchResults" class="search-results" role="listbox" hidden></div>
           </div>
-          <button id="llmSearchButton" class="llm-search-trigger" type="button" title="LLM Augmented Search" aria-label="LLM Augmented Search" aria-expanded="false">
+          <button id="llmSearchButton" class="llm-search-trigger" type="button" title="Smart search: describe what you are looking for" aria-label="Smart search" aria-expanded="false">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z"></path><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16Z"></path></svg>
-            <span>LLM</span>
+            <span>Smart</span>
           </button>
           <div class="map-toolbar" aria-label="Map tools">
             <button id="refreshJournals" class="icon-button" title="Scan latest journal files" aria-label="Scan latest journal files">
@@ -51,28 +51,36 @@
         <div id="llmSearchPanel" class="llm-search-panel" hidden>
           <div class="llm-panel-header">
             <div>
-              <strong>LLM Augmented Search</strong>
-              <span id="llmSearchProviderLabel">Local keyword planner</span>
+              <strong>Smart search</strong>
+              <span id="llmSearchProviderLabel">Describe what you are looking for</span>
             </div>
-            <button id="llmSearchClose" type="button" aria-label="Close LLM search">×</button>
+            <button id="llmSearchClose" type="button" aria-label="Close smart search">×</button>
           </div>
-          <textarea id="llmSearchPrompt" rows="3" spellcheck="true">Based on the current target, find the nearest systems with icy ring planets, preferably those with tritium hotspots.</textarea>
-          <div class="llm-settings-grid">
-            <label><span>Provider</span><select id="llmProvider">
-              <option value="openai">ChatGPT</option>
-              <option value="anthropic">Claude</option>
-              <option value="kobold">KoboldCPP</option>
-            </select></label>
-            <label><span>Model</span><input id="llmModel" type="text" list="llmModelOptions" placeholder="gpt-5.4-mini"></label>
-            <datalist id="llmModelOptions"></datalist>
-            <label><span>API key</span><input id="llmApiKey" type="password" autocomplete="off" placeholder="Stored in this browser"><small id="llmApiKeyHint"></small></label>
-            <label><span>Base URL</span><input id="llmBaseUrl" type="url" placeholder="Default for provider"><small id="llmBaseUrlHint"></small></label>
-          </div>
+          <textarea id="llmSearchPrompt" rows="3" spellcheck="true" placeholder="For example: earth-like worlds within 300 ly, or icy rings with tritium">Based on the current target, find the nearest systems with icy ring planets, preferably those with tritium hotspots.</textarea>
+          <div id="llmSearchPreview" class="llm-search-preview" aria-live="polite"></div>
           <div class="llm-panel-actions">
-            <label class="toggle llm-mode-toggle"><input id="llmEnabled" type="checkbox"><span>Use LLM planner and summary<small id="llmModeHint">Off uses the local keyword planner only.</small></span></label>
             <button id="llmSearchRun" class="panel-button panel-button-cyan" type="button">Search</button>
           </div>
-          <div id="llmSearchStatus" class="muted">Configure a provider, or leave LLM off to use the local keyword planner.</div>
+          <details id="llmAiSettings" class="llm-ai-settings">
+            <summary><span>AI assistant (optional)</span><small id="llmAiSummary">Not set up</small></summary>
+            <p class="llm-ai-explainer">Search already understands body and ring types, mining materials, biological and geological signals, and distances like "within 300 ly". You only need an AI assistant if you want it to handle other wording and write a short summary of the results. It is used only for those searches, sends the request text to the service you choose, and may be charged to your account there.</p>
+            <div class="llm-settings-grid">
+              <label><span>Provider</span><select id="llmProvider">
+                <option value="openai">ChatGPT</option>
+                <option value="anthropic">Claude</option>
+                <option value="kobold">KoboldCPP</option>
+              </select></label>
+              <label><span>Model</span><input id="llmModel" type="text" list="llmModelOptions" placeholder="gpt-5.4-mini"><small id="llmModelHint"></small></label>
+              <datalist id="llmModelOptions"></datalist>
+              <label><span>API key</span><input id="llmApiKey" type="password" autocomplete="off" placeholder="API key"><small id="llmApiKeyHint"></small></label>
+              <label><span>Base URL</span><input id="llmBaseUrl" type="url" placeholder="Default for provider"><small id="llmBaseUrlHint"></small></label>
+              <div class="llm-key-actions">
+                <button id="llmSaveKey" class="panel-button" type="button">Save key</button>
+                <button id="llmRemoveKey" class="panel-button panel-button-tertiary" type="button" hidden>Remove</button>
+              </div>
+            </div>
+          </details>
+          <div id="llmSearchStatus" class="muted">Searches the systems nearest your current target using the full galaxy data.</div>
           <div id="llmSearchAnswer" class="llm-search-answer" hidden></div>
           <div id="llmSearchResults" class="llm-search-results"></div>
         </div>

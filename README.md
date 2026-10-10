@@ -87,8 +87,12 @@ Colonia keep you oriented at any zoom.
   government, atmospheres, volcanism, rings, signals, and other system details.
 - Rich map filters for stations, population, body counts, body types,
   atmospheres, ring materials, volcanism, economies, security, and government.
-- Local keyword-planned search with optional configurable LLM planning and
-  summaries (OpenAI, Kobold, or another compatible endpoint).
+- **Smart search**: describe what you want ("earth-like worlds within 300 ly",
+  "icy rings with tritium") and it searches the systems nearest your target,
+  showing as you type what it understood. No setup is needed. An optional AI
+  assistant (Claude, ChatGPT, or a local KoboldCPP server) handles wording the
+  built-in search does not recognise; its keys are kept in the operating
+  system's credential store, never in the browser.
 - Default-off **Murder Binaries** caution overlay for systems with a secondary
   star between 5 and 12 light-seconds from arrival.
 - In-app controls for system deltas, full-data imports, places, discoveries,
@@ -210,6 +214,67 @@ npm start
 ```
 
 Open [http://localhost:5177](http://localhost:5177).
+
+The server only listens on this computer (`127.0.0.1`) and only answers
+requests addressed to `localhost`, `127.0.0.1`, or `[::1]`. To open it from
+another device, set `EDSS_HOST` to the address to listen on (for example
+`0.0.0.0`) and `EDSS_ALLOWED_HOSTS` to a comma-separated list of the hostnames
+or IP addresses you will browse to. Traffic is plain HTTP, so do this only on a
+network you trust.
+
+### Smart search
+
+The **Smart** button next to the search box opens a panel where you describe
+what you are looking for in plain words. It searches the systems nearest your
+current target using the full galaxy data, so that data must be installed. As
+you type, a line under the box shows what will be searched for, such as
+"icy rings · tritium · within 1,000 ly".
+
+It understands these on its own, with no setup:
+
+- **Body types:** earth-like worlds, water worlds, ammonia worlds, water giants,
+  gas giants with water- or ammonia-based life, icy and rocky-ice bodies,
+  high metal content and metal-rich bodies, terraformable bodies
+- **Ring types:** icy, rocky, metal-rich, and metallic rings
+- **Mining hotspots:** tritium, painite, platinum, low temperature diamonds,
+  void opals, and the other ring materials
+- **Signals:** biological and geological signals, or any signals
+- **Distance and count:** "within 300 ly", "5 systems"
+- **Required or preferred:** materials are required unless you say
+  "preferably" or "ideally"; "painite or LTDs" accepts either
+
+If the request contains words it does not recognise (for example "without",
+or "neutron"), the preview says so before you search.
+
+#### Optional AI assistant
+
+You only need this for requests the built-in search does not recognise. Open
+**AI assistant (optional)** in the panel, choose Claude, ChatGPT, or a local
+KoboldCPP server, enter your API key (and a base URL only for a proxy or
+compatible endpoint), and choose **Save key**. From then on, a request with
+unrecognised words is read by the assistant, which also writes a short summary
+of the results. Requests the built-in search fully understands never contact
+it. If the assistant cannot be reached, the search still runs on the parts that
+were understood. Using it sends the request text to that service and may be
+charged to your account there.
+
+Keys are stored by the local server in the operating system's credential store,
+one entry per provider, and never kept in the browser:
+
+| System | Store | Notes |
+| --- | --- | --- |
+| Windows | Credential Manager, under `ed-system-search/llm-<provider>` | Built in |
+| macOS | Keychain, service `ed-system-search` | Built in (`security` tool) |
+| Linux | Secret Service (GNOME Keyring, KWallet) | Needs `secret-tool` (package `libsecret-tools`) and a running keyring |
+
+If no credential store is available, as on a headless Linux machine, keys fall
+back to `data/llm-keys.local.json` in plain text, and the panel says so.
+
+Each key is saved together with its base URL and is only ever sent there, so
+changing the base URL means entering the key again. **Remove** deletes the
+saved key. A key placed in `config.local.json` under `llmSearch.apiKey` is moved
+into the credential store the next time the server starts, and keys saved in
+the browser by older versions are moved the first time the page loads.
 
 ## Full Galaxy Details
 

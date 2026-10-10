@@ -58,15 +58,19 @@ const el = {
   llmSearchAnswer: document.querySelector('#llmSearchAnswer'),
   llmSearchResults: document.querySelector('#llmSearchResults'),
   llmSearchProviderLabel: document.querySelector('#llmSearchProviderLabel'),
-  llmEnabled: document.querySelector('#llmEnabled'),
+  llmSearchPreview: document.querySelector('#llmSearchPreview'),
+  llmAiSettings: document.querySelector('#llmAiSettings'),
+  llmAiSummary: document.querySelector('#llmAiSummary'),
   llmProvider: document.querySelector('#llmProvider'),
   llmModel: document.querySelector('#llmModel'),
   llmModelOptions: document.querySelector('#llmModelOptions'),
+  llmModelHint: document.querySelector('#llmModelHint'),
+  llmSaveKey: document.querySelector('#llmSaveKey'),
+  llmRemoveKey: document.querySelector('#llmRemoveKey'),
   llmApiKey: document.querySelector('#llmApiKey'),
   llmApiKeyHint: document.querySelector('#llmApiKeyHint'),
   llmBaseUrl: document.querySelector('#llmBaseUrl'),
   llmBaseUrlHint: document.querySelector('#llmBaseUrlHint'),
-  llmModeHint: document.querySelector('#llmModeHint'),
   clientToast: document.querySelector('#clientToast'),
   filters: document.querySelector('#filters'),
   filterActions: document.querySelector('#filterActions'),
@@ -387,6 +391,7 @@ function effectiveShipJumpRange(ship) {
   };
 }
 
+// Offline fallback; the panel lists the provider's live models when it can.
 const llmModelPresets = {
   openai: [
     { id: 'gpt-5.5', label: 'GPT-5.5 - highest capability' },
@@ -395,10 +400,10 @@ const llmModelPresets = {
     { id: 'gpt-5.4-nano', label: 'GPT-5.4 nano - lowest latency/cost' },
   ],
   anthropic: [
-    { id: 'claude-fable-5', label: 'Claude Fable 5 - highest capability' },
-    { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 - complex reasoning' },
-    { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 - balanced default' },
-    { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5 - fastest' },
+    { id: 'claude-fable-5-1', label: 'Claude Fable 5.1 - highest capability' },
+    { id: 'claude-opus-5-5', label: 'Claude Opus 5.5 - default' },
+    { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 - balanced' },
+    { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5 - fastest' },
   ],
   kobold: [
     { id: 'local-model', label: 'KoboldCPP local model' },
@@ -407,14 +412,9 @@ const llmModelPresets = {
 const llmProviders = ['openai', 'anthropic', 'kobold'];
 
 function defaultLlmModel(provider) {
-  if (provider === 'anthropic') return 'claude-sonnet-4-6';
+  if (provider === 'anthropic') return 'claude-opus-5-5';
   if (provider === 'kobold') return 'local-model';
   return 'gpt-5.4-mini';
-}
-
-function defaultLlmBaseUrl(provider) {
-  if (provider === 'kobold') return 'http://localhost:5001/v1';
-  return '';
 }
 
 function llmBaseUrlPlaceholder(provider) {
@@ -429,39 +429,103 @@ function llmProviderLabel(provider) {
   return 'ChatGPT';
 }
 
+// Where the server keeps API keys, from /api/llm-keys.
+function llmKeyStoreText() {
+  const store = state.llmKeys?.store;
+  if (!store) return 'the app on this computer';
+  return store.secure ? store.label : 'a plain-text file';
+}
+
+function llmSavedKey(provider) {
+  return state.llmKeys?.providers?.[provider] ?? null;
+}
+
 function llmApiKeyHint(provider) {
+  if (state.llmKeys?.error) return `Could not read saved keys: ${state.llmKeys.error}`;
+  const saved = llmSavedKey(provider);
+  const insecure = state.llmKeys?.store && !state.llmKeys.store.secure
+    ? ` Not secure: ${state.llmKeys.store.reason ?? 'no credential store is available'}.`
+    : '';
+  if (saved?.hasKey) {
+    const when = saved.savedAt ? ` on ${new Date(saved.savedAt).toLocaleDateString()}` : '';
+    return `${provider === 'kobold' ? 'Token' : 'Key'} saved in ${llmKeyStoreText()}${when}. Enter a new one to replace it.${insecure}`;
+  }
   if (provider === 'kobold') return 'Usually blank unless your local endpoint requires a token.';
-  return `${llmProviderLabel(provider)} uses its own API key. Keys are stored separately in this browser.`;
+  return `Saved in ${llmKeyStoreText()}, never in the browser.${insecure}`;
 }
 
 function llmBaseUrlHint(provider) {
-  if (provider === 'kobold') return 'Your local OpenAI-compatible KoboldCPP endpoint.';
-  return `Leave blank for ${llmProviderLabel(provider)}'s official API. Set only for a proxy, gateway, or compatible custom endpoint.`;
+  if (provider === 'kobold') return 'Your local OpenAI-compatible KoboldCPP endpoint. Save to apply.';
+  return `Leave blank for ${llmProviderLabel(provider)}'s official API. A key is only sent to the URL it was saved with, so changing this means entering the key again.`;
 }
 
-function updateLlmModelOptions(provider) {
+// Live model lists for this page session, keyed by provider and saved key.
+const llmModelLists = new Map();
+let llmModelRequest = null;
+let llmModelTimer = null;
+
+function llmModelListKey(provider) {
+  return `${provider}|${llmSavedKey(provider)?.savedAt ?? ''}`;
+}
+
+function updateLlmModelOptions(settings) {
+  const { provider } = settings;
   el.llmModel.placeholder = defaultLlmModel(provider);
-  const options = llmModelPresets[provider] ?? llmModelPresets.openai;
+  const live = llmModelLists.get(llmModelListKey(provider));
+  const options = live?.models?.length ? live.models : (llmModelPresets[provider] ?? llmModelPresets.openai);
   el.llmModelOptions.replaceChildren(...options.map((item) => {
     const option = document.createElement('option');
     option.value = item.id;
-    option.label = item.label;
+    if (item.label && item.label !== item.id) option.label = item.label;
     return option;
   }));
+  const canList = provider === 'kobold' || Boolean(llmSavedKey(provider)?.hasKey);
+  if (live?.models?.length) {
+    el.llmModelHint.textContent = `${live.models.length} models available from ${llmProviderLabel(provider)}.`;
+  } else if (live?.error) {
+    el.llmModelHint.textContent = `Could not list models (${live.error}). Showing presets.`;
+  } else if (!canList) {
+    el.llmModelHint.textContent = 'Save an API key to list the models your account can use.';
+  } else {
+    el.llmModelHint.textContent = '';
+  }
+  // Only ask the provider while the panel is open, not on every page load.
+  if (!live && canList && state.llmKeys && !el.llmSearchPanel.hidden) {
+    clearTimeout(llmModelTimer);
+    llmModelTimer = setTimeout(() => refreshLlmModels(provider), 300);
+  }
 }
 
-function llmProviderConfigFrom(settings, defaults, provider) {
-  const configured = settings.providers?.[provider] ?? {};
-  const legacyConfigured = settings.provider === provider ? settings : {};
-  const serverDefaults = defaults?.provider === provider ? defaults : {};
-  return {
-    model: configured.model || legacyConfigured.model || serverDefaults.model || defaultLlmModel(provider),
-    apiKey: configured.apiKey ?? legacyConfigured.apiKey ?? '',
-    baseUrl: configured.baseUrl ?? legacyConfigured.baseUrl ?? serverDefaults.baseUrl ?? defaultLlmBaseUrl(provider),
-    serverHasApiKey: Boolean(serverDefaults.hasApiKey),
-  };
+async function refreshLlmModels(provider) {
+  const key = llmModelListKey(provider);
+  llmModelRequest?.abort();
+  const controller = new AbortController();
+  llmModelRequest = controller;
+  el.llmModelHint.textContent = `Loading ${llmProviderLabel(provider)} models...`;
+  try {
+    const response = await fetch('/api/llm-models', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider }),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => ({}));
+    llmModelLists.set(key, response.ok
+      ? { models: data.models ?? [] }
+      : { error: data.error || response.statusText });
+  } catch (error) {
+    if (isAbortError(error)) return;
+    llmModelLists.set(key, { error: error.message });
+  } finally {
+    if (llmModelRequest === controller) llmModelRequest = null;
+  }
+  // Render only if the form still shows the provider this list belongs to.
+  const current = readLlmSettings();
+  if (current.provider === provider && llmModelListKey(provider) === key) updateLlmModelOptions(current);
 }
 
+// Browser storage holds only non-secret choices: whether the LLM is on, the
+// provider, and the model picked for each provider.
 function readLlmSettings() {
   const settings = readViewSettings().llmSearch ?? {};
   const defaults = state.llmSearchDefaults ?? {};
@@ -470,36 +534,53 @@ function readLlmSettings() {
     : llmProviders.includes(defaults.provider)
       ? defaults.provider
       : 'openai';
-  const providerConfig = llmProviderConfigFrom(settings, defaults, provider);
+  const configured = settings.providers?.[provider] ?? {};
+  const legacyConfigured = settings.provider === provider ? settings : {};
+  const serverModel = defaults.provider === provider ? defaults.model : '';
   return {
-    enabled: Boolean(settings.enabled),
     provider,
     providers: settings.providers ?? {},
-    ...providerConfig,
+    model: configured.model || legacyConfigured.model || serverModel || defaultLlmModel(provider),
   };
 }
 
 function writeLlmSettings(settings) {
-  writeViewSettings({ llmSearch: settings });
+  const providers = {};
+  for (const [provider, config] of Object.entries(settings.providers ?? {})) {
+    if (config?.model) providers[provider] = { model: config.model };
+  }
+  writeViewSettings({ llmSearch: { provider: settings.provider, providers } });
 }
 
-function applyLlmSettingsToForm(settings = readLlmSettings()) {
-  el.llmEnabled.checked = Boolean(settings.enabled);
+function applyLlmSettingsToForm(settings = readLlmSettings(), { resetCredentials = false } = {}) {
   el.llmProvider.value = settings.provider;
-  updateLlmModelOptions(settings.provider);
+  updateLlmModelOptions(settings);
   el.llmModel.value = settings.model || defaultLlmModel(settings.provider);
-  el.llmApiKey.value = settings.apiKey || '';
-  el.llmApiKey.placeholder = settings.provider === 'kobold' ? 'Optional token' : `${llmProviderLabel(settings.provider)} API key`;
+  const saved = llmSavedKey(settings.provider);
+  // Keep what the user is typing unless the provider changed or a save ran.
+  if (resetCredentials || el.llmApiKey.dataset.provider !== settings.provider) {
+    el.llmApiKey.value = '';
+    el.llmBaseUrl.value = saved?.baseUrl ?? '';
+    el.llmApiKey.dataset.provider = settings.provider;
+  }
+  el.llmApiKey.placeholder = saved?.hasKey
+    ? 'Saved - enter a new one to replace it'
+    : settings.provider === 'kobold' ? 'Optional token' : `${llmProviderLabel(settings.provider)} API key`;
   el.llmApiKeyHint.textContent = llmApiKeyHint(settings.provider);
-  el.llmBaseUrl.value = settings.baseUrl ?? defaultLlmBaseUrl(settings.provider);
   el.llmBaseUrl.placeholder = llmBaseUrlPlaceholder(settings.provider);
   el.llmBaseUrlHint.textContent = llmBaseUrlHint(settings.provider);
-  el.llmModeHint.textContent = settings.enabled
-    ? 'On asks the selected model to plan filters and write a short summary.'
-    : 'Off uses the local keyword planner only; no provider request is sent.';
-  el.llmSearchProviderLabel.textContent = settings.enabled
-    ? `${llmProviderLabel(settings.provider)} planner${settings.serverHasApiKey && !settings.apiKey ? ' · config key' : ''}`
-    : 'Local keyword planner';
+  el.llmSaveKey.textContent = settings.provider === 'kobold' ? 'Save endpoint' : 'Save key';
+  el.llmRemoveKey.hidden = !saved?.saved;
+  const ready = llmAssistantReady(settings.provider);
+  el.llmAiSummary.textContent = ready ? `${llmProviderLabel(settings.provider)} ready` : 'Not set up';
+  el.llmSearchProviderLabel.textContent = 'Describe what you are looking for';
+}
+
+// An assistant counts as set up once it has a saved key, or for KoboldCPP a
+// saved endpoint.
+function llmAssistantReady(provider) {
+  const saved = llmSavedKey(provider);
+  return provider === 'kobold' ? Boolean(saved?.saved) : Boolean(saved?.hasKey);
 }
 
 function llmSettingsFromForm() {
@@ -509,20 +590,14 @@ function llmSettingsFromForm() {
 }
 
 function llmSettingsWithProviderFromForm(provider, existing = readViewSettings().llmSearch ?? {}) {
-  const providerConfig = {
-    model: el.llmModel.value.trim() || defaultLlmModel(provider),
-    apiKey: el.llmApiKey.value.trim(),
-    baseUrl: el.llmBaseUrl.value.trim(),
-  };
-  const providers = {
-    ...(existing.providers ?? {}),
-    [provider]: providerConfig,
-  };
+  const model = el.llmModel.value.trim() || defaultLlmModel(provider);
   return {
-    enabled: el.llmEnabled.checked,
     provider,
-    providers,
-    ...providerConfig,
+    providers: {
+      ...(existing.providers ?? {}),
+      [provider]: { model },
+    },
+    model,
   };
 }
 
@@ -531,6 +606,71 @@ function persistLlmSettings() {
   writeLlmSettings(settings);
   applyLlmSettingsToForm(settings);
   return settings;
+}
+
+async function loadLlmKeys() {
+  try {
+    const response = await api('/api/llm-keys');
+    state.llmKeys = await response.json();
+    await migrateBrowserLlmKeys();
+  } catch (error) {
+    state.llmKeys = { error: error.message, providers: {} };
+  }
+  applyLlmSettingsToForm(readLlmSettings(), { resetCredentials: true });
+}
+
+// Earlier versions kept keys in browser storage. Hand any found to the server
+// (unless it already holds one for that provider), then drop the local copies.
+async function migrateBrowserLlmKeys() {
+  const settings = readViewSettings().llmSearch ?? {};
+  const found = [];
+  for (const provider of llmProviders) {
+    const entry = settings.providers?.[provider] ?? (settings.provider === provider ? settings : null);
+    if (entry?.apiKey || (provider === 'kobold' && entry?.baseUrl)) {
+      found.push({ provider, apiKey: entry.apiKey ?? '', baseUrl: entry.baseUrl ?? '' });
+    }
+  }
+  if (!found.length && !('apiKey' in settings)) return;
+  let moved = true;
+  for (const item of found) {
+    if (llmSavedKey(item.provider)?.saved) continue;
+    try {
+      const response = await api('/api/llm-keys', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(item),
+      });
+      state.llmKeys = await response.json();
+    } catch (error) {
+      moved = false;
+      console.warn(`Could not move the saved ${item.provider} key out of the browser: ${error.message}`);
+    }
+  }
+  if (moved) writeLlmSettings({ ...readLlmSettings(), providers: settings.providers ?? {} });
+}
+
+async function saveLlmKey({ remove = false } = {}) {
+  const provider = llmProviders.includes(el.llmProvider.value) ? el.llmProvider.value : 'openai';
+  el.llmSaveKey.disabled = true;
+  el.llmRemoveKey.disabled = true;
+  el.llmApiKeyHint.textContent = remove ? 'Removing...' : 'Saving...';
+  try {
+    const response = await api('/api/llm-keys', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(remove
+        ? { provider, remove: true }
+        : { provider, apiKey: el.llmApiKey.value.trim(), baseUrl: el.llmBaseUrl.value.trim() }),
+    });
+    state.llmKeys = await response.json();
+    applyLlmSettingsToForm(readLlmSettings(), { resetCredentials: true });
+    scheduleSearchPreview(0);
+  } catch (error) {
+    el.llmApiKeyHint.textContent = `Could not ${remove ? 'remove' : 'save'} the ${provider === 'kobold' ? 'endpoint' : 'key'}: ${error.message}`;
+  } finally {
+    el.llmSaveKey.disabled = false;
+    el.llmRemoveKey.disabled = false;
+  }
 }
 
 function applyStarScale(percent, persist = false) {
@@ -1439,7 +1579,7 @@ function bodyHtml(body, index) {
   return `
     <details class="body-item"${index === 0 ? ' open' : ''}>
       <summary>
-        <span class="body-ordinal">${String(body.bodyId ?? index).padStart(2, '0')}</span>
+        <span class="body-ordinal">${escapeHtml(String(body.bodyId ?? index).padStart(2, '0'))}</span>
         <span class="body-title">
           <strong>${escapeHtml(body.name ?? `Body ${index + 1}`)}</strong>
           <small>${escapeHtml(subtype)}</small>
@@ -1532,20 +1672,55 @@ async function loadSelectedBodies() {
   }
 }
 
+// Place descriptions come from third-party lists and some carry HTML links.
+// Parse them inertly (a <template> runs no scripts and loads nothing), then
+// keep only the text and plain http(s) links.
+function safeDescriptionHtml(value) {
+  const template = document.createElement('template');
+  template.innerHTML = String(value ?? '');
+  const parts = [];
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(escapeHtml(node.textContent));
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    if (node.tagName === 'A') {
+      let href = null;
+      try {
+        const url = new URL(node.getAttribute('href') ?? '');
+        if (url.protocol === 'https:' || url.protocol === 'http:') href = url.href;
+      } catch {
+        href = null;
+      }
+      const text = escapeHtml(node.textContent || href || '');
+      parts.push(href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${text}</a>` : text);
+      return;
+    }
+    if (node.tagName === 'BR') {
+      parts.push('<br>');
+      return;
+    }
+    for (const child of node.childNodes) walk(child);
+  };
+  for (const child of template.content.childNodes) walk(child);
+  return parts.join('');
+}
+
 function selectedPlaceHtml(place) {
   const distance = distanceLy(state.focus?.coords, place.coords);
   return `
-    <h2>${place.name}</h2>
-    <div class="muted">${place.category ?? 'Place of interest'}</div>
+    <h2>${escapeHtml(place.name)}</h2>
+    <div class="muted">${escapeHtml(place.category ?? 'Place of interest')}</div>
     <dl>
       <dt>Coords</dt><dd>${coordsText(place.coords)}</dd>
-      <dt>System</dt><dd>${place.systemName ?? 'Unknown'}</dd>
-      ${place.stale ? `<dt>Status</dt><dd>Last known position. Latest journal system is ${place.unresolvedSystemName ?? 'unknown'}.</dd>` : ''}
-      <dt>Source</dt><dd>${place.source ?? 'Unknown'}</dd>
-      <dt>Group</dt><dd>${place.sourceGroup ?? 'Unknown'}</dd>
-      <dt>Type</dt><dd>${place.typeLabel ?? place.type ?? 'Unknown'}</dd>
+      <dt>System</dt><dd>${escapeHtml(place.systemName ?? 'Unknown')}</dd>
+      ${place.stale ? `<dt>Status</dt><dd>Last known position. Latest journal system is ${escapeHtml(place.unresolvedSystemName ?? 'unknown')}.</dd>` : ''}
+      <dt>Source</dt><dd>${escapeHtml(place.source ?? 'Unknown')}</dd>
+      <dt>Group</dt><dd>${escapeHtml(place.sourceGroup ?? 'Unknown')}</dd>
+      <dt>Type</dt><dd>${escapeHtml(place.typeLabel ?? place.type ?? 'Unknown')}</dd>
       <dt>Distance</dt><dd>${distance === null ? 'Unknown' : `${fmt(distance)} ly from focus`}</dd>
-      ${place.description ? `<dt>Notes</dt><dd>${place.description}</dd>` : ''}
+      ${place.description ? `<dt>Notes</dt><dd>${safeDescriptionHtml(place.description)}</dd>` : ''}
     </dl>
   `;
 }
@@ -3143,6 +3318,55 @@ function renderSearchResults(results, message = '') {
   state.renderer.setSearchResults(results, state.meta);
 }
 
+let searchPreviewTimer = null;
+let searchPreviewRequest = null;
+
+function scheduleSearchPreview(delay = 300) {
+  clearTimeout(searchPreviewTimer);
+  searchPreviewTimer = setTimeout(updateSearchPreview, delay);
+}
+
+async function updateSearchPreview() {
+  const query = el.llmSearchPrompt.value.trim();
+  if (!query) {
+    el.llmSearchPreview.replaceChildren();
+    return;
+  }
+  searchPreviewRequest?.abort();
+  const controller = new AbortController();
+  searchPreviewRequest = controller;
+  try {
+    const response = await fetch('/api/search-plan', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ query, provider: readLlmSettings().provider }),
+      signal: controller.signal,
+    });
+    if (!response.ok) return;
+    renderSearchPreview(await response.json());
+  } catch (error) {
+    if (!isAbortError(error)) console.warn(error);
+  }
+}
+
+function renderSearchPreview(preview) {
+  const line = document.createElement('div');
+  const label = document.createElement('strong');
+  label.textContent = 'Will search for: ';
+  line.append(label, preview.understood.join(' · '));
+  const parts = [line];
+  if (preview.unknown.length) {
+    const unknown = document.createElement('span');
+    unknown.className = 'llm-unknown';
+    const words = preview.unknown.map((word) => `"${word}"`).join(', ');
+    unknown.textContent = preview.aiProvider
+      ? `Not recognised: ${words}. The AI assistant (${llmProviderLabel(preview.aiProvider)}) will read the whole request.`
+      : `Not recognised: ${words}. These words will be ignored. Try other wording, or set up the AI assistant below to handle requests like this.`;
+    parts.push(unknown);
+  }
+  el.llmSearchPreview.replaceChildren(...parts);
+}
+
 function setLlmSearchOpen(open) {
   el.llmSearchPanel.hidden = !open;
   el.llmSearchButton.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -3152,6 +3376,7 @@ function setLlmSearchOpen(open) {
       el.llmSearchPrompt.value = el.search.value.trim();
     }
     el.llmSearchPrompt.focus();
+    scheduleSearchPreview(0);
   }
 }
 
@@ -3162,7 +3387,7 @@ function renderLlmResults(data) {
   if (!data.results?.length) {
     const empty = document.createElement('div');
     empty.className = 'llm-result';
-    empty.innerHTML = '<strong>No matching systems found</strong><small>Try widening the request or using fewer hard requirements.</small>';
+    empty.innerHTML = '<strong>No matching systems found</strong><small>Try a larger distance, like "within 2,000 ly", or fewer requirements.</small>';
     el.llmSearchResults.append(empty);
     state.renderer.setSearchResults([]);
     return;
@@ -3188,14 +3413,12 @@ function renderLlmResults(data) {
 async function runLlmSearch() {
   const query = el.llmSearchPrompt.value.trim();
   if (query.length < 8) {
-    el.llmSearchStatus.textContent = 'Enter a longer natural-language search.';
+    el.llmSearchStatus.textContent = 'Describe what you are looking for in a few more words.';
     return;
   }
-  const llm = persistLlmSettings();
+  const settings = persistLlmSettings();
   el.llmSearchRun.disabled = true;
-  el.llmSearchStatus.textContent = llm.enabled
-    ? `Asking ${llmProviderLabel(llm.provider)} for a search plan...`
-    : 'Using local keyword planner...';
+  el.llmSearchStatus.textContent = 'Searching...';
   el.llmSearchAnswer.hidden = true;
   el.llmSearchResults.replaceChildren();
   try {
@@ -3205,22 +3428,26 @@ async function runLlmSearch() {
       body: JSON.stringify({
         query,
         target: state.focus,
-        llm,
+        ai: { provider: settings.provider, model: settings.model },
       }),
     });
     const data = await response.json();
-    const planner = data.planner === 'heuristic' ? 'local keyword planner' : llmProviderLabel(llm.provider);
-    const filterText = [
-      data.plan?.filters?.ringTypes?.length ? `rings: ${data.plan.filters.ringTypes.join(', ')}` : '',
-      data.plan?.filters?.requireSignals ? 'signals required' : '',
-      data.plan?.keywords?.length ? `keywords: ${data.plan.keywords.join(', ')}` : '',
-    ].filter(Boolean).join(' · ');
-    el.llmSearchStatus.textContent = `${fmt(data.count)} result${data.count === 1 ? '' : 's'} · ${planner}${filterText ? ` · ${filterText}` : ''}`;
-    if (data.warning) el.llmSearchStatus.textContent += ` · ${data.warning}`;
+    const parts = [
+      data.count
+        ? `Found ${fmt(data.count)} system${data.count === 1 ? '' : 's'} among the ${fmt(data.scanned)} nearest.`
+        : `No matches among the ${fmt(data.scanned)} nearest systems.`,
+    ];
+    if (data.planner !== 'local') {
+      parts.push(`Read by the AI assistant (${llmProviderLabel(data.planner)}).`);
+    } else if (data.unknown?.length) {
+      parts.push(`Ignored: ${data.unknown.map((word) => `"${word}"`).join(', ')}.`);
+    }
+    if (data.warning) parts.push(data.warning);
+    el.llmSearchStatus.textContent = parts.join(' ');
     renderLlmResults(data);
   } catch (error) {
     console.error(error);
-    const message = `LLM search failed: ${error.message}`;
+    const message = `Search failed: ${error.message}`;
     el.llmSearchStatus.textContent = message;
     showClientToast(message);
     state.renderer.setSearchResults([]);
@@ -3294,9 +3521,16 @@ function bindControls() {
     writeLlmSettings(currentSettings);
     applyLlmSettingsToForm(readLlmSettings());
     el.llmProvider.dataset.previousProvider = provider;
+    scheduleSearchPreview(0);
   });
-  for (const input of [el.llmEnabled, el.llmModel, el.llmApiKey, el.llmBaseUrl]) {
-    input.addEventListener('change', persistLlmSettings);
+  el.llmModel.addEventListener('change', persistLlmSettings);
+  el.llmSearchPrompt.addEventListener('input', () => scheduleSearchPreview());
+  el.llmSaveKey.addEventListener('click', () => saveLlmKey());
+  el.llmRemoveKey.addEventListener('click', () => saveLlmKey({ remove: true }));
+  for (const input of [el.llmApiKey, el.llmBaseUrl]) {
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') saveLlmKey();
+    });
   }
   el.llmSearchPrompt.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
@@ -3596,6 +3830,7 @@ async function init() {
   setNotesMode(viewSettings.notesMode, false);
   bindControls();
   const ready = await loadStatus();
+  loadLlmKeys();
   if (!ready) return;
   applyLlmSettingsToForm(readLlmSettings());
   updateLandmarks();

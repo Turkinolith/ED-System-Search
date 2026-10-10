@@ -1825,6 +1825,88 @@ body {
   font-weight: 750;
 }
 
+.llm-search-preview {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.llm-search-preview strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.llm-search-preview .llm-unknown {
+  display: block;
+  margin-top: 3px;
+  color: #f2b45f;
+}
+
+.llm-ai-settings {
+  margin: 10px 0 8px;
+  border-top: 1px solid rgba(113, 142, 157, 0.18);
+  padding-top: 8px;
+}
+
+.llm-ai-settings > summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: #c9d9e0;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.llm-ai-settings > summary {
+  list-style: none;
+}
+
+.llm-ai-settings > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* The summary is a flex row, which hides the native marker, so draw one. */
+.llm-ai-settings > summary span::before {
+  content: '\25B8';
+  display: inline-block;
+  width: 14px;
+  color: var(--muted);
+}
+
+.llm-ai-settings[open] > summary span::before {
+  content: '\25BE';
+}
+
+.llm-ai-settings > summary small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.llm-ai-explainer {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.llm-key-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  gap: 8px;
+}
+
+.llm-key-actions .panel-button {
+  margin-top: 0;
+}
+
+.llm-key-actions .panel-button[hidden] {
+  display: none;
+}
+
 .llm-settings-grid small,
 .llm-mode-toggle small {
   display: block;

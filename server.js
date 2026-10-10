@@ -17,7 +17,9 @@ import {
 } from './scripts/update-time.js';
 import { suggestKey } from './scripts/suggest-key.js';
 import { buildPlaceIndex, readPlaceIndexCategories, readPlaceIndexMeta } from './scripts/place-index.js';
-import { loadLocalConfig, saveTrackedCarrier } from './local-config.js';
+import { loadLocalConfig, removeLocalConfigLlmApiKey, saveTrackedCarrier } from './local-config.js';
+import { createSecretStore } from './secret-store.js';
+import { bodyMatchesType, compactText, knownKeywords, planSearchLocally } from './scripts/search-planner.js';
 import { findCarrierIdentity, parseCarrierQuery } from './scripts/carrier-identity.js';
 import { createShutdownController } from './shutdown-guard.js';
 import { cleanupJunkFiles, DEFAULT_MIN_AGE_MS, describeCleanup } from './scripts/cleanup-junk.js';
@@ -303,7 +305,14 @@ function clampNote(value) {
   return String(value ?? '').trim().slice(0, 512);
 }
 
+// Only JSON bodies are accepted. A cross-site page can send a text/plain POST
+// without a CORS preflight, but not an application/json one.
 async function readRequestJson(req, maxBytes = 4096) {
+  if (!/^application\/json\b/i.test(req.headers['content-type'] ?? '')) {
+    const error = new Error('Requests must send a JSON body (content-type: application/json).');
+    error.statusCode = 415;
+    throw error;
+  }
   let body = '';
   for await (const chunk of req) {
     body += chunk;
@@ -419,17 +428,6 @@ function sameCarrierText(a, b) {
 }
 
 async function saveTrackedCarrierConfig(req, res) {
-  // This endpoint rewrites a local file, so refuse cross-site form posts.
-  const origin = req.headers.origin;
-  if (origin) {
-    let originHost = null;
-    try {
-      originHost = new URL(origin).host;
-    } catch {
-      originHost = null;
-    }
-    if (originHost !== req.headers.host) return sendJson(res, { error: 'Cross-origin request refused.' }, 403);
-  }
   const payload = await readRequestJson(req);
   const query = parseCarrierQuery(String(payload.carrier ?? '').slice(0, 120));
   if (!query) {
@@ -1072,10 +1070,12 @@ async function callLlmText(config, systemPrompt, userPrompt, maxTokens = 900) {
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
       },
+      // Current Claude models reject sampling parameters and think by default,
+      // and thinking counts toward max_tokens, so send no temperature and
+      // leave headroom beyond the expected answer length.
       body: JSON.stringify({
         model,
-        max_tokens: maxTokens,
-        temperature: 0.1,
+        max_tokens: Math.max(maxTokens, 4096),
         system: systemPrompt,
         messages: [{ role: 'user', content: userPrompt }],
       }),
@@ -1107,7 +1107,7 @@ async function callLlmText(config, systemPrompt, userPrompt, maxTokens = 900) {
     return String(data.choices?.[0]?.message?.content ?? '').trim();
   }
 
-  const response = await fetch(`${baseUrl}/responses`, {
+  const requestResponse = (withTemperature) => fetch(`${baseUrl}/responses`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -1115,7 +1115,7 @@ async function callLlmText(config, systemPrompt, userPrompt, maxTokens = 900) {
     },
     body: JSON.stringify({
       model,
-      temperature: 0.1,
+      ...(withTemperature ? { temperature: 0.1 } : {}),
       max_output_tokens: maxTokens,
       input: [
         { role: 'system', content: systemPrompt },
@@ -1123,7 +1123,13 @@ async function callLlmText(config, systemPrompt, userPrompt, maxTokens = 900) {
       ],
     }),
   });
-  const data = await response.json().catch(() => ({}));
+  let response = await requestResponse(true);
+  let data = await response.json().catch(() => ({}));
+  // Reasoning models reject temperature; older chat models accept it.
+  if (response.status === 400 && /temperature/i.test(data.error?.message ?? '')) {
+    response = await requestResponse(false);
+    data = await response.json().catch(() => ({}));
+  }
   if (!response.ok) throw new Error(data.error?.message ?? `OpenAI request failed with HTTP ${response.status}.`);
   if (data.output_text) return String(data.output_text).trim();
   return (data.output ?? [])
@@ -1133,30 +1139,191 @@ async function callLlmText(config, systemPrompt, userPrompt, maxTokens = 900) {
     .trim();
 }
 
-function heuristicLlmSearchPlan(query) {
-  const text = String(query ?? '').toLowerCase();
-  const ringTypes = [];
-  const bodyTypes = [];
-  const keywords = [];
-  if (/\bicy\b|ice ring|icy ring/.test(text)) ringTypes.push('icy');
-  if (/rocky ice|rocky-ice/.test(text)) bodyTypes.push('rockyIce');
-  if (/\btritium\b/.test(text)) keywords.push('tritium');
-  if (/hotspot|hot spot/.test(text)) keywords.push('hotspot');
-  const radiusMatch = text.match(/(?:within|inside|under|less than)\s+(\d+(?:\.\d+)?)\s*(?:ly|light years?|light-years?)/);
-  const radiusLy = radiusMatch ? Number(radiusMatch[1]) : 1000;
-  return {
-    intent: 'Find nearby systems matching the natural-language request.',
-    radiusLy,
-    limit: 10,
-    scanLimit: 160,
-    filters: {
-      ringTypes,
-      bodyTypes,
-      requireSignals: /\bsignal|hotspot|hot spot|tritium/.test(text) && !/\bprefer|preferably|bonus|ideally/.test(text),
-    },
-    preferences: keywords.length ? ['Prefer exact mentions of requested hotspot/material keywords.'] : [],
-    keywords,
+// OpenAI's model list also holds embedding, audio, image, and moderation
+// models that cannot answer a text prompt.
+const nonTextModelPattern = /(embedding|tts|whisper|dall-e|image|audio|realtime|transcribe|moderation|search|computer-use|davinci|babbage)/i;
+const llmModelCache = new Map();
+const llmModelCacheMs = 10 * 60 * 1000;
+
+async function listLlmModels(config) {
+  const provider = cleanLlmText(config?.provider, 40) || 'openai';
+  const apiKey = cleanLlmText(config?.apiKey, 400);
+  const baseUrl = llmBaseUrl(provider, config?.baseUrl);
+  if (provider !== 'kobold' && !apiKey) throw new Error('Add an API key to list models.');
+  const cacheKey = `${provider}|${baseUrl}|${createHash('sha256').update(apiKey).digest('hex')}`;
+  const cached = llmModelCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < llmModelCacheMs) return cached.models;
+
+  const request = async (url, headers) => {
+    const response = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error?.message ?? `Model list request failed with HTTP ${response.status}.`);
+    return data;
   };
+
+  let models;
+  if (provider === 'anthropic') {
+    models = [];
+    let afterId = null;
+    // Pages are newest first; ten pages of 1000 is far beyond the catalog.
+    for (let page = 0; page < 10; page += 1) {
+      const params = new URLSearchParams({ limit: '1000' });
+      if (afterId) params.set('after_id', afterId);
+      const data = await request(`${baseUrl}/v1/models?${params}`, {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      });
+      for (const model of data.data ?? []) {
+        models.push({ id: model.id, label: model.display_name || model.id, created: Date.parse(model.created_at) || 0 });
+      }
+      if (!data.has_more || !data.last_id) break;
+      afterId = data.last_id;
+    }
+  } else {
+    const data = await request(`${baseUrl}/models`, apiKey ? { authorization: `Bearer ${apiKey}` } : {});
+    models = (data.data ?? [])
+      .filter((model) => provider === 'kobold' || !nonTextModelPattern.test(model.id))
+      .map((model) => ({ id: model.id, label: model.id, created: (Number(model.created) || 0) * 1000 }));
+  }
+  models = models
+    .filter((model) => typeof model.id === 'string' && model.id)
+    .sort((a, b) => b.created - a.created || a.id.localeCompare(b.id));
+  llmModelCache.set(cacheKey, { at: Date.now(), models });
+  return models;
+}
+
+// API keys live in the operating system's credential store, one entry per
+// provider holding the key and the base URL it was saved for. Requests name
+// only the provider, so a key can never be sent to a URL a request supplies.
+const llmProviderIds = ['openai', 'anthropic', 'kobold'];
+const secretStore = createSecretStore({ fallbackFile: path.join(dataDir, 'llm-keys.local.json') });
+let llmCredentials = null;
+let llmCredentialsLoad = null;
+
+function llmCredentialName(provider) {
+  return `llm-${provider}`;
+}
+
+function cleanLlmBaseUrl(value) {
+  const text = cleanLlmText(value, 400);
+  if (!text) return '';
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    throw new Error('The base URL is not a valid URL.');
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('The base URL must start with http:// or https://.');
+  return text.replace(/\/+$/, '');
+}
+
+async function loadLlmCredentials() {
+  llmCredentialsLoad ??= (async () => {
+    const values = await secretStore.getMany(llmProviderIds.map(llmCredentialName));
+    const credentials = new Map();
+    values.forEach((value, index) => {
+      if (!value) return;
+      try {
+        const parsed = JSON.parse(value);
+        credentials.set(llmProviderIds[index], {
+          apiKey: cleanLlmText(parsed.apiKey, 400),
+          baseUrl: cleanLlmText(parsed.baseUrl, 400),
+          savedAt: parsed.savedAt ?? null,
+        });
+      } catch {
+        console.warn(`Ignoring an unreadable stored credential for ${llmProviderIds[index]}.`);
+      }
+    });
+    llmCredentials = credentials;
+    await migrateConfigLlmKey();
+    return credentials;
+  })().catch((error) => {
+    llmCredentialsLoad = null;
+    throw error;
+  });
+  return llmCredentialsLoad;
+}
+
+// A key written into config.local.json by hand is moved into the credential
+// store on startup and removed from the file.
+async function migrateConfigLlmKey() {
+  const configured = localConfig.llmSearch;
+  if (!configured?.apiKey || !llmProviderIds.includes(configured.provider)) return;
+  if (!llmCredentials.has(configured.provider)) {
+    await storeLlmCredential(configured.provider, configured.apiKey, configured.baseUrl ?? '');
+    console.log(`Moved the ${configured.provider} API key from config.local.json into the credential store.`);
+  }
+  localConfig = { ...localConfig, llmSearch: { ...configured, apiKey: null } };
+  await removeLocalConfigLlmApiKey();
+}
+
+async function storeLlmCredential(provider, apiKey, baseUrl) {
+  const record = { apiKey, baseUrl, savedAt: new Date().toISOString() };
+  await secretStore.set(llmCredentialName(provider), JSON.stringify(record));
+  llmCredentials.set(provider, record);
+}
+
+async function resolveLlmCredential(provider) {
+  await loadLlmCredentials();
+  const saved = llmCredentials.get(provider);
+  return { apiKey: saved?.apiKey ?? '', baseUrl: saved?.baseUrl ?? '' };
+}
+
+async function llmKeyStatus() {
+  const store = await secretStore.info();
+  let loadError = null;
+  try {
+    await loadLlmCredentials();
+  } catch (error) {
+    loadError = error.message;
+  }
+  const providers = {};
+  for (const provider of llmProviderIds) {
+    const saved = llmCredentials?.get(provider);
+    providers[provider] = {
+      saved: Boolean(saved?.apiKey || saved?.baseUrl),
+      hasKey: Boolean(saved?.apiKey),
+      baseUrl: saved?.baseUrl ?? '',
+      savedAt: saved?.savedAt ?? null,
+    };
+  }
+  return { store, providers, error: loadError };
+}
+
+async function updateLlmKey(req, res) {
+  const payload = await readRequestJson(req);
+  const provider = cleanLlmText(payload.provider, 40);
+  if (!llmProviderIds.includes(provider)) return badRequest(res, 'Unknown LLM provider.');
+  await loadLlmCredentials();
+  if (payload.remove) {
+    await secretStore.delete(llmCredentialName(provider));
+    llmCredentials.delete(provider);
+  } else {
+    const apiKey = cleanLlmText(payload.apiKey, 400);
+    let baseUrl;
+    try {
+      baseUrl = cleanLlmBaseUrl(payload.baseUrl);
+    } catch (error) {
+      return badRequest(res, error.message);
+    }
+    if (provider !== 'kobold' && !apiKey) return badRequest(res, 'Enter an API key to save.');
+    await storeLlmCredential(provider, apiKey, baseUrl);
+  }
+  // Model lists were fetched with the old key or endpoint.
+  for (const key of llmModelCache.keys()) if (key.startsWith(`${provider}|`)) llmModelCache.delete(key);
+  return sendJson(res, await llmKeyStatus());
+}
+
+async function listLlmModelsForRequest(req, res) {
+  const payload = await readRequestJson(req);
+  const provider = cleanLlmText(payload.provider, 40);
+  if (!llmProviderIds.includes(provider)) return badRequest(res, 'Unknown LLM provider.');
+  try {
+    const models = await listLlmModels({ provider, ...(await resolveLlmCredential(provider)) });
+    return sendJson(res, { provider, models });
+  } catch (error) {
+    return sendJson(res, { error: error.message }, 502);
+  }
 }
 
 function sanitizeLlmSearchPlan(value, fallback) {
@@ -1168,9 +1335,11 @@ function sanitizeLlmSearchPlan(value, fallback) {
   const limit = Number(plan.limit ?? fallback.limit);
   const scanLimit = Number(plan.scanLimit ?? fallback.scanLimit);
   const filters = plan.filters && typeof plan.filters === 'object' ? plan.filters : {};
+  // Keywords are limited to material and signal names that exist in the data,
+  // so an invented keyword cannot silently filter every system out.
   const keywords = Array.isArray(plan.keywords)
-    ? plan.keywords.map((item) => cleanLlmText(item, 40).toLowerCase()).filter(Boolean).slice(0, 8)
-    : fallback.keywords;
+    ? plan.keywords.map((item) => compactText(item)).filter((item) => knownKeywords.includes(item))
+    : [];
   return {
     intent: cleanLlmText(plan.intent, 240) || fallback.intent,
     radiusLy: Number.isFinite(radiusLy) ? Math.max(25, Math.min(5000, radiusLy)) : fallback.radiusLy,
@@ -1180,23 +1349,46 @@ function sanitizeLlmSearchPlan(value, fallback) {
       ringTypes: [...new Set([...fallback.filters.ringTypes, ...cleanList(filters.ringTypes, Object.keys(richCategoryMasks.ring))])],
       bodyTypes: [...new Set([...fallback.filters.bodyTypes, ...cleanList(filters.bodyTypes, Object.keys(richCategoryMasks.body))])],
       requireSignals: Boolean(filters.requireSignals ?? fallback.filters.requireSignals),
+      requireKeywords: Boolean(filters.requireKeywords ?? fallback.filters.requireKeywords),
+      keywordMatch: filters.keywordMatch === 'any' ? 'any' : (filters.keywordMatch === 'all' ? 'all' : fallback.filters.keywordMatch),
     },
     preferences: Array.isArray(plan.preferences)
       ? plan.preferences.map((item) => cleanLlmText(item, 120)).filter(Boolean).slice(0, 5)
       : fallback.preferences,
-    keywords,
+    keywords: [...new Set([...fallback.keywords, ...keywords])],
   };
 }
 
-async function llmSearchPlan(query, config) {
-  const fallback = heuristicLlmSearchPlan(query);
-  if (!config?.enabled) return { plan: fallback, source: 'heuristic', warning: 'LLM settings are not configured; used local keyword planning.' };
+// The configured AI provider, if one is set up: a saved key, or a saved
+// endpoint for a local KoboldCPP server.
+async function availableAiConfig(provider, model) {
+  if (!llmProviderIds.includes(provider)) return null;
+  await loadLlmCredentials().catch(() => null);
+  const saved = llmCredentials?.get(provider);
+  if (!saved || (provider !== 'kobold' && !saved.apiKey)) return null;
+  return {
+    enabled: true,
+    provider,
+    model: cleanLlmText(model, 120) || localConfig.llmSearch?.model || '',
+    apiKey: saved.apiKey,
+    baseUrl: saved.baseUrl,
+  };
+}
+
+// Searches use the built-in planner. The AI assistant is asked only when the
+// request has words the built-in planner could not use and an assistant is
+// set up; if that call fails, the built-in plan still runs.
+async function planSearch(query, aiConfig) {
+  const local = planSearchLocally(query);
+  const result = { plan: local.plan, source: 'local', understood: local.understood, unknown: local.unknown, warning: null };
+  if (!local.unknown.length || !aiConfig) return result;
   const systemPrompt = [
     'You translate Elite Dangerous galaxy search requests into constrained JSON search plans.',
     'Use only these filter values:',
     `ringTypes: ${Object.keys(richCategoryMasks.ring).join(', ')}`,
     `bodyTypes: ${Object.keys(richCategoryMasks.body).join(', ')}`,
-    'Return JSON only. No prose.',
+    `keywords (ring hotspot materials and surface signals): ${knownKeywords.join(', ')}`,
+    'Leave a list empty when the request does not ask for it. Return JSON only. No prose.',
   ].join('\n');
   const userPrompt = JSON.stringify({
     request: query,
@@ -1210,13 +1402,19 @@ async function llmSearchPlan(query, config) {
         ringTypes: ['icy'],
         bodyTypes: [],
         requireSignals: true,
+        requireKeywords: 'true when the materials are required, false when only preferred',
+        keywordMatch: 'all or any',
       },
       preferences: ['prefer tritium hotspots if present'],
-      keywords: ['tritium', 'hotspot'],
+      keywords: ['tritium'],
     },
   });
-  const text = await callLlmText(config, systemPrompt, userPrompt, 700);
-  return { plan: sanitizeLlmSearchPlan(jsonFromText(text), fallback), source: config.provider };
+  try {
+    const text = await callLlmText(aiConfig, systemPrompt, userPrompt, 700);
+    return { ...result, plan: sanitizeLlmSearchPlan(jsonFromText(text), local.plan), source: aiConfig.provider };
+  } catch (error) {
+    return { ...result, warning: `The AI assistant could not be reached (${error.message}), so only the understood parts were searched.` };
+  }
 }
 
 async function collectNearestSpatialPoints(center, limit, maximumRadius) {
@@ -1380,6 +1578,22 @@ function richSummaryMatches(entry, plan) {
   return true;
 }
 
+// Signal names from either data format: the galaxy dump nests counts under
+// "signals" ({ signals: { "$SAA_SignalType_Geological;": 3 }, updateTime }),
+// while journal-merged bodies list them directly ({ Tritium: { count: 1 } }).
+function signalNames(signals) {
+  if (!signals || typeof signals !== 'object') return [];
+  const names = new Set();
+  const readable = (key) => key.replace(/^\$SAA_SignalType_(\w+);$/, '$1');
+  if (signals.signals && typeof signals.signals === 'object') {
+    for (const key of Object.keys(signals.signals)) names.add(readable(key));
+  }
+  for (const key of Object.keys(signals)) {
+    if (!['signals', 'updatetime', 'genuses'].includes(key.toLowerCase())) names.add(readable(key));
+  }
+  return [...names];
+}
+
 function candidateEvidence(system, rich, plan) {
   const ringEvidence = [];
   const bodyEvidence = [];
@@ -1388,16 +1602,16 @@ function candidateEvidence(system, rich, plan) {
   let score = 0;
   const bodies = Array.isArray(rich?.system?.bodies) ? rich.system.bodies : [];
   const requiredRingTypes = new Set(plan.filters.ringTypes.map((item) => item.toLowerCase()));
-  const requiredBodyTypes = new Set(plan.filters.bodyTypes.map((item) => item.toLowerCase()));
-  const keywords = plan.keywords.map((item) => item.toLowerCase());
+  const requiredBodyTypes = plan.filters.bodyTypes;
+  const keywords = plan.keywords.map((item) => compactText(item));
+  const matchedKeywordSet = new Set();
   let hasRequiredRing = requiredRingTypes.size === 0;
-  let hasRequiredBody = requiredBodyTypes.size === 0;
+  let hasRequiredBody = requiredBodyTypes.length === 0;
   let hasSignals = !plan.filters.requireSignals;
   let hasKeyword = keywords.length === 0;
   let signalScoreApplied = false;
   for (const body of bodies) {
-    const bodyTypeText = String(body.subType ?? body.type ?? '').toLowerCase();
-    if ([...requiredBodyTypes].some((type) => bodyTypeText.includes(type.replace(/[A-Z]/g, (char) => ` ${char.toLowerCase()}`).trim()))) {
+    if (requiredBodyTypes.some((type) => bodyMatchesType(body, type))) {
       hasRequiredBody = true;
       score += 8;
       bodyEvidence.push(`${body.name ?? 'Body'} matches requested body type.`);
@@ -1410,8 +1624,11 @@ function candidateEvidence(system, rich, plan) {
         ringEvidence.push(`${body.name ?? 'Body'} has ${ring.type ?? 'matching'} ring ${ring.name ?? ''}`.trim());
       }
     }
-    const signalKeys = Object.keys(body.signals ?? {})
-      .filter((key) => !['signals', 'updatetime', 'genuses'].includes(key.toLowerCase()));
+    // Ring hotspots sit on each ring's own signals.
+    const signalKeys = [...new Set([
+      ...signalNames(body.signals),
+      ...(body.rings ?? []).flatMap((ring) => signalNames(ring.signals)),
+    ])];
     if (signalKeys.length) {
       hasSignals = true;
       if (!signalScoreApplied) {
@@ -1420,26 +1637,32 @@ function candidateEvidence(system, rich, plan) {
       }
       signalEvidence.push(`${body.name ?? 'Body'} has ${signalKeys.join(', ')} signals.`);
     }
-    const searchable = JSON.stringify({
+    const searchable = compactText(JSON.stringify({
       name: body.name,
       subType: body.subType,
       type: body.type,
       rings: body.rings,
       signals: body.signals,
       reserveLevel: body.reserveLevel,
-    }).toLowerCase();
+    }));
     const matchedKeywords = keywords.filter((keyword) => searchable.includes(keyword));
     if (matchedKeywords.length) {
       hasKeyword = true;
-      score += matchedKeywords.length * 20;
-      keywordEvidence.push(`${body.name ?? 'Body'} mentions ${matchedKeywords.join(', ')}.`);
+      for (const keyword of matchedKeywords) matchedKeywordSet.add(keyword);
+      // Requested materials outweigh ring count, so "preferably tritium"
+      // puts tritium systems first.
+      score += matchedKeywords.length * 40;
+      keywordEvidence.push(`${body.name ?? 'Body'} has ${signalKeys.length ? signalKeys.join(', ') : matchedKeywords.join(', ')}.`);
     }
   }
-  const matches = hasRequiredRing && hasRequiredBody && hasSignals;
+  const keywordsSatisfied = !plan.filters.requireKeywords || !keywords.length || (plan.filters.keywordMatch === 'any'
+    ? matchedKeywordSet.size > 0
+    : keywords.every((keyword) => matchedKeywordSet.has(keyword)));
+  const matches = hasRequiredRing && hasRequiredBody && hasSignals && keywordsSatisfied;
   const evidence = [...keywordEvidence, ...ringEvidence, ...bodyEvidence, ...signalEvidence];
   return {
     matches,
-    score: score + (hasKeyword ? 20 : 0),
+    score: score + (hasKeyword && keywords.length ? 40 : 0),
     evidence: [...new Set(evidence)].slice(0, 5),
     confidence: hasKeyword ? 'high' : matches ? 'medium' : 'low',
   };
@@ -1474,17 +1697,12 @@ async function llmAugmentedSearch(req, res) {
     z: Number(target.coords?.z),
   };
   if (!Object.values(targetCoords).every(Number.isFinite)) return badRequest(res, 'A current target with finite coordinates is required.');
-  const llmConfig = payload.llm && typeof payload.llm === 'object' ? {
-    enabled: Boolean(payload.llm.enabled),
-    provider: cleanLlmText(payload.llm.provider, 40) || localConfig.llmSearch?.provider,
-    model: cleanLlmText(payload.llm.model, 120) || localConfig.llmSearch?.model,
-    apiKey: cleanLlmText(payload.llm.apiKey, 400) || localConfig.llmSearch?.apiKey,
-    baseUrl: cleanLlmText(payload.llm.baseUrl, 400) || localConfig.llmSearch?.baseUrl,
-  } : { enabled: false };
+  const ai = payload.ai && typeof payload.ai === 'object' ? payload.ai : {};
+  const aiConfig = await availableAiConfig(cleanLlmText(ai.provider, 40), ai.model);
 
   const meta = await getMeta();
   if (!meta) return sendJson(res, { error: 'Systems have not been imported yet.' }, 409);
-  const planResult = await llmSearchPlan(query, llmConfig);
+  const planResult = await planSearch(query, aiConfig);
   const plan = planResult.plan;
   const nearest = await collectNearestSpatialPoints(targetCoords, plan.scanLimit, plan.radiusLy);
   const results = [];
@@ -1510,16 +1728,33 @@ async function llmAugmentedSearch(req, res) {
   }
   results.sort((a, b) => b.score - a.score || a.distanceLy - b.distanceLy);
   const trimmed = results.slice(0, plan.limit);
-  const answer = await summarizeLlmSearch(query, { name: target.name ?? 'Current target', coords: targetCoords }, plan, trimmed, llmConfig);
+  // The written summary comes from the assistant, so only when it planned.
+  const answer = planResult.source !== 'local'
+    ? await summarizeLlmSearch(query, { name: target.name ?? 'Current target', coords: targetCoords }, plan, trimmed, aiConfig)
+    : '';
   return sendJson(res, {
     query,
     target: { name: target.name ?? null, coords: targetCoords },
     plan,
     planner: planResult.source,
+    understood: planResult.understood,
+    unknown: planResult.unknown,
+    scanned: nearest.length,
     warning: planResult.warning ?? null,
     answer,
     count: trimmed.length,
     results: trimmed,
+  });
+}
+
+async function previewSearchPlan(req, res) {
+  const payload = await readRequestJson(req);
+  const local = planSearchLocally(cleanLlmText(payload.query, 1200));
+  const aiConfig = local.unknown.length ? await availableAiConfig(cleanLlmText(payload.provider, 40), '') : null;
+  return sendJson(res, {
+    understood: local.understood,
+    unknown: local.unknown,
+    aiProvider: aiConfig?.provider ?? null,
   });
 }
 
@@ -3713,8 +3948,40 @@ async function serveStatic(req, reqUrl, res) {
   }
 }
 
+// Hostnames the app answers to. Checking Host stops DNS rebinding (a page on
+// another domain re-pointed at 127.0.0.1); checking Origin on writes stops
+// other sites posting to the app from the user's browser.
+const allowedHostnames = new Set([
+  'localhost',
+  '127.0.0.1',
+  '[::1]',
+  ...String(process.env.EDSS_ALLOWED_HOSTS ?? '').split(',').map((host) => host.trim().toLowerCase()).filter(Boolean),
+]);
+
+function requestHostname(value) {
+  try {
+    return new URL(`http://${value}`).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedRequest(req) {
+  if (!allowedHostnames.has(requestHostname(req.headers.host ?? ''))) return false;
+  if (req.method === 'GET' || req.method === 'HEAD') return true;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const url = new URL(origin);
+    return url.host === req.headers.host && allowedHostnames.has(url.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
+    if (!isAllowedRequest(req)) return sendJson(res, { error: 'Request refused: the app only answers to its own pages on this computer.' }, 403);
     const reqUrl = new URL(req.url, `http://${req.headers.host}`);
     if (reqUrl.pathname === '/api/status') {
       refreshCarrierPlacesOnceDaily().catch((error) => console.warn(`Carrier POI refresh failed: ${error.message}`));
@@ -3749,8 +4016,6 @@ const server = http.createServer(async (req, res) => {
           llmSearch: localConfig.llmSearch ? {
             provider: localConfig.llmSearch.provider,
             model: localConfig.llmSearch.model,
-            baseUrl: localConfig.llmSearch.baseUrl,
-            hasApiKey: Boolean(localConfig.llmSearch.apiKey),
           } : null,
         },
         journalPath: journalDir,
@@ -3761,6 +4026,10 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/search') return await searchSystems(req, reqUrl, res);
     if (reqUrl.pathname === '/api/nav-route') return await readNavRoute(res);
     if (reqUrl.pathname === '/api/llm-search' && req.method === 'POST') return await llmAugmentedSearch(req, res);
+    if (reqUrl.pathname === '/api/search-plan' && req.method === 'POST') return await previewSearchPlan(req, res);
+    if (reqUrl.pathname === '/api/llm-models' && req.method === 'POST') return await listLlmModelsForRequest(req, res);
+    if (reqUrl.pathname === '/api/llm-keys' && req.method === 'GET') return sendJson(res, await llmKeyStatus());
+    if (reqUrl.pathname === '/api/llm-keys' && req.method === 'POST') return await updateLlmKey(req, res);
     if (reqUrl.pathname === '/api/system') return await readSystemDetail(reqUrl, res);
     if (reqUrl.pathname === '/api/system-rich') return await readRichSystem(reqUrl, res);
     if (reqUrl.pathname === '/api/notes' && req.method === 'GET') return await listSystemNotes(req, reqUrl, res);
@@ -3804,12 +4073,16 @@ const server = http.createServer(async (req, res) => {
     }
     return await serveStatic(req, reqUrl, res);
   } catch (error) {
+    if (error.statusCode) return sendJson(res, { error: error.message }, error.statusCode);
     console.error(error);
     sendJson(res, { error: error.message }, 500);
   }
 });
 
 const port = Number(process.env.PORT ?? 5177);
+// Loopback only unless EDSS_HOST says otherwise; the app holds API keys and
+// writes local files, so it should not be reachable from the network by default.
+const listenHost = process.env.EDSS_HOST || '127.0.0.1';
 
 // Distinct exit codes so the launcher (.bat) can print a situation-appropriate
 // message instead of a generic failure line.
@@ -3993,7 +4266,7 @@ function listen(targetPort) {
     };
     server.once('error', onError);
     server.once('listening', onListening);
-    server.listen(targetPort);
+    server.listen(targetPort, listenHost);
   });
 }
 
@@ -4019,6 +4292,14 @@ async function start() {
     await listen(port);
   }
   console.log(`Elite Dangerous System Search running at http://localhost:${port}`);
+  // Read stored keys in the background so the first LLM request is quick, and
+  // say up front if the credential store is unavailable.
+  secretStore.info()
+    .then((store) => {
+      if (!store.secure) console.warn(`API keys are stored in plain text: ${store.reason ?? store.label}`);
+      return loadLlmCredentials();
+    })
+    .catch((error) => console.warn(`Could not read stored API keys: ${error.message}`));
   // Fire and forget: a previous run may have been killed mid-import, and the
   // stranded temps should not delay the port being served. Uses the default age
   // threshold so a hand-run CLI import in another terminal keeps its temps.

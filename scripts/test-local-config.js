@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { normalizeLocalConfig, saveTrackedCarrier } from '../local-config.js';
+import { normalizeLocalConfig, removeLocalConfigLlmApiKey, saveTrackedCarrier } from '../local-config.js';
 import { findCarrierIdentity, parseCarrierQuery } from './carrier-identity.js';
 
 assert.deepEqual(normalizeLocalConfig(), {
@@ -70,6 +70,13 @@ try {
   const written = JSON.parse(await fs.readFile(configFile, 'utf8'));
   assert.equal(written.llmSearch.provider, 'kobold', 'saving the carrier keeps other settings');
   assert.equal((await saveTrackedCarrier(null, configFile)).trackedCarrier, null);
+
+  await fs.writeFile(configFile, JSON.stringify({ llmSearch: { provider: 'anthropic', model: 'claude-opus-5-5', apiKey: 'sk-secret' } }));
+  const stripped = await removeLocalConfigLlmApiKey(configFile);
+  assert.equal(stripped.llmSearch.apiKey, null);
+  const strippedRaw = JSON.parse(await fs.readFile(configFile, 'utf8'));
+  assert.equal(strippedRaw.llmSearch.apiKey, undefined, 'the plain-text key is removed from the file');
+  assert.equal(strippedRaw.llmSearch.model, 'claude-opus-5-5', 'other LLM settings are kept');
 } finally {
   await fs.rm(tempDir, { recursive: true, force: true });
 }

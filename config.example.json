@@ -8,8 +8,6 @@
   },
   "llmSearch": {
     "provider": "openai",
-    "model": "gpt-5.4-mini",
-    "baseUrl": "",
-    "apiKey": ""
+    "model": "gpt-5.4-mini"
   }
 }
