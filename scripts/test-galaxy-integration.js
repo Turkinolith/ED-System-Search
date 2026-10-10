@@ -327,6 +327,30 @@ try {
   assert.deepEqual(await pointIndexes('economy=highTech'), [0]);
   assert.deepEqual(await pointIndexes('security=high'), [0]);
   assert.deepEqual(await pointIndexes('government=democracy'), [0]);
+  assert.deepEqual(await pointIndexes('economy=none'), [1, 2, 3, 4], '"none" should select systems without an economy, including ones with no rich record.');
+  assert.deepEqual(await pointIndexes('security=high,none'), [0, 1, 2, 3, 4]);
+
+  // Colour-by packs the category (1-based index in color-modes.js) into flag bits 12..15.
+  async function pointCategories(pathAndQuery) {
+    const response = await fetch(`http://localhost:${port}${pathAndQuery}`);
+    if (!response.ok) throw new Error(`Point request failed (${response.status}): ${await response.text()}`);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const categories = new Map();
+    for (let offset = 0; offset < bytes.length; offset += 20) {
+      categories.set(bytes.readUInt32LE(offset + 16), bytes.readUInt16LE(offset + 14) >> 12);
+    }
+    return { colorBy: response.headers.get('x-color-by'), categories };
+  }
+  const securityColors = await pointCategories('/api/points?types=0&limit=100&colorBy=security');
+  assert.equal(securityColors.colorBy, 'security');
+  assert.deepEqual([...securityColors.categories.entries()].sort((a, b) => a[0] - b[0]), [[0, 4], [1, 0], [2, 0], [3, 0], [4, 0]]);
+  const filteredColors = await pointCategories('/api/points?types=0&limit=100&colorBy=economy&economy=highTech');
+  // High Tech + Tourism: two-economy systems take the less common economy (Tourism, 7).
+  assert.deepEqual([...filteredColors.categories.entries()], [[0, 7]], 'Colour-by should combine with the existing filters.');
+  const localColors = await pointCategories('/api/local-points?x=10&y=11&z=12&types=0&limit=1000&colorBy=government');
+  assert.equal(localColors.colorBy, 'government');
+  assert.equal(localColors.categories.get(0), 6, 'The local sphere should be coloured too.');
+  assert.equal(localColors.categories.get(1), 0);
 
   const staleManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
   staleManifest.mapFilters.lodLevels[0].count += 1;

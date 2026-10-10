@@ -2,6 +2,7 @@ import { createReadStream, createWriteStream, existsSync, promises as fs } from 
 import path from 'node:path';
 import { createGunzip } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
+import { massCode, withMassCode, weightedLodDivisor } from './mass-code.js';
 import { parseUpdateSeconds, secondsToIso, unknownUpdateSeconds } from './update-time.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -91,7 +92,8 @@ async function writeSystem(system, index, writers, bounds) {
   nameBytes += nameBuffer.length;
   await writeAll(writers.names, nameBuffer);
 
-  const flags = (system.needsPermit ? 1 : 0) | (nonStandard(star) ? 2 : 0);
+  const flags = withMassCode((system.needsPermit ? 1 : 0) | (nonStandard(star) ? 2 : 0), system.id64);
+  const code64 = massCode(system.id64);
   const record = Buffer.allocUnsafe(recordBytes);
   record.writeFloatLE(Number(system.coords?.x ?? 0), 0);
   record.writeFloatLE(Number(system.coords?.y ?? 0), 4);
@@ -134,7 +136,7 @@ async function writeSystem(system, index, writers, bounds) {
   point.writeUInt32LE(index, 16);
   const hash = hashIndex(system.id64, index);
   for (let i = 0; i < lodDefs.length; i += 1) {
-    if (hash % lodDefs[i].divisor === 0) {
+    if (hash % weightedLodDivisor(lodDefs[i].divisor, code64) === 0) {
       await writeAll(writers.lods[i], point);
       lodCounts[i] += 1;
     }
@@ -208,6 +210,8 @@ async function main() {
     typeNames,
     typeCounts: Object.fromEntries([...typeCounts.entries()].map(([k, v]) => [String(k), v])),
     baseTypes: Object.fromEntries(typeNames.map((name, code) => [String(code), baseType(name)])),
+    pointFlags: { massCodeShift: 8, massCodeBits: 4 },
+    lodWeighting: 'mass-code-v1',
     lodLevels: lodDefs.map((lod, i) => ({ level: lod.level, divisor: lod.divisor, file: lod.file, count: lodCounts[i] })),
     updateTimeRange: {
       available: minUpdateSeconds !== unknownUpdateSeconds,

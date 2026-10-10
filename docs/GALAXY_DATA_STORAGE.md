@@ -13,7 +13,56 @@ The map needs a small, fixed record for every system:
 - name offset
 - ID64
 
-Those records remain in `data/systems.bin` and the existing LOD files. Bodies,
+Those records remain in `data/systems.bin` and the existing LOD files.
+
+### Point flags
+
+The 16-bit flags field in `systems.bin` and every LOD point record holds:
+
+| Bits | Meaning |
+| --- | --- |
+| 0 | Permit required |
+| 1 | Non-standard primary (black hole, neutron star, white dwarf, ...) |
+| 2 | Visited (set by the server at request time, never stored) |
+| 8..11 | ID64 mass code plus one: 1 = a ... 8 = h, 0 = no ID64 |
+
+Datasets imported before the mass-code change have zeros in bits 8..11. Any
+systems delta or full import rewrites every record and fills them in.
+
+### Mass-weighted LODs
+
+`systems-lod-0.bin` (coarsest) to `systems-lod-6.bin` (every system) are
+nested hash samples. Since `lodWeighting: "mass-code-v1"` in
+`systems-meta.json`, the divisor depends on the system's mass code, following
+the in-game map's mass-layered octree:
+
+| Mass code | Typical primaries | Divisor |
+| --- | --- | --- |
+| a, b | brown dwarfs, M dwarfs | 2 x base |
+| c, d, none | K, G, F, A stars, white dwarfs | base |
+| e | B stars | base / 8 |
+| f | black holes, B stars | base / 32 |
+| g | O stars, black holes | base / 64 |
+| h | O and Wolf-Rayet stars, black holes | base / 128 |
+
+Divisors never drop below 1 and stay powers of two, so each LOD is still a
+subset of the next finer one, and LOD 6 still holds every system. The base
+divisors (4096 ... 1) are unchanged in the metadata. LOD 1, the default
+whole-galaxy layer, holds roughly 230k systems instead of 192k, and the server
+accepts a default LOD of up to 300k when the data is mass-weighted. The rich
+filter sidecars follow the LOD files row by row, so run
+`npm run import:galaxy-filters` after any systems import.
+
+### Galaxy glow image
+
+`data/galaxy-density.bin` is a 1024 x 1024 top-down image of every known
+system, covering a 100,000 ly square centred on Sagittarius A*. It has a
+32-byte header (`EDGDENS1`, version, width, height, min x, min z, texel size in
+ly), then two bytes per texel in rows of increasing z: log-scaled density, and
+the local share of mass-code e..h systems, where 128 is the galaxy average.
+The spatial-index step writes it from the points it already has in memory;
+`npm run import:galaxy-density` rebuilds it alone from the full LOD in about
+half a minute. `GET /api/galaxy-density` serves it. Bodies,
 stations, markets, factions, and other full-system data are variable-sized and
 are only needed after opening a system. Mixing them into the map files would
 make normal navigation and filtering much slower.

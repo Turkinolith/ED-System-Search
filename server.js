@@ -22,6 +22,7 @@ import { createShutdownController } from './shutdown-guard.js';
 import { cleanupJunkFiles, DEFAULT_MIN_AGE_MS, describeCleanup } from './scripts/cleanup-junk.js';
 import { createCleanupScheduler } from './scripts/cleanup-scheduler.js';
 import { writeFileAtomic } from './scripts/atomic-file.js';
+import { colorCategoryForMask, colorCategoryShift, colorModes } from './public/color-modes.js';
 import { withImportActivity } from './scripts/import-activity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -46,6 +47,7 @@ const murderBinariesNamesPath = path.join(dataDir, 'murder-binaries-names.txt');
 const greenGasGiantsPath = path.join(dataDir, 'green-gas-giants.json');
 const notesPath = path.join(dataDir, 'system-notes.json');
 const regionMapPath = path.join(dataDir, 'region-map-vectors.json');
+const galaxyDensityPath = path.join(dataDir, 'galaxy-density.bin');
 const systemUpdateLogPath = path.join(dataDir, 'system-update-log.json');
 const updatesPath = path.join(dataDir, 'systems-updates.u32');
 const updatesMetaPath = path.join(dataDir, 'systems-updates-meta.json');
@@ -607,6 +609,11 @@ function richPointFilters(reqUrl) {
     .map((value) => value.trim())
     .filter(Boolean)
     .reduce((mask, value) => mask | (richCategoryMasks[category]?.[value] ?? 0), 0);
+  // "none" keeps systems that have no value for the category (unpopulated
+  // systems have no economy, security, or government).
+  const includesNone = (parameter) => String(reqUrl.searchParams.get(parameter) ?? '')
+    .split(',')
+    .some((value) => value.trim() === 'none');
   const minBodiesRaw = Number(reqUrl.searchParams.get('minBodies') ?? 0);
   const minBodies = Number.isFinite(minBodiesRaw) ? Math.max(0, Math.floor(minBodiesRaw)) : 0;
   const filters = {
@@ -626,6 +633,9 @@ function richPointFilters(reqUrl) {
     economyTypes: categoryMask('economy', 'economy'),
     securityTypes: categoryMask('security', 'security'),
     governmentTypes: categoryMask('government', 'government'),
+    economyNone: includesNone('economy'),
+    securityNone: includesNone('security'),
+    governmentNone: includesNone('government'),
   };
   filters.advanced = Boolean(
     filters.bodyTypes
@@ -635,6 +645,9 @@ function richPointFilters(reqUrl) {
     || filters.economyTypes
     || filters.securityTypes
     || filters.governmentTypes
+    || filters.economyNone
+    || filters.securityNone
+    || filters.governmentNone
   );
   filters.active = filters.richData
     || filters.stations
@@ -647,6 +660,50 @@ function richPointFilters(reqUrl) {
     || filters.minBodies > 0
     || filters.advanced;
   return filters;
+}
+
+function categoryAllowed(value, mask, includeNone) {
+  if (!mask && !includeNone) return true;
+  return Boolean(value & mask) || (includeNone && value === 0);
+}
+
+function colorModeFromRequest(reqUrl) {
+  const key = reqUrl.searchParams.get('colorBy');
+  return key && Object.hasOwn(colorModes, key) ? { key, ...colorModes[key] } : null;
+}
+
+function colorCategoryAt(buffer, offset, colorMode, recordBytes) {
+  if (!colorMode || recordBytes < colorMode.offset + 4) return 0;
+  return colorCategoryForMask(colorMode, buffer.readUInt32LE(offset + colorMode.offset));
+}
+
+// Batched, sorted reads of the full-resolution rich sidecar (row = system
+// index) so colouring the local sphere never thrashes the paged cache.
+function colorCategoriesForIndexes(cache, sortedIndexes, colorMode) {
+  const categories = new Map();
+  if (!cache || !colorMode || sortedIndexes.length === 0) return categories;
+  const recordBytes = cache.recordBytes;
+  const mergeGapRecords = 2048;
+  let i = 0;
+  while (i < sortedIndexes.length) {
+    let j = i;
+    while (j + 1 < sortedIndexes.length && sortedIndexes[j + 1] - sortedIndexes[j] <= mergeGapRecords) j += 1;
+    const start = sortedIndexes[i];
+    const byteStart = cache.headerBytes + start * recordBytes;
+    const byteLength = Math.min((sortedIndexes[j] - start + 1) * recordBytes, cache.size - byteStart);
+    if (byteLength > 0) {
+      const buffer = Buffer.allocUnsafe(byteLength);
+      const bytesRead = readSync(cache.fd, buffer, 0, byteLength, byteStart);
+      for (let k = i; k <= j; k += 1) {
+        const offset = (sortedIndexes[k] - start) * recordBytes;
+        if (offset >= 0 && offset + recordBytes <= bytesRead) {
+          categories.set(sortedIndexes[k], colorCategoryAt(buffer, offset, colorMode, recordBytes));
+        }
+      }
+    }
+    i = j + 1;
+  }
+  return categories;
 }
 
 function richPointAllowed(buffer, offset, filters, recordBytes) {
@@ -673,9 +730,9 @@ function richPointAllowed(buffer, offset, filters, recordBytes) {
     if (filters.atmosphereTypes && !(buffer.readUInt32LE(offset + 16) & filters.atmosphereTypes)) return false;
     if (filters.ringTypes && !(buffer.readUInt32LE(offset + 20) & filters.ringTypes)) return false;
     if (filters.volcanismTypes && !(buffer.readUInt32LE(offset + 24) & filters.volcanismTypes)) return false;
-    if (filters.economyTypes && !(buffer.readUInt32LE(offset + 28) & filters.economyTypes)) return false;
-    if (filters.securityTypes && !(buffer.readUInt32LE(offset + 32) & filters.securityTypes)) return false;
-    if (filters.governmentTypes && !(buffer.readUInt32LE(offset + 36) & filters.governmentTypes)) return false;
+    if (!categoryAllowed(buffer.readUInt32LE(offset + 28), filters.economyTypes, filters.economyNone)) return false;
+    if (!categoryAllowed(buffer.readUInt32LE(offset + 32), filters.securityTypes, filters.securityNone)) return false;
+    if (!categoryAllowed(buffer.readUInt32LE(offset + 36), filters.governmentTypes, filters.governmentNone)) return false;
   }
   return true;
 }
@@ -1925,7 +1982,16 @@ async function queryLocalPoints(reqUrl, res) {
   );
   const range = updateRange(reqUrl);
   const richFilters = richPointFilters(reqUrl);
+  let colorMode = colorModeFromRequest(reqUrl);
   let localRichIndex = null;
+  if (colorMode && !richFilters.active) {
+    const meta = await getMeta();
+    const manifest = await getGalaxyManifest();
+    localRichIndex = richMapFiltersCompatibility(meta, manifest).compatible
+      ? await getLocalRichFilterIndex(meta, manifest)
+      : null;
+    if (!localRichIndex || localRichIndex.recordBytes < 40) colorMode = null;
+  }
   if (richFilters.active) {
     const meta = await getMeta();
     const manifest = await getGalaxyManifest();
@@ -2042,9 +2108,21 @@ async function queryLocalPoints(reqUrl, res) {
   }
   candidates.sort((a, b) => a.distanceSq - b.distanceSq);
   const selected = candidates.slice(0, limit);
+  const categories = colorMode
+    ? colorCategoriesForIndexes(
+      localRichIndex,
+      [...new Set(selected.map((candidate) => candidate.recordIndex))].sort((a, b) => a - b),
+      colorMode,
+    )
+    : null;
   const body = Buffer.allocUnsafe(selected.length * spatialPointBytes);
   for (let indexPosition = 0; indexPosition < selected.length; indexPosition += 1) {
-    selected[indexPosition].record.copy(body, indexPosition * spatialPointBytes);
+    const candidate = selected[indexPosition];
+    if (categories) {
+      const flags = candidate.record.readUInt16LE(14) & 0x0fff;
+      candidate.record.writeUInt16LE(flags | ((categories.get(candidate.recordIndex) ?? 0) << colorCategoryShift), 14);
+    }
+    candidate.record.copy(body, indexPosition * spatialPointBytes);
   }
   res.writeHead(200, {
     'content-type': 'application/octet-stream',
@@ -2055,6 +2133,7 @@ async function queryLocalPoints(reqUrl, res) {
     'x-local-area-count': String(localAreaCount),
     'x-local-area-complete': areaScanComplete ? '1' : '0',
     'x-rich-filters': richFilters.active ? '1' : '0',
+    'x-color-by': colorMode?.key ?? '',
     'cache-control': 'no-store',
   });
   res.end(body);
@@ -2602,8 +2681,12 @@ function chooseLod(meta, requested) {
     const exact = meta.lodLevels.find((level) => level.level === Number(requested));
     if (exact) return exact;
   }
+  // Mass-weighted LODs (lodWeighting mass-code-v1) put LOD 1 near 230k
+  // systems; allow headroom up to the client's 300k request so growth from
+  // later deltas doesn't drop the default view to the 4x sparser LOD 0.
+  const maximumDefaultCount = meta.lodWeighting ? 300000 : 250000;
   return [...meta.lodLevels]
-    .filter((level) => level.count > 0 && level.count <= 250000)
+    .filter((level) => level.count > 0 && level.count <= maximumDefaultCount)
     .sort((a, b) => b.count - a.count)[0] ?? meta.lodLevels.at(-1);
 }
 
@@ -2667,11 +2750,12 @@ function appendVirtualVisitedPoints(out, included, includedCoords, meta, supplem
 const pointsPayloadCache = new Map();
 const pointsPayloadCacheLimit = 8;
 
-function sendPointsPayload(res, body, lod, richActive) {
+function sendPointsPayload(res, body, lod, richActive, colorMode = null) {
   res.writeHead(200, {
     'content-type': 'application/octet-stream',
     'content-length': body.length,
     'x-lod-level': String(lod.level),
+    'x-color-by': colorMode?.key ?? '',
     'x-total-count': String(lod.count),
     'x-rich-filters': richActive ? '1' : '0',
     'cache-control': 'no-store',
@@ -2696,12 +2780,30 @@ async function readPoints(reqUrl, res) {
   );
   const range = updateRange(reqUrl);
   const richFilters = richPointFilters(reqUrl);
+  let colorMode = colorModeFromRequest(reqUrl);
   const updates = range.active ? await getUpdateIndex() : null;
   const limit = Math.max(1000, Math.min(Number(reqUrl.searchParams.get('limit') ?? 250000), 500000));
-  const galaxyManifest = richFilters.active ? await getGalaxyManifest() : null;
+  const galaxyManifest = richFilters.active || colorMode ? await getGalaxyManifest() : null;
   const richRecordBytes = Number(galaxyManifest?.mapFilters?.recordBytes ?? 0);
   let richLod = null;
   let richStat = null;
+  // Colouring alone never fails the request: without usable rich data the
+  // points come back uncoloured and the client shows them as "no data".
+  if (colorMode && !richFilters.active) {
+    const usable = richMapFiltersCompatibility(meta, galaxyManifest).compatible && richRecordBytes >= 40;
+    const candidate = usable
+      ? galaxyManifest.mapFilters.lodLevels.find((entry) => Number(entry.level) === Number(lod.level))
+      : null;
+    const candidateStat = candidate && Number(candidate.count) === Number(lod.count)
+      ? await fs.stat(galaxyDataPath(candidate.file)).catch(() => null)
+      : null;
+    if (candidateStat) {
+      richLod = candidate;
+      richStat = candidateStat;
+    } else {
+      colorMode = null;
+    }
+  }
   if (richFilters.active) {
     const richCompatibility = richMapFiltersCompatibility(meta, galaxyManifest);
     if (!richCompatibility.compatible) {
@@ -2746,12 +2848,13 @@ async function readPoints(reqUrl, res) {
     [...typeSet].sort((a, b) => a - b).join(','),
     limit,
     richFilters.active ? `${JSON.stringify(richFilters)}:${richStat.mtimeMs}` : '',
+    colorMode ? `color:${colorMode.key}:${richStat?.mtimeMs ?? 0}` : '',
   ].join('|');
   const hit = pointsPayloadCache.get(payloadCacheKey);
   if (hit) {
     pointsPayloadCache.delete(payloadCacheKey);
     pointsPayloadCache.set(payloadCacheKey, hit);
-    return sendPointsPayload(res, hit, lod, richFilters.active);
+    return sendPointsPayload(res, hit, lod, richFilters.active, colorMode);
   }
   const out = [];
   const included = new Set();
@@ -2789,7 +2892,14 @@ async function readPoints(reqUrl, res) {
         }
         const recordIndex = buffer.readUInt32LE(offset + 16);
         if (range.active && !updateAllowed(updateSecondsAt(updates, recordIndex), range)) continue;
-        const flags = buffer.readUInt16LE(offset + 14) | (visitedIndexSet.has(recordIndex) ? 4 : 0);
+        let flags = buffer.readUInt16LE(offset + 14) | (visitedIndexSet.has(recordIndex) ? 4 : 0);
+        if (colorMode) {
+          const richOffset = (offset / lodBytes) * richRecordBytes;
+          const category = richOffset + richRecordBytes <= richBytesRead
+            ? colorCategoryAt(richBuffer, richOffset, colorMode, richRecordBytes)
+            : 0;
+          flags = (flags & 0x0fff) | (category << colorCategoryShift);
+        }
         const entry = Buffer.allocUnsafe(lodBytes);
         buffer.copy(entry, 0, offset, offset + lodBytes);
         entry.writeUInt16LE(flags, 14);
@@ -2834,7 +2944,7 @@ async function readPoints(reqUrl, res) {
   while (pointsPayloadCache.size > pointsPayloadCacheLimit) {
     pointsPayloadCache.delete(pointsPayloadCache.keys().next().value);
   }
-  sendPointsPayload(res, body, lod, richFilters.active);
+  sendPointsPayload(res, body, lod, richFilters.active, colorMode);
 }
 
 function searchMatch(query, candidate) {
@@ -3494,6 +3604,26 @@ function notModifiedSince(req, stat) {
   return Number.isFinite(sinceMs) && Math.floor(stat.mtimeMs / 1000) * 1000 <= sinceMs;
 }
 
+// Top-down density image written by the native spatial-index step; the client
+// draws it as the galaxy glow behind the capped star layer.
+async function serveGalaxyDensity(req, res) {
+  const stat = await fs.stat(galaxyDensityPath).catch(() => null);
+  if (!stat?.isFile()) {
+    return sendJson(res, { error: 'Galaxy density image is not built. Run npm run import:galaxy-density.' }, 404);
+  }
+  if (notModifiedSince(req, stat)) {
+    res.writeHead(304, { 'cache-control': 'no-cache' });
+    return res.end();
+  }
+  res.writeHead(200, {
+    'content-type': 'application/octet-stream',
+    'content-length': stat.size,
+    'cache-control': 'no-cache',
+    'last-modified': new Date(stat.mtimeMs).toUTCString(),
+  });
+  return createReadStream(galaxyDensityPath).pipe(res);
+}
+
 async function serveRegionMap(req, res) {
   if (!existsSync(regionMapPath)) {
     return sendJson(res, {
@@ -3610,6 +3740,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, { indexes: [...visitedIndexSet] });
     }
     if (reqUrl.pathname === '/api/regions') return await serveRegionMap(req, res);
+    if (reqUrl.pathname === '/api/galaxy-density') return await serveGalaxyDensity(req, res);
     if (reqUrl.pathname === '/api/murder-binaries') return queryMurderBinaries(reqUrl, res);
     if (reqUrl.pathname === '/api/discoveries') return sendJson(res, await getDiscoveries() ?? { imported: false, places: [] });
     if (reqUrl.pathname === '/api/visited') return sendJson(res, await getVisited());

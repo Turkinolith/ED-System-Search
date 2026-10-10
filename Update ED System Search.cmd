@@ -58,6 +58,7 @@ echo   K. Import a different local galaxy dump (paste or drag its path)
 echo   L. Download and import the full galaxy dump (very large)
 echo   M. Clean up stranded temporary import files
 echo   N. Repack the completed rich galaxy with dictionary compression
+echo   O. Rebuild everything from galaxy.json.gz beside this updater (map + rich data)
 echo.
 echo   0. Exit
 echo.
@@ -87,6 +88,7 @@ if /i "%selection%"=="K" (call :importLocalGalaxy & goto done)
 if /i "%selection%"=="L" (call :confirmFullGalaxy & goto done)
 if /i "%selection%"=="M" (call :run "cleanup" & goto done)
 if /i "%selection%"=="N" (call :repackGalaxy & goto done)
+if /i "%selection%"=="O" (call :refreshFromGalaxy & goto done)
 if "%selection%"=="0" exit /b 0
 
 echo.
@@ -125,6 +127,26 @@ if /i not "%confirm%"=="YES" (
   goto :eof
 )
 call :runNative "import:galaxy:download"
+goto :eof
+
+:refreshFromGalaxy
+echo.
+echo This rebuilds the system map, search indexes, spatial index, and rich galaxy data
+echo from galaxy.json.gz in this folder. It reads the dump twice and takes many hours.
+echo Star types and permits missing from the dump are kept from the current data.
+if not exist "galaxy.json.gz" (
+  echo galaxy.json.gz was not found next to this updater.
+  set "EXITCODE=1"
+  goto :eof
+)
+set "confirm="
+set /p "confirm=Type REBUILD to continue: "
+if /i not "%confirm%"=="REBUILD" (
+  echo Full rebuild cancelled.
+  set "EXITCODE=0"
+  goto :eof
+)
+call :run "refresh:from-galaxy"
 goto :eof
 
 :repackGalaxy

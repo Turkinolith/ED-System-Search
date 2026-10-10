@@ -1,3 +1,5 @@
+import { decodeId64, massCodeFromFlags } from './id64.js?v=mass-layers-1';
+
 const vertexShader = `
 attribute vec3 a_position;
 attribute vec3 a_color;
@@ -64,6 +66,78 @@ void main() {
 }
 `;
 
+// The galaxy glow: a top-down density image on the galactic plane, drawn
+// before the stars the way the in-game map draws its Milky Way impostors
+// separately from the capped star instances. Luminance is log density, alpha
+// is the share of heavy (mass code e..h) systems, 0.5 = galaxy average.
+const glowVertexShader = `
+attribute vec3 a_position;
+attribute vec2 a_uv;
+uniform mat4 u_matrix;
+varying vec2 v_uv;
+void main() {
+  gl_Position = u_matrix * vec4(a_position, 1.0);
+  v_uv = a_uv;
+}
+`;
+
+const glowFragmentShader = `
+precision mediump float;
+uniform sampler2D u_density;
+uniform float u_alpha;
+varying vec2 v_uv;
+void main() {
+  vec4 texel = texture2D(u_density, v_uv);
+  float glow = pow(texel.r, 1.8);
+  vec3 warm = vec3(1.0, 0.74, 0.48);
+  vec3 cool = vec3(0.56, 0.7, 1.0);
+  vec3 color = mix(warm, cool, smoothstep(0.4, 0.85, texel.a));
+  vec2 edge = smoothstep(vec2(0.0), vec2(0.04), v_uv) * smoothstep(vec2(1.0), vec2(0.96), v_uv);
+  float strength = glow * u_alpha * edge.x * edge.y * 0.55;
+  gl_FragColor = vec4(color * strength, strength);
+}
+`;
+
+// Nebula clouds: soft billboards at known nebula positions, the counterpart
+// of the in-game map's background nebula impostors.
+const nebulaVertexShader = `
+attribute vec3 a_center;
+attribute vec2 a_corner;
+attribute float a_radius;
+attribute vec3 a_color;
+attribute float a_seed;
+uniform mat4 u_matrix;
+uniform vec3 u_right;
+uniform vec3 u_up;
+uniform vec3 u_eye;
+uniform float u_alpha;
+varying vec2 v_uv;
+varying vec3 v_color;
+varying float v_alpha;
+void main() {
+  vec3 world = a_center + (u_right * a_corner.x + u_up * a_corner.y) * a_radius;
+  gl_Position = u_matrix * vec4(world, 1.0);
+  float angle = a_seed * 6.2831853;
+  mat2 spin = mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
+  v_uv = spin * a_corner * 0.5 + 0.5;
+  v_color = a_color;
+  float cameraDistance = length(a_center - u_eye);
+  v_alpha = u_alpha * smoothstep(a_radius * 0.6, a_radius * 2.5, cameraDistance);
+}
+`;
+
+const nebulaFragmentShader = `
+precision mediump float;
+uniform sampler2D u_cloud;
+varying vec2 v_uv;
+varying vec3 v_color;
+varying float v_alpha;
+void main() {
+  float density = texture2D(u_cloud, v_uv).a * v_alpha;
+  gl_FragColor = vec4(v_color * density, density);
+}
+`;
+
 function shader(gl, type, source) {
   const s = gl.createShader(type);
   gl.shaderSource(s, source);
@@ -72,10 +146,10 @@ function shader(gl, type, source) {
   return s;
 }
 
-function program(gl) {
+function program(gl, vertexSource = vertexShader, fragmentSource = fragmentShader) {
   const p = gl.createProgram();
-  gl.attachShader(p, shader(gl, gl.VERTEX_SHADER, vertexShader));
-  gl.attachShader(p, shader(gl, gl.FRAGMENT_SHADER, fragmentShader));
+  gl.attachShader(p, shader(gl, gl.VERTEX_SHADER, vertexSource));
+  gl.attachShader(p, shader(gl, gl.FRAGMENT_SHADER, fragmentSource));
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
   return p;
@@ -310,6 +384,18 @@ function quickselectPrefix(items, count, score) {
   }
 }
 
+// Context slots (beyond the nearest share of the budget) go to the heaviest
+// mass codes first, like the in-game map's mass-layered octree; the stable
+// hash bucket breaks ties within a layer. Unknown mass codes rank as class d.
+export function contextRank(massCode, bucket) {
+  const layer = Number.isInteger(massCode) && massCode >= 0 && massCode <= 7 ? massCode : 3;
+  return (7 - layer) * 2 ** 32 + (bucket >>> 0);
+}
+
+function pointContextRank(point) {
+  return point.contextRank ?? contextRank(point.massCode, point.bucket);
+}
+
 export function prioritizeDrawCandidates(candidates, limit, nearFraction = 0.8) {
   if (limit <= 0 || candidates.length === 0) return [];
   if (candidates.length <= limit) return candidates;
@@ -318,7 +404,7 @@ export function prioritizeDrawCandidates(candidates, limit, nearFraction = 0.8) 
   const nearest = candidates.slice(0, nearestCount);
   const context = candidates.slice(nearestCount);
   const contextCount = limit - nearestCount;
-  quickselectPrefix(context, contextCount, (item) => item.point.bucket);
+  quickselectPrefix(context, contextCount, (item) => pointContextRank(item.point));
   return [...nearest, ...context.slice(0, contextCount)];
 }
 
@@ -387,6 +473,193 @@ const giantCageVertices = Array.from({ length: 6 }, (_, index) => {
   const angle = Math.PI / 6 + index * Math.PI / 3;
   return [Math.cos(angle) * 9, Math.sin(angle) * 9];
 });
+// Eased camera glide between focus points. Long jumps pull the camera back
+// mid-flight so the move reads as travel rather than a cut.
+export function flightDuration(from, to) {
+  const travel = Math.hypot(...to.target.map((value, index) => value - from.target[index]));
+  return clamp(0.55 + Math.log10(1 + travel / 50) * 0.16, 0.55, 1.2);
+}
+
+export function flightPose(from, to, t) {
+  const progress = clamp(t, 0, 1);
+  const eased = progress < 0.5 ? 4 * progress ** 3 : 1 - ((-2 * progress + 2) ** 3) / 2;
+  const target = from.target.map((value, index) => value + (to.target[index] - value) * eased);
+  const travel = Math.hypot(...to.target.map((value, index) => value - from.target[index]));
+  const logFrom = Math.log(Math.max(1, from.distance));
+  const logTo = Math.log(Math.max(1, to.distance));
+  const base = Math.exp(logFrom + (logTo - logFrom) * eased);
+  const lift = Math.max(0, Math.min(travel * 0.6, 60000) - Math.max(from.distance, to.distance));
+  return { target, distance: base + lift * Math.sin(Math.PI * progress) };
+}
+
+function prefersReducedMotion() {
+  return typeof window !== 'undefined'
+    && Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
+}
+
+// Text laid flat on the grid plane: an affine basis whose x axis reads left
+// to right on screen and whose y axis keeps the glyphs unmirrored.
+export function planeTextBasis(origin, axisA, axisB) {
+  if (!origin || !axisA || !axisB) return null;
+  const vectors = [
+    { x: axisA.x - origin.x, y: axisA.y - origin.y },
+    { x: axisB.x - origin.x, y: axisB.y - origin.y },
+  ];
+  const candidates = [
+    { right: vectors[0], other: vectors[1] },
+    { right: { x: -vectors[0].x, y: -vectors[0].y }, other: vectors[1] },
+    { right: vectors[1], other: vectors[0] },
+    { right: { x: -vectors[1].x, y: -vectors[1].y }, other: vectors[0] },
+  ];
+  let best = null;
+  for (const candidate of candidates) {
+    const length = Math.hypot(candidate.right.x, candidate.right.y);
+    if (length < 1e-6) continue;
+    const score = candidate.right.x / length;
+    if (!best || score > best.score) best = { ...candidate, score };
+  }
+  if (!best) return null;
+  let down = best.other;
+  if (best.right.x * down.y - best.right.y * down.x < 0) down = { x: -down.x, y: -down.y };
+  return { origin, right: best.right, down };
+}
+
+// Deterministic fractal-noise cloud with a soft radial falloff, used as the
+// alpha mask for every nebula billboard.
+export function buildCloudTexels(size = 128) {
+  const lattice = (x, y, seed) => {
+    let h = Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(seed, 2147483647);
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+  };
+  const valueNoise = (x, y, seed) => {
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const fx = x - x0;
+    const fy = y - y0;
+    const sx = fx * fx * (3 - 2 * fx);
+    const sy = fy * fy * (3 - 2 * fy);
+    const top = lattice(x0, y0, seed) + (lattice(x0 + 1, y0, seed) - lattice(x0, y0, seed)) * sx;
+    const bottom = lattice(x0, y0 + 1, seed) + (lattice(x0 + 1, y0 + 1, seed) - lattice(x0, y0 + 1, seed)) * sx;
+    return top + (bottom - top) * sy;
+  };
+  const texels = new Uint8Array(size * size);
+  for (let row = 0; row < size; row += 1) {
+    for (let column = 0; column < size; column += 1) {
+      const u = column / (size - 1) * 2 - 1;
+      const v = row / (size - 1) * 2 - 1;
+      let noise = 0;
+      let amplitude = 0.55;
+      let frequency = 3;
+      for (let octave = 0; octave < 5; octave += 1) {
+        noise += valueNoise((u + 1) * frequency, (v + 1) * frequency, octave + 1) * amplitude;
+        amplitude *= 0.5;
+        frequency *= 2;
+      }
+      const radius = Math.hypot(u, v);
+      const falloff = 1 - smoothstep(0.25, 1, radius);
+      const cloud = clamp((noise - 0.32) * 1.9, 0, 1) * falloff;
+      texels[row * size + column] = Math.round(cloud * 255);
+    }
+  }
+  return texels;
+}
+
+function nameHash(text) {
+  let hash = 2166136261;
+  for (const char of String(text ?? '')) hash = Math.imul(hash ^ char.codePointAt(0), 16777619);
+  return hash >>> 0;
+}
+
+const nebulaTints = [
+  [0.86, 0.42, 0.48],
+  [0.42, 0.62, 0.9],
+  [0.42, 0.82, 0.76],
+  [0.66, 0.66, 0.7],
+];
+
+export function nebulaSprite(place) {
+  const hash = nameHash(place?.name ?? place?.id);
+  const tint = nebulaTints[hash % nebulaTints.length];
+  return {
+    radius: 60 + (hash >>> 8) % 101,
+    // Mostly grey, like the in-game backdrop clouds, with a hint of colour.
+    color: tint.map((component) => component * 0.55 + 0.6 * 0.45),
+    seed: ((hash >>> 16) % 1000) / 1000,
+  };
+}
+
+// Fine grids need exact values (every label near Colonia would otherwise
+// read "-10k"); coarse grids keep the compact thousands form.
+export function formatPlaneCoordinate(value, step) {
+  const rounded = Math.round(value);
+  if (step >= 1000 && Math.abs(rounded) >= 1000) return `${(rounded / 1000).toFixed(1)}k`;
+  return rounded.toLocaleString('en-US');
+}
+
+export function parseGalaxyDensity(buffer) {
+  if (!buffer || buffer.byteLength < 32) return null;
+  const view = new DataView(buffer);
+  const magic = String.fromCharCode(...new Uint8Array(buffer, 0, 8));
+  if (magic !== 'EDGDENS1' || view.getUint32(8, true) !== 1) return null;
+  const width = view.getUint32(12, true);
+  const height = view.getUint32(16, true);
+  if (!width || !height || buffer.byteLength < 32 + width * height * 2) return null;
+  return {
+    width,
+    height,
+    minX: view.getFloat32(20, true),
+    minZ: view.getFloat32(24, true),
+    cellSize: view.getFloat32(28, true),
+    texels: new Uint8Array(buffer, 32, width * height * 2),
+  };
+}
+
+// A quad on the galactic plane (y = 0) in render coordinates, where x is
+// mirrored from galactic x.
+export function galaxyGlowQuad(image) {
+  const maxX = image.minX + image.width * image.cellSize;
+  const maxZ = image.minZ + image.height * image.cellSize;
+  const corners = [
+    [image.minX, image.minZ, 0, 0],
+    [maxX, image.minZ, 1, 0],
+    [image.minX, maxZ, 0, 1],
+    [maxX, maxZ, 1, 1],
+  ];
+  return {
+    positions: new Float32Array(corners.flatMap(([x, z]) => {
+      const render = toRenderCoords({ x, y: 0, z });
+      return [render.x, render.y, render.z];
+    })),
+    uvs: new Float32Array(corners.flatMap(([, , u, v]) => [u, v])),
+  };
+}
+
+// Fades in once the view is wide enough for the capped star layer to look
+// sparse, and softens when looking edge-on at the flat plane.
+export function galaxyGlowAlpha(distance, pitch) {
+  const zoom = smoothstep(1500, 9000, Number(distance) || 0);
+  const tilt = 0.3 + 0.7 * Math.abs(Math.sin(Number(pitch) || 0));
+  return zoom * tilt;
+}
+
+export function boxelCorners(boxel) {
+  const corners = [];
+  for (const x of [boxel.min.x, boxel.max.x]) {
+    for (const y of [boxel.min.y, boxel.max.y]) {
+      for (const z of [boxel.min.z, boxel.max.z]) corners.push({ x, y, z });
+    }
+  }
+  return corners;
+}
+
+// Index pairs into boxelCorners() that differ along exactly one axis.
+const boxelEdges = [
+  [0, 1], [2, 3], [4, 5], [6, 7],
+  [0, 2], [1, 3], [4, 6], [5, 7],
+  [0, 4], [1, 5], [2, 6], [3, 7],
+];
+
 const starVisualCache = new Map();
 const specialKindCache = new Map();
 
@@ -417,6 +690,50 @@ export function starVisual(typeName = '') {
   if (/super giant/i.test(typeName)) size *= 2.05;
   else if (/giant/i.test(typeName)) size *= 1.55;
   return { color, size, style };
+}
+
+// Spectral stand-ins for each mass code, from the classes that dominate it in
+// the imported data. Used only when the primary star type is unknown.
+const massCodeStandInTypes = [
+  'L (Brown dwarf) Star',
+  'M (Red dwarf) Star',
+  'K (Yellow-Orange) Star',
+  'F (White) Star',
+  'B (Blue-White) Star',
+  'B (Blue-White) Star',
+  'O (Blue-White) Star',
+  'O (Blue-White) Star',
+];
+const estimatedVisualCache = new Map();
+
+export function isUnknownStarType(typeName = '') {
+  const text = String(typeName ?? '').trim();
+  return text === '' || text === 'Unknown';
+}
+
+export function estimatedStarVisual(massCode) {
+  const standIn = massCodeStandInTypes[massCode];
+  if (!standIn) return starVisual('Unknown');
+  const base = starVisual(standIn);
+  const unknownColor = starVisual('Unknown').color;
+  // Pull the colour partway back to the unknown grey so estimates read as
+  // softer than catalogued stars.
+  return {
+    color: base.color.map((component, index) => component * 0.65 + unknownColor[index] * 0.35),
+    size: base.size * 0.9,
+    style: base.style,
+    estimated: true,
+  };
+}
+
+function pointStarVisual(point) {
+  if (!isUnknownStarType(point.typeName) || !(point.massCode >= 0)) return cachedStarVisual(point.typeName);
+  let visual = estimatedVisualCache.get(point.massCode);
+  if (!visual) {
+    visual = estimatedStarVisual(point.massCode);
+    estimatedVisualCache.set(point.massCode, visual);
+  }
+  return visual;
 }
 
 function cachedStarVisual(typeName = '') {
@@ -544,6 +861,14 @@ export class GalaxyRenderer {
     this.showDropLines = true;
     this.showLandmarks = true;
     this.showSectorMap = false;
+    this.showGalaxyGlow = true;
+    this.showBoxel = true;
+    this.showNebulae = true;
+    this.galaxyGlow = null;
+    this.nebulae = null;
+    this.flight = null;
+    this.colorMode = null;
+    this.eye = [0, 0, 0];
     this.showPlaces = true;
     this.showAllPlaces = false;
     this.isolatePlaces = false;
@@ -594,8 +919,191 @@ export class GalaxyRenderer {
     this.regionMapLoading = false;
     this.regionMapError = null;
     this.accentColor = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#f2a541';
+    this.glowProgram = program(this.gl, glowVertexShader, glowFragmentShader);
+    this.glowLocations = {
+      matrix: this.gl.getUniformLocation(this.glowProgram, 'u_matrix'),
+      alpha: this.gl.getUniformLocation(this.glowProgram, 'u_alpha'),
+      density: this.gl.getUniformLocation(this.glowProgram, 'u_density'),
+      position: this.gl.getAttribLocation(this.glowProgram, 'a_position'),
+      uv: this.gl.getAttribLocation(this.glowProgram, 'a_uv'),
+    };
+    this.nebulaProgram = program(this.gl, nebulaVertexShader, nebulaFragmentShader);
+    this.nebulaLocations = {
+      matrix: this.gl.getUniformLocation(this.nebulaProgram, 'u_matrix'),
+      right: this.gl.getUniformLocation(this.nebulaProgram, 'u_right'),
+      up: this.gl.getUniformLocation(this.nebulaProgram, 'u_up'),
+      eye: this.gl.getUniformLocation(this.nebulaProgram, 'u_eye'),
+      alpha: this.gl.getUniformLocation(this.nebulaProgram, 'u_alpha'),
+      cloud: this.gl.getUniformLocation(this.nebulaProgram, 'u_cloud'),
+      center: this.gl.getAttribLocation(this.nebulaProgram, 'a_center'),
+      corner: this.gl.getAttribLocation(this.nebulaProgram, 'a_corner'),
+      radius: this.gl.getAttribLocation(this.nebulaProgram, 'a_radius'),
+      color: this.gl.getAttribLocation(this.nebulaProgram, 'a_color'),
+      seed: this.gl.getAttribLocation(this.nebulaProgram, 'a_seed'),
+    };
     this.bind();
     this.loadRegionMap();
+    this.loadGalaxyGlow();
+  }
+
+  setNebulae(places) {
+    const gl = this.gl;
+    const sprites = (places ?? [])
+      .filter((place) => place?.type === 'nebula' && place.coords)
+      .map((place) => ({ ...nebulaSprite(place), center: toRenderCoords(place.coords) }));
+    if (!sprites.length) {
+      this.nebulae = null;
+      this.requestRender();
+      return;
+    }
+    const corners = [[-1, -1], [1, -1], [-1, 1], [-1, 1], [1, -1], [1, 1]];
+    const vertexCount = sprites.length * corners.length;
+    const centers = new Float32Array(vertexCount * 3);
+    const cornerData = new Float32Array(vertexCount * 2);
+    const radii = new Float32Array(vertexCount);
+    const colors = new Float32Array(vertexCount * 3);
+    const seeds = new Float32Array(vertexCount);
+    let vertex = 0;
+    for (const sprite of sprites) {
+      for (const [cx, cy] of corners) {
+        centers.set([sprite.center.x, sprite.center.y, sprite.center.z], vertex * 3);
+        cornerData.set([cx, cy], vertex * 2);
+        radii[vertex] = sprite.radius;
+        colors.set(sprite.color, vertex * 3);
+        seeds[vertex] = sprite.seed;
+        vertex += 1;
+      }
+    }
+    const buffer = (data) => {
+      const handle = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, handle);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      return handle;
+    };
+    let texture = this.nebulae?.texture;
+    if (!texture) {
+      const size = 128;
+      texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.ALPHA, size, size, 0, gl.ALPHA, gl.UNSIGNED_BYTE, buildCloudTexels(size));
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+    for (const old of ['centers', 'corners', 'radii', 'colors', 'seeds']) {
+      if (this.nebulae?.[old]) gl.deleteBuffer(this.nebulae[old]);
+    }
+    this.nebulae = {
+      texture,
+      vertexCount,
+      centers: buffer(centers),
+      corners: buffer(cornerData),
+      radii: buffer(radii),
+      colors: buffer(colors),
+      seeds: buffer(seeds),
+    };
+    this.requestRender();
+  }
+
+  drawNebulae(matrix) {
+    if (!this.showNebulae || !this.nebulae) return;
+    const alpha = 0.38 * smoothstep(120, 900, this.distance);
+    if (alpha < 0.01) return;
+    const gl = this.gl;
+    const locations = this.nebulaLocations;
+    const forward = normalize(this.target.map((value, index) => value - this.eye[index]));
+    const right = normalize(cross(forward, [0, 1, 0]));
+    const up = cross(right, forward);
+    gl.useProgram(this.nebulaProgram);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.uniformMatrix4fv(locations.matrix, false, matrix);
+    gl.uniform3fv(locations.right, right);
+    gl.uniform3fv(locations.up, up);
+    gl.uniform3fv(locations.eye, this.eye);
+    gl.uniform1f(locations.alpha, alpha);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.nebulae.texture);
+    gl.uniform1i(locations.cloud, 0);
+    this.attrib(locations.center, this.nebulae.centers, 3);
+    this.attrib(locations.corner, this.nebulae.corners, 2);
+    this.attrib(locations.radius, this.nebulae.radii, 1);
+    this.attrib(locations.color, this.nebulae.colors, 3);
+    this.attrib(locations.seed, this.nebulae.seeds, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, this.nebulae.vertexCount);
+    for (const name of ['center', 'corner', 'radius', 'color', 'seed']) gl.disableVertexAttribArray(locations[name]);
+  }
+
+  // Colour-by map modes: the server packs a category index into point flag
+  // bits 12..15; the palette maps it to a colour. Null restores star classes.
+  setColorMode(mode) {
+    this.colorMode = mode?.palette ? mode : null;
+    this.lastBufferKey = '';
+    this.rebuildDrawBuffers(true);
+    this.requestRender();
+  }
+
+  pointColor(point) {
+    if (this.colorMode) {
+      return this.colorMode.palette[point.category] ?? this.colorMode.noData ?? [0.42, 0.46, 0.5];
+    }
+    return pointStarVisual(point).color;
+  }
+
+  async loadGalaxyGlow() {
+    try {
+      const response = await fetch('/api/galaxy-density');
+      if (!response.ok) return;
+      const image = parseGalaxyDensity(await response.arrayBuffer());
+      if (!image) return;
+      const gl = this.gl;
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE_ALPHA, image.width, image.height, 0, gl.LUMINANCE_ALPHA, gl.UNSIGNED_BYTE, image.texels);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const quad = galaxyGlowQuad(image);
+      const positionBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, quad.positions, gl.STATIC_DRAW);
+      const uvBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, quad.uvs, gl.STATIC_DRAW);
+      this.galaxyGlow = { texture, positionBuffer, uvBuffer };
+      this.requestRender();
+    } catch (error) {
+      console.warn('Galaxy glow unavailable:', error);
+    }
+  }
+
+  galaxyGlowAlpha() {
+    if (!this.showGalaxyGlow || !this.galaxyGlow) return 0;
+    return galaxyGlowAlpha(this.distance, this.pitch);
+  }
+
+  drawGalaxyGlow(matrix) {
+    const alpha = this.galaxyGlowAlpha();
+    if (alpha < 0.01) return;
+    const gl = this.gl;
+    const glow = this.galaxyGlow;
+    gl.useProgram(this.glowProgram);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.uniformMatrix4fv(this.glowLocations.matrix, false, matrix);
+    gl.uniform1f(this.glowLocations.alpha, alpha);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, glow.texture);
+    gl.uniform1i(this.glowLocations.density, 0);
+    this.attrib(this.glowLocations.position, glow.positionBuffer, 3);
+    this.attrib(this.glowLocations.uv, glow.uvBuffer, 2);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.disableVertexAttribArray(this.glowLocations.position);
+    gl.disableVertexAttribArray(this.glowLocations.uv);
   }
 
   bind() {
@@ -605,6 +1113,7 @@ export class GalaxyRenderer {
     });
     this.canvas.addEventListener('wheel', (event) => {
       event.preventDefault();
+      this.cancelFlight();
       this.distance = Math.max(8, this.distance * (event.deltaY > 0 ? 1.12 : 0.88));
       this.notifyTargetChange();
       this.requestRender(240);
@@ -612,6 +1121,7 @@ export class GalaxyRenderer {
     this.canvas.addEventListener('contextmenu', (event) => event.preventDefault());
     this.canvas.addEventListener('pointerdown', (event) => {
       event.preventDefault();
+      this.cancelFlight();
       this.canvas.setPointerCapture(event.pointerId);
       this.drag = {
         x: event.clientX,
@@ -658,6 +1168,7 @@ export class GalaxyRenderer {
     });
     window.addEventListener('keydown', (event) => {
       if (isTextInputActive()) return;
+      this.cancelFlight();
       this.keys.add(event.key.toLowerCase());
       this.requestRender(180);
     });
@@ -700,11 +1211,42 @@ export class GalaxyRenderer {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  setTarget(x, y, z) {
+  setTarget(x, y, z, { animate = true } = {}) {
     const coords = toRenderCoords({ x, y, z });
-    this.target = [coords.x, coords.y, coords.z];
-    this.distance = 850;
+    const to = { target: [coords.x, coords.y, coords.z], distance: 850 };
     this.orbitLocked = true;
+    // The first focus happens before anything is drawn, so it lands instantly.
+    if (!animate || this.renderSerial === 0 || prefersReducedMotion()) {
+      this.flight = null;
+      this.target = to.target;
+      this.distance = to.distance;
+      this.notifyTargetChange();
+      return;
+    }
+    const from = { target: [...this.target], distance: this.distance };
+    this.flight = { from, to, start: performance.now(), duration: flightDuration(from, to) };
+    this.requestRender(this.flight.duration * 1000 + 60);
+  }
+
+  advanceFlight(now) {
+    const flight = this.flight;
+    if (!flight) return;
+    const t = (now - flight.start) / (flight.duration * 1000);
+    const pose = flightPose(flight.from, flight.to, t);
+    this.target = pose.target;
+    this.distance = pose.distance;
+    if (t >= 1) {
+      this.flight = null;
+      this.target = [...flight.to.target];
+      this.distance = flight.to.distance;
+      this.notifyTargetChange();
+    }
+  }
+
+  // Any manual camera input takes over from a glide where it currently is.
+  cancelFlight() {
+    if (!this.flight) return;
+    this.flight = null;
     this.notifyTargetChange();
   }
 
@@ -807,6 +1349,7 @@ export class GalaxyRenderer {
         typeName: system.mainStar,
         flags: system.visited ? 4 : 0,
         special: cachedSpecialKind(system.mainStar),
+        boxel: system.id64 ? decodeId64(system.id64) : null,
       }
       : null;
     if (system) this.selectedPlace = null;
@@ -833,6 +1376,7 @@ export class GalaxyRenderer {
   }
 
   move(direction) {
+    this.cancelFlight();
     const step = Math.max(8, this.distance * 0.08);
     const forward = [Math.sin(this.yaw), 0, Math.cos(this.yaw)];
     const right = [Math.cos(this.yaw), 0, -Math.sin(this.yaw)];
@@ -926,7 +1470,19 @@ export class GalaxyRenderer {
       const flags = view.getUint16(offset + 14, true);
       const index = view.getUint32(offset + 16, true);
       const typeName = meta.typeNames[typeCode] ?? '';
-      points.push({ ...toRenderCoords({ x, y, z }), typeName, flags, index, special: cachedSpecialKind(typeName), bucket: stableBucket(index) });
+      const bucket = stableBucket(index);
+      const massCode = massCodeFromFlags(flags);
+      points.push({
+        ...toRenderCoords({ x, y, z }),
+        typeName,
+        flags,
+        index,
+        massCode,
+        category: (flags >> 12) & 0x0f,
+        special: cachedSpecialKind(typeName),
+        bucket,
+        contextRank: contextRank(massCode, bucket),
+      });
       if (++recordsInChunk >= chunkRecords) {
         recordsInChunk = 0;
         await yieldToUi();
@@ -1100,7 +1656,7 @@ export class GalaxyRenderer {
     const sizeScale = this.starSizeScale();
     for (let pointIndex = 0; pointIndex < drawPoints.length; pointIndex += 1) {
       const point = drawPoints[pointIndex];
-      const visual = cachedStarVisual(point.typeName);
+      const visual = pointStarVisual(point);
       const distanceAlpha = this.starDistanceAlpha(this.distanceFromTarget(point));
       const gridAnchor = gridAnchorIndexes.has(point.index);
       const depthExempt = required.has(point.index) || (this.showVisited && (point.flags & 4));
@@ -1114,13 +1670,16 @@ export class GalaxyRenderer {
       positions[vectorOffset] = point.x;
       positions[vectorOffset + 1] = point.y;
       positions[vectorOffset + 2] = point.z;
-      colors[vectorOffset] = visual.color[0];
-      colors[vectorOffset + 1] = visual.color[1];
-      colors[vectorOffset + 2] = visual.color[2];
-      sizes[pointIndex] = visual.size * sizeScale * (0.62 + distanceAlpha * 0.38) * depthSize * (gridAnchor ? 1.5 : 1);
+      const color = this.pointColor(point);
+      const uncategorised = this.colorMode && !this.colorMode.palette[point.category];
+      colors[vectorOffset] = color[0];
+      colors[vectorOffset + 1] = color[1];
+      colors[vectorOffset + 2] = color[2];
+      sizes[pointIndex] = visual.size * sizeScale * (0.62 + distanceAlpha * 0.38) * depthSize * (gridAnchor ? 1.5 : 1)
+        * (uncategorised ? 0.75 : 1);
       styles[pointIndex] = visual.style;
       phases[pointIndex] = (point.bucket % 4096) / 4096;
-      alphas[pointIndex] = gridAnchor ? Math.max(0.9, combinedAlpha) : combinedAlpha;
+      alphas[pointIndex] = (gridAnchor ? Math.max(0.9, combinedAlpha) : combinedAlpha) * (uncategorised ? 0.45 : 1);
     }
     this.points = drawPoints;
     this.count = drawPoints.length;
@@ -1225,6 +1784,7 @@ export class GalaxyRenderer {
       this.target[1] + Math.sin(this.pitch) * this.distance,
       this.target[2] + Math.cos(this.yaw) * cp * this.distance,
     ];
+    this.eye = eye;
     const aspect = this.canvas.width / this.canvas.height;
     const near = Math.max(0.1, this.distance / 5000);
     const far = Math.max(10000, this.distance * 16);
@@ -1239,9 +1799,11 @@ export class GalaxyRenderer {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     if (this.isolatePlaces) return;
     gl.enable(gl.BLEND);
+    this.matrixData.set(matrix);
+    this.drawGalaxyGlow(this.matrixData);
+    this.drawNebulae(this.matrixData);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
     gl.useProgram(this.program);
-    this.matrixData.set(matrix);
     gl.uniformMatrix4fv(this.uniformLocations.matrix, false, this.matrixData);
     gl.uniform1f(this.uniformLocations.pixelRatio, Math.min(window.devicePixelRatio || 1, 2));
     this.attrib(this.attributeLocations.position, this.positionBuffer, 3);
@@ -1340,7 +1902,6 @@ export class GalaxyRenderer {
       ctx.restore();
     }
     for (const hop of this.routeHops) this.drawRouteHop(hop);
-    this.drawRouteSummaryBadge();
     ctx.restore();
   }
 
@@ -1369,7 +1930,16 @@ export class GalaxyRenderer {
     } else if (first) {
       ctx.rect(-radius, -radius, radius * 2, radius * 2);
     } else {
-      ctx.arc(0, 0, radius, 0, Math.PI * 2);
+      // Waypoints are chevrons pointing along the route, as in game.
+      const next = this.routeHops[hop.routeIndex + 1];
+      const nextScreen = next ? this.screen(next) : null;
+      const angle = nextScreen ? Math.atan2(nextScreen.y - screen.y, nextScreen.x - screen.x) : Math.PI / 2;
+      ctx.rotate(angle);
+      ctx.moveTo(radius + 1.5, 0);
+      ctx.lineTo(-radius, radius);
+      ctx.lineTo(-radius * 0.35, 0);
+      ctx.lineTo(-radius, -radius);
+      ctx.closePath();
     }
     ctx.stroke();
     ctx.globalAlpha = hover ? 0.34 : 0.2;
@@ -1387,18 +1957,6 @@ export class GalaxyRenderer {
       ctx.fillText(label, screen.x + 18, screen.y);
       ctx.restore();
     }
-  }
-
-  drawRouteSummaryBadge() {
-    const count = this.routeHops.length;
-    const distance = Number(this.routeOverlay?.totalDistanceLy ?? 0);
-    const text = `Route ${count.toLocaleString()} hops · ${distance.toLocaleString(undefined, { maximumFractionDigits: 1 })} ly`;
-    const clip = this.centerClipRect();
-    this.drawMapBadge(text, clip.x + 10, clip.y + clip.height - 30, {
-      stroke: 'rgba(102, 224, 194, 0.56)',
-      text: 'rgba(186, 245, 231, 0.9)',
-      fill: 'rgba(3, 13, 15, 0.9)',
-    });
   }
 
   drawPlaceIndicators() {
@@ -1845,12 +2403,12 @@ export class GalaxyRenderer {
       const edgeFade = 1 - Math.abs(index) / (lineCount + 1);
       const center = Math.abs(x - grid.centerX) < step * 0.5;
       const major = primary || Math.abs(x / grid.step - Math.round(x / grid.step)) < 0.001;
-      const lineWidth = center ? 2.2 : major ? 1.45 : 0.75;
+      const lineWidth = center ? 2.2 : major ? 1.1 : 0.7;
       const strokeStyle = center
         ? `rgba(72, 220, 230, ${(this.showDepthEmphasis ? 0.72 : 0.62) * alpha})`
         : major
-          ? `rgba(104, 181, 194, ${((this.showDepthEmphasis ? 0.28 : 0.22) + edgeFade * 0.3) * alpha})`
-          : `rgba(84, 150, 164, ${((this.showDepthEmphasis ? 0.13 : 0.095) + edgeFade * 0.13) * alpha})`;
+          ? `rgba(104, 181, 194, ${((this.showDepthEmphasis ? 0.17 : 0.13) + edgeFade * 0.19) * alpha})`
+          : `rgba(84, 150, 164, ${((this.showDepthEmphasis ? 0.075 : 0.055) + edgeFade * 0.08) * alpha})`;
       this.drawGridWorldLine(
         { x, y: grid.y, z: grid.minZ },
         { x, y: grid.y, z: grid.maxZ },
@@ -1863,12 +2421,12 @@ export class GalaxyRenderer {
       const edgeFade = 1 - Math.abs(index) / (lineCount + 1);
       const center = Math.abs(z - grid.centerZ) < step * 0.5;
       const major = primary || Math.abs(z / grid.step - Math.round(z / grid.step)) < 0.001;
-      const lineWidth = center ? 2.2 : major ? 1.45 : 0.75;
+      const lineWidth = center ? 2.2 : major ? 1.1 : 0.7;
       const strokeStyle = center
         ? `rgba(255, 177, 76, ${(this.showDepthEmphasis ? 0.66 : 0.55) * alpha})`
         : major
-          ? `rgba(104, 181, 194, ${((this.showDepthEmphasis ? 0.28 : 0.22) + edgeFade * 0.3) * alpha})`
-          : `rgba(84, 150, 164, ${((this.showDepthEmphasis ? 0.13 : 0.095) + edgeFade * 0.13) * alpha})`;
+          ? `rgba(104, 181, 194, ${((this.showDepthEmphasis ? 0.17 : 0.13) + edgeFade * 0.19) * alpha})`
+          : `rgba(84, 150, 164, ${((this.showDepthEmphasis ? 0.075 : 0.055) + edgeFade * 0.08) * alpha})`;
       this.drawGridWorldLine(
         { x: grid.minX, y: grid.y, z },
         { x: grid.maxX, y: grid.y, z },
@@ -1879,10 +2437,10 @@ export class GalaxyRenderer {
 
   drawGridWorldLine(a, b, { lineWidth, strokeStyle, center = false, major = false }) {
     const ctx = this.ctx;
-    if (center || major) {
+    if (center) {
       ctx.save();
-      ctx.lineWidth = lineWidth + (center ? 3.4 : 2.4);
-      ctx.strokeStyle = center ? 'rgba(0, 5, 8, 0.7)' : 'rgba(0, 5, 8, 0.5)';
+      ctx.lineWidth = lineWidth + 3.4;
+      ctx.strokeStyle = 'rgba(0, 5, 8, 0.7)';
       this.drawWorldLine(a, b);
       ctx.restore();
     }
@@ -1890,8 +2448,8 @@ export class GalaxyRenderer {
     ctx.save();
     ctx.lineWidth = lineWidth;
     ctx.strokeStyle = strokeStyle;
-    ctx.shadowColor = center ? strokeStyle : major ? 'rgba(72, 220, 230, 0.18)' : 'transparent';
-    ctx.shadowBlur = this.isNavigating() ? 0 : center ? 8 : major ? 5 : 0;
+    ctx.shadowColor = center ? strokeStyle : 'transparent';
+    ctx.shadowBlur = this.isNavigating() || !center ? 0 : 8;
     this.drawWorldLine(a, b);
     ctx.restore();
   }
@@ -2034,36 +2592,58 @@ export class GalaxyRenderer {
     ctx.restore();
   }
 
+  // Coordinate labels lie flat on the grid plane in perspective, like the
+  // in-game map's grid numbers, so near labels read larger than far ones.
   drawGridCoordinateLabels(grid, gridAlpha) {
     if (grid.step > 1000 || gridAlpha <= 0.05) return;
     const center = this.screen({ x: grid.centerX, y: grid.y, z: grid.centerZ });
     const cell = this.screen({ x: grid.centerX + grid.step, y: grid.y, z: grid.centerZ });
     if (!center || !cell) return;
     const screenCell = Math.hypot(cell.x - center.x, cell.y - center.y);
-    if (screenCell < 128) return;
+    if (screenCell < 20) return;
     const skip = Math.max(2, Math.ceil(220 / screenCell));
-    const alpha = gridAlpha * smoothstep(128, 190, screenCell) * (1 - smoothstep(7000, 16000, this.distance));
+    const alpha = gridAlpha * smoothstep(20, 40, screenCell) * (1 - smoothstep(7000, 16000, this.distance));
     if (alpha <= 0.03) return;
 
+    // Glyph units: 10 units of font span 5.5% of the label spacing, about
+    // 12 px near the focus, growing and shrinking with perspective.
+    const unit = grid.step * skip * 0.0055;
     const ctx = this.ctx;
     const lineCount = Math.round(grid.extent / grid.step);
+    const width = this.overlay.clientWidth;
+    const height = this.overlay.clientHeight;
     let drawn = 0;
     ctx.save();
     ctx.font = '600 10px "Segoe UI", system-ui, sans-serif';
     ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = `rgba(72, 220, 230, ${Math.min(0.74, alpha * 0.8)})`;
-    ctx.shadowColor = 'rgba(4, 10, 14, 0.7)';
-    ctx.shadowBlur = 4;
+    ctx.fillStyle = 'rgb(96, 206, 214)';
     for (let xi = -lineCount + 1; xi <= lineCount; xi += skip) {
       for (let zi = -lineCount + 1; zi <= lineCount; zi += skip) {
-        if (drawn > 24) break;
-        const x = grid.centerX + xi * grid.step;
-        const z = grid.centerZ + zi * grid.step;
-        const screen = this.screen({ x, y: grid.y, z });
-        if (!screen || screen.x < 0 || screen.y < 0 || screen.x > this.overlay.clientWidth || screen.y > this.overlay.clientHeight) continue;
+        if (drawn > 32) break;
+        const anchor = { x: grid.centerX + xi * grid.step, y: grid.y, z: grid.centerZ + zi * grid.step };
+        const origin = this.screen(anchor);
+        if (!origin || origin.x < 0 || origin.y < 0 || origin.x > width || origin.y > height) continue;
+        const basis = planeTextBasis(
+          origin,
+          this.screen({ ...anchor, x: anchor.x + unit }),
+          this.screen({ ...anchor, z: anchor.z + unit }),
+        );
+        if (!basis) continue;
+        const glyphPixels = Math.hypot(basis.down.x, basis.down.y) * 10;
+        const sizeFade = smoothstep(5, 8, glyphPixels) * (1 - smoothstep(30, 44, glyphPixels));
         const edgeFade = Math.min(1 - Math.abs(xi) / (lineCount + 1), 1 - Math.abs(zi) / (lineCount + 1));
-        ctx.globalAlpha = Math.max(0, edgeFade) * alpha;
-        ctx.fillText(`${this.formatGridCoordinate(x)} : ${this.formatGridCoordinate(grid.y)} : ${this.formatGridCoordinate(z)}`, screen.x + 5, screen.y - 5);
+        const labelAlpha = Math.max(0, edgeFade) * alpha * sizeFade * 0.62;
+        if (labelAlpha <= 0.02) continue;
+        const coords = fromRenderCoords(anchor);
+        ctx.save();
+        ctx.globalAlpha = labelAlpha;
+        ctx.transform(basis.right.x, basis.right.y, basis.down.x, basis.down.y, origin.x, origin.y);
+        ctx.fillText(
+          [coords.x, coords.y, coords.z].map((value) => formatPlaneCoordinate(value, grid.step)).join(' · '),
+          3,
+          -3,
+        );
+        ctx.restore();
         drawn += 1;
       }
     }
@@ -2341,7 +2921,7 @@ export class GalaxyRenderer {
       const start = this.screen(point);
       const end = this.screen({ x: point.x, y: grid.y, z: point.z });
       if (!start || !end) continue;
-      const color = colorsForType(point.typeName).map((component) => Math.round(component * 255));
+      const color = this.pointColor(point).map((component) => Math.round(component * 255));
       const prominence = 1 - index / Math.max(1, this.gridAnchorPoints.length);
       const colorText = color.join(',');
       ctx.strokeStyle = `rgba(${colorText}, ${0.3 + prominence * 0.34})`;
@@ -2366,16 +2946,19 @@ export class GalaxyRenderer {
       const cameraScale = 0.62 + 0.38 / (1 + this.distance / 1800);
       const ringWorldScale = Math.min(grid.step, 10);
       const ringRadius = ringWorldScale * (0.055 + pulsePhase * 0.17) * cameraScale;
-      const ringAlpha = (1 - pulsePhase) ** 1.35 * (0.52 + prominence * 0.34);
+      const ringAlpha = (1 - pulsePhase) ** 1.35 * (0.3 + prominence * 0.24);
       this.drawGridPlaneRing(point.x, grid.y, point.z, ringRadius, {
         strokeStyle: `rgba(128, 242, 244, ${ringAlpha})`,
-        lineWidth: 1 + prominence * 0.55,
+        lineWidth: 1 + prominence * 0.4,
       });
 
-      ctx.fillStyle = `rgba(224, 255, 255, ${0.7 + prominence * 0.22})`;
-      ctx.beginPath();
-      ctx.arc(end.x, end.y, 1.15 + prominence * 0.65, 0, Math.PI * 2);
-      ctx.fill();
+      // Footprint: a filled disc lying in the grid plane, sized in world
+      // units so it shrinks with distance like the in-game stalk bases.
+      this.drawGridPlaneRing(point.x, grid.y, point.z, ringWorldScale * 0.11, {
+        fillStyle: `rgba(64, 206, 214, ${0.42 + prominence * 0.3})`,
+        strokeStyle: `rgba(150, 246, 248, ${0.5 + prominence * 0.3})`,
+        lineWidth: 0.8,
+      });
 
       ctx.strokeStyle = `rgba(${colorText}, ${0.62 + prominence * 0.32})`;
       ctx.fillStyle = `rgba(${colorText}, ${0.72 + prominence * 0.25})`;
@@ -2417,6 +3000,10 @@ export class GalaxyRenderer {
         ctx.lineTo(screen.x, screen.y);
       }
     }
+    if (style.fillStyle) {
+      ctx.fillStyle = style.fillStyle;
+      ctx.fill();
+    }
     ctx.stroke();
     ctx.restore();
   }
@@ -2451,28 +3038,62 @@ export class GalaxyRenderer {
     ctx.restore();
   }
 
+  // The camera focus shows as a ring lying on the grid plane, like the
+  // in-game map's focus ellipse; orange while locked to a selected system.
   drawOrbitPoint(grid) {
     const screen = this.screen({ x: this.target[0], y: this.target[1], z: this.target[2] });
     if (!screen) return;
+    const locked = this.orbitLocked;
+    const radius = this.distance * 0.024;
+    this.drawGridPlaneRing(this.target[0], grid.y, this.target[2], radius, {
+      fillStyle: locked ? 'rgba(242, 165, 65, 0.06)' : 'rgba(66, 209, 199, 0.07)',
+      strokeStyle: locked ? 'rgba(242, 165, 65, 0.78)' : 'rgba(96, 226, 230, 0.82)',
+      lineWidth: 1.6,
+    });
     const ctx = this.ctx;
-    const coords = fromRenderCoords({ x: this.target[0], y: this.target[1], z: this.target[2] });
-    const label = `X ${coords.x.toFixed(1)}, Y ${coords.y.toFixed(1)}, Z ${coords.z.toFixed(1)}`;
     ctx.save();
-    ctx.strokeStyle = this.orbitLocked ? 'rgba(242, 165, 65, 0.8)' : 'rgba(66, 209, 199, 0.72)';
-    ctx.fillStyle = ctx.strokeStyle;
-    ctx.lineWidth = 1.4;
+    ctx.fillStyle = locked ? 'rgba(242, 165, 65, 0.9)' : 'rgba(150, 246, 248, 0.9)';
     ctx.beginPath();
-    ctx.moveTo(screen.x - 7, screen.y);
-    ctx.lineTo(screen.x + 7, screen.y);
-    ctx.moveTo(screen.x, screen.y - 7);
-    ctx.lineTo(screen.x, screen.y + 7);
+    ctx.arc(screen.x, screen.y, 1.8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Outlines the ID64 boxel (the octree cell the game files this system in)
+  // while it is large enough on screen to read as a cube.
+  drawSelectedBoxel() {
+    const boxel = this.selectedSystem?.boxel;
+    if (!this.showBoxel || !boxel) return;
+    const projected = boxelCorners(boxel).map((corner) => this.screen(toRenderCoords(corner)));
+    if (projected.some((point) => !point)) return;
+    const xs = projected.map((point) => point.x);
+    const span = Math.max(...xs) - Math.min(...xs);
+    const rect = this.frameRect ?? this.canvas.getBoundingClientRect();
+    if (span < 10 || span > rect.width * 3) return;
+    const alpha = clamp((span - 10) / 30, 0, 1) * 0.6;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.strokeStyle = `rgba(242, 165, 65, ${alpha})`;
+    ctx.lineWidth = 1.1;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    for (const [a, b] of boxelEdges) {
+      ctx.moveTo(projected[a].x, projected[a].y);
+      ctx.lineTo(projected[b].x, projected[b].y);
+    }
     ctx.stroke();
-    ctx.font = '12px Segoe UI, sans-serif';
-    ctx.fillText(label, screen.x + 10, screen.y + 10);
+    ctx.setLineDash([]);
+    const top = projected.reduce((best, point) => (point.y < best.y ? point : best), projected[0]);
+    ctx.font = '600 11px Segoe UI, sans-serif';
+    ctx.fillStyle = `rgba(242, 165, 65, ${Math.min(1, alpha * 1.5)})`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(`boxel ${boxel.letter} · ${boxel.cellEdge} ly`, top.x, top.y - 4);
     ctx.restore();
   }
 
   drawSelectedSystem() {
+    this.drawSelectedBoxel();
     const screen = this.screen(this.selectedSystem);
     if (!screen) return;
     const ctx = this.ctx;
@@ -2833,7 +3454,7 @@ export class GalaxyRenderer {
   }
 
   isNavigating() {
-    return Boolean(this.drag || this.keys.size > 0 || performance.now() < this.continuousUntil);
+    return Boolean(this.flight || this.drag || this.keys.size > 0 || performance.now() < this.continuousUntil);
   }
 
   updatePerformanceQuality(frameCost) {
@@ -2858,13 +3479,14 @@ export class GalaxyRenderer {
     const started = performance.now();
     this.frameRect = this.canvas.getBoundingClientRect();
     this.renderSerial += 1;
+    this.advanceFlight(performance.now());
     this.keyboardMove();
     this.rebuildDrawBuffers();
     const matrix = this.camera();
     this.drawStars(matrix);
     this.drawOverlay();
     this.updatePerformanceQuality(performance.now() - started);
-    if (this.keys.size > 0 || this.drag || performance.now() < this.continuousUntil) {
+    if (this.flight || this.keys.size > 0 || this.drag || performance.now() < this.continuousUntil) {
       this.requestRender();
     }
     this.scheduleDropLinePulse();

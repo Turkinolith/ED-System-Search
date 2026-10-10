@@ -29,6 +29,16 @@ between sessions.
 - Full-resolution local spatial detail merged with the sampled global LOD,
   loaded first so the current area is responsive while galaxy-wide context
   arrives in the background.
+- Mass-layered galaxy LODs: like the in-game map, wide views favour heavy
+  systems (O and B stars, Wolf-Rayet stars, black holes) using the mass code
+  in each system's ID64, over a glow drawn from known-system density.
+- Galaxy-map styling borrowed from the in-game map: stalks ending in flat
+  footprint discs, coordinate labels lying on the grid plane, a focus ellipse,
+  eased camera glides between targets, soft nebula clouds, and a route strip
+  (current system, next jump, jumps left, destination).
+- **Colour stars by** economy, security, or government, with a legend whose
+  toggles drive the matching System features filter; visited braces stay on
+  top of any colour mode.
 - Persistent **Local detail only** mode to hide the global LOD layer and retain
   the clear, exploration-pattern-focused nearby view on purpose.
 - Fast fuzzy system search with suggestions and filter-overriding results.
@@ -105,7 +115,8 @@ npm run import:spatial-index
 These commands create the compact binary map, update-time index, exact-name
 lookup, search suggestions, and a 100 ly-cell spatial index under `data/`. The
 spatial index lets close views merge full local system detail with the sampled
-whole-galaxy LOD. The downloaded dump can be deleted after a successful import.
+whole-galaxy LOD, and the same step writes the galaxy glow image
+(`galaxy-density.bin`). The downloaded dump can be deleted after a successful import.
 
 ### 3. Add optional overlays
 
