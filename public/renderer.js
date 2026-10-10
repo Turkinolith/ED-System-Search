@@ -225,6 +225,141 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+// Simplification tolerances (ly) for the sector map's detail levels. The
+// boundaries were traced from a 10 ly raster whose staircase corners sit ~7 ly
+// off the true line, so even the finest level smooths those steps away.
+export const regionBoundaryTolerances = [12, 20, 50, 120];
+
+// Region boundaries arrive as ~90k unit edges of a 10 ly raster. Stroking them
+// one by one (each with its own caps) is what made the sector map slow, so
+// chain the edges between each pair of regions into polylines and simplify
+// those once per detail level. Points are stored in render coordinates
+// (galactic x mirrored).
+export function buildRegionBoundaryPolylines(boundaries, tolerances = regionBoundaryTolerances) {
+  const groups = new Map();
+  for (const segment of boundaries) {
+    const [x1, z1, x2, z2, a, b] = segment;
+    if (![x1, z1, x2, z2].every(Number.isFinite)) continue;
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { outer: a === 0 || b === 0, edges: [] };
+      groups.set(key, group);
+    }
+    group.edges.push(-x1, z1, -x2, z2);
+  }
+
+  const pointKey = (x, z) => `${x},${z}`;
+  const polylines = [];
+  for (const { outer, edges } of groups.values()) {
+    const edgeCount = edges.length / 4;
+    const byPoint = new Map();
+    const link = (key, edge) => {
+      const list = byPoint.get(key);
+      if (list) list.push(edge);
+      else byPoint.set(key, [edge]);
+    };
+    for (let edge = 0; edge < edgeCount; edge += 1) {
+      link(pointKey(edges[edge * 4], edges[edge * 4 + 1]), edge);
+      link(pointKey(edges[edge * 4 + 2], edges[edge * 4 + 3]), edge);
+    }
+    const used = new Uint8Array(edgeCount);
+    // Follow unused edges from (x, z), appending the far end of each.
+    const walk = (x, z, out) => {
+      for (;;) {
+        const next = byPoint.get(pointKey(x, z))?.find((edge) => !used[edge]);
+        if (next === undefined) return;
+        used[next] = 1;
+        const base = next * 4;
+        const forward = edges[base] === x && edges[base + 1] === z;
+        x = forward ? edges[base + 2] : edges[base];
+        z = forward ? edges[base + 3] : edges[base + 1];
+        out.push(x, z);
+      }
+    };
+    for (let edge = 0; edge < edgeCount; edge += 1) {
+      if (used[edge]) continue;
+      used[edge] = 1;
+      const base = edge * 4;
+      const ahead = [edges[base + 2], edges[base + 3]];
+      walk(ahead[0], ahead[1], ahead);
+      const behind = [];
+      walk(edges[base], edges[base + 1], behind);
+      const points = [];
+      for (let index = behind.length - 2; index >= 0; index -= 2) points.push(behind[index], behind[index + 1]);
+      points.push(edges[base], edges[base + 1]);
+      for (const value of ahead) points.push(value);
+      let minX = Infinity;
+      let maxX = -Infinity;
+      let minZ = Infinity;
+      let maxZ = -Infinity;
+      for (let index = 0; index < points.length; index += 2) {
+        minX = Math.min(minX, points[index]);
+        maxX = Math.max(maxX, points[index]);
+        minZ = Math.min(minZ, points[index + 1]);
+        maxZ = Math.max(maxZ, points[index + 1]);
+      }
+      polylines.push({
+        outer,
+        minX,
+        maxX,
+        minZ,
+        maxZ,
+        lods: tolerances.map((tolerance) => simplifyPolyline(points, tolerance)),
+      });
+    }
+  }
+  return polylines;
+}
+
+// Douglas-Peucker on a flat [x, z, x, z, ...] list; keeps both end points.
+export function simplifyPolyline(points, tolerance) {
+  const count = points.length / 2;
+  if (count <= 2) return Float32Array.from(points);
+  const keep = new Uint8Array(count);
+  keep[0] = 1;
+  keep[count - 1] = 1;
+  const toleranceSq = tolerance * tolerance;
+  const stack = [0, count - 1];
+  while (stack.length) {
+    const last = stack.pop();
+    const first = stack.pop();
+    const ax = points[first * 2];
+    const az = points[first * 2 + 1];
+    const dx = points[last * 2] - ax;
+    const dz = points[last * 2 + 1] - az;
+    const lengthSq = dx * dx + dz * dz;
+    let farthest = -1;
+    let farthestSq = toleranceSq;
+    for (let index = first + 1; index < last; index += 1) {
+      const px = points[index * 2] - ax;
+      const pz = points[index * 2 + 1] - az;
+      let distanceSq;
+      if (lengthSq === 0) {
+        distanceSq = px * px + pz * pz;
+      } else {
+        const t = clamp((px * dx + pz * dz) / lengthSq, 0, 1);
+        const ex = px - t * dx;
+        const ez = pz - t * dz;
+        distanceSq = ex * ex + ez * ez;
+      }
+      if (distanceSq > farthestSq) {
+        farthestSq = distanceSq;
+        farthest = index;
+      }
+    }
+    if (farthest >= 0) {
+      keep[farthest] = 1;
+      stack.push(first, farthest, farthest, last);
+    }
+  }
+  const out = [];
+  for (let index = 0; index < count; index += 1) {
+    if (keep[index]) out.push(points[index * 2], points[index * 2 + 1]);
+  }
+  return Float32Array.from(out);
+}
+
 function smoothstep(edge0, edge1, value) {
   const t = clamp((value - edge0) / Math.max(0.0001, edge1 - edge0), 0, 1);
   return t * t * (3 - 2 * t);
@@ -913,9 +1048,11 @@ export class GalaxyRenderer {
     this.performanceScale = 1;
     this.lastQualityUpdate = 0;
     this.regionMap = null;
-    this.regionBoundaryLods = null;
+    this.regionBoundaryPolylines = null;
     this.regionPathCacheKey = '';
     this.regionPathCache = null;
+    this.regionLayer = null;
+    this.regionLayerKey = '';
     this.regionMapLoading = false;
     this.regionMapError = null;
     this.accentColor = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#f2a541';
@@ -1191,7 +1328,7 @@ export class GalaxyRenderer {
         throw new Error('Region map vector data is invalid.');
       }
       this.regionMap = data;
-      this.regionBoundaryLods = this.buildRegionBoundaryLods(data.boundaries);
+      this.regionBoundaryPolylines = buildRegionBoundaryPolylines(data.boundaries);
       this.requestRender();
     } catch (error) {
       this.regionMapError = error.message;
@@ -2665,24 +2802,14 @@ export class GalaxyRenderer {
     return 0.42;
   }
 
-  buildRegionBoundaryLods(boundaries) {
-    const longEnough = (minLength) => boundaries.filter((segment) => (
-      Math.hypot(segment[2] - segment[0], segment[3] - segment[1]) >= minLength
-    ));
-    return {
-      all: boundaries,
-      min20: longEnough(20),
-      min30: longEnough(30),
-    };
-  }
-
-  regionBoundarySegmentsForDistance() {
-    const lods = this.regionBoundaryLods;
-    if (!lods) return this.regionMap?.boundaries ?? [];
-    const step = this.gridStep();
-    if (step <= 2500) return lods.all ?? [];
-    if (step <= 5000) return lods.min20 ?? lods.all ?? [];
-    return lods.min30 ?? lods.min20 ?? lods.all ?? [];
+  // Coarsest simplification that stays under ~0.8 px at the orbit target.
+  regionBoundaryLevel(rect) {
+    const lyPerPixel = (2 * this.distance * Math.tan(Math.PI / 8)) / Math.max(1, rect.height);
+    let level = 0;
+    for (let index = 1; index < regionBoundaryTolerances.length; index += 1) {
+      if (regionBoundaryTolerances[index] <= lyPerPixel * 0.8) level = index;
+    }
+    return level;
   }
 
   sectorMapWorldRadius() {
@@ -2692,20 +2819,6 @@ export class GalaxyRenderer {
 
   regionMapPoint(x, z) {
     return { x: -Number(x ?? 0), z: Number(z ?? 0) };
-  }
-
-  isRegionSegmentNearView(segment, radius) {
-    if (!Number.isFinite(radius)) return true;
-    const a = this.regionMapPoint(segment[0], segment[1]);
-    const b = this.regionMapPoint(segment[2], segment[3]);
-    const minX = Math.min(a.x, b.x);
-    const maxX = Math.max(a.x, b.x);
-    const minZ = Math.min(segment[1], segment[3]);
-    const maxZ = Math.max(segment[1], segment[3]);
-    const targetZ = this.target[2];
-    if (maxZ < targetZ - radius || minZ > targetZ + radius) return false;
-    const targetX = this.target[0];
-    return !(maxX < targetX - radius || minX > targetX + radius);
   }
 
   drawSectorMapOverlay() {
@@ -2721,14 +2834,15 @@ export class GalaxyRenderer {
   }
 
   drawRegionBoundarySegments(y, alpha) {
-    const boundaries = this.regionBoundarySegmentsForDistance();
-    if (!boundaries.length) return;
+    const polylines = this.regionBoundaryPolylines;
+    if (!polylines?.length) return;
     const ctx = this.ctx;
     const rect = this.overlay.getBoundingClientRect();
     const margin = 120;
     const worldRadius = this.sectorMapWorldRadius();
+    const level = this.regionBoundaryLevel(rect);
     const cacheKey = [
-      boundaries.length,
+      level,
       rect.width.toFixed(0),
       rect.height.toFixed(0),
       this.target.map((value) => value.toFixed(1)).join(':'),
@@ -2745,30 +2859,68 @@ export class GalaxyRenderer {
       const outerPath = new Path2D();
       let internalCount = 0;
       let outerCount = 0;
+      const m = this.matrix;
+      const [targetX, , targetZ] = this.target;
+      const halfWidth = rect.width * 0.5;
+      const halfHeight = rect.height * 0.5;
+      let screenX = new Float32Array(4096);
+      let screenY = new Float32Array(4096);
 
-      const appendSegment = (segment, path) => {
-        if (!this.isRegionSegmentNearView(segment, worldRadius)) return false;
-        const [x1, z1, x2, z2] = segment;
-        const start = this.regionMapPoint(x1, z1);
-        const end = this.regionMapPoint(x2, z2);
-        const a = this.screen({ x: start.x, y, z: start.z }, rect);
-        const b = this.screen({ x: end.x, y, z: end.z }, rect);
-        if (!a || !b) return false;
-        if ((a.x < -margin && b.x < -margin)
-          || (a.x > rect.width + margin && b.x > rect.width + margin)
-          || (a.y < -margin && b.y < -margin)
-          || (a.y > rect.height + margin && b.y > rect.height + margin)) return false;
-        path.moveTo(a.x, a.y);
-        path.lineTo(b.x, b.y);
-        return true;
-      };
-
-      for (const segment of boundaries) {
-        const isOuter = segment[4] === 0 || segment[5] === 0;
-        if (appendSegment(segment, isOuter ? outerPath : internalPath)) {
-          if (isOuter) outerCount += 1;
-          else internalCount += 1;
+      for (const polyline of polylines) {
+        if (Number.isFinite(worldRadius) && (
+          polyline.maxX < targetX - worldRadius || polyline.minX > targetX + worldRadius
+          || polyline.maxZ < targetZ - worldRadius || polyline.minZ > targetZ + worldRadius
+        )) continue;
+        const points = polyline.lods[level];
+        const count = points.length / 2;
+        if (count > screenX.length) {
+          screenX = new Float32Array(count);
+          screenY = new Float32Array(count);
         }
+        // Project inline: this runs for every vertex whenever the camera moves.
+        let minSX = Infinity;
+        let maxSX = -Infinity;
+        let minSY = Infinity;
+        let maxSY = -Infinity;
+        for (let index = 0; index < count; index += 1) {
+          const x = points[index * 2];
+          const z = points[index * 2 + 1];
+          const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+          const depth = (m[2] * x + m[6] * y + m[10] * z + m[14]) / w;
+          if (w <= 0 || depth < -1 || depth > 1) {
+            screenX[index] = NaN;
+            continue;
+          }
+          const px = ((m[0] * x + m[4] * y + m[8] * z + m[12]) / w + 1) * halfWidth;
+          const py = (1 - (m[1] * x + m[5] * y + m[9] * z + m[13]) / w) * halfHeight;
+          screenX[index] = px;
+          screenY[index] = py;
+          if (px < minSX) minSX = px;
+          if (px > maxSX) maxSX = px;
+          if (py < minSY) minSY = py;
+          if (py > maxSY) maxSY = py;
+        }
+        if (maxSX < -margin || minSX > rect.width + margin || maxSY < -margin || minSY > rect.height + margin) continue;
+        const path = polyline.outer ? outerPath : internalPath;
+        let drawn = false;
+        let penDown = false;
+        for (let index = 0; index < count; index += 1) {
+          const px = screenX[index];
+          if (Number.isNaN(px)) {
+            penDown = false;
+            continue;
+          }
+          if (penDown) {
+            path.lineTo(px, screenY[index]);
+            drawn = true;
+          } else {
+            path.moveTo(px, screenY[index]);
+            penDown = true;
+          }
+        }
+        if (!drawn) continue;
+        if (polyline.outer) outerCount += 1;
+        else internalCount += 1;
       }
 
       paths = { internalPath, outerPath, internalCount, outerCount };
@@ -2776,6 +2928,33 @@ export class GalaxyRenderer {
       this.regionPathCache = paths;
     }
 
+    // While navigating, strokes skip the blur and change every frame, so draw
+    // them directly. At rest the drop-line pulse still redraws every 80 ms, so
+    // keep the blurred strokes in a cached layer until the view changes.
+    if (this.isNavigating()) {
+      this.strokeRegionPaths(ctx, paths, alpha, false);
+      return;
+    }
+    const layerKey = `${cacheKey}|${alpha.toFixed(3)}|${this.overlay.width}x${this.overlay.height}`;
+    if (this.regionLayerKey !== layerKey) {
+      this.regionLayer ??= document.createElement('canvas');
+      const layer = this.regionLayer;
+      if (layer.width !== this.overlay.width) layer.width = this.overlay.width;
+      if (layer.height !== this.overlay.height) layer.height = this.overlay.height;
+      const layerCtx = layer.getContext('2d');
+      layerCtx.setTransform(1, 0, 0, 1, 0, 0);
+      layerCtx.clearRect(0, 0, layer.width, layer.height);
+      layerCtx.setTransform(ctx.getTransform());
+      this.strokeRegionPaths(layerCtx, paths, alpha, true);
+      this.regionLayerKey = layerKey;
+    }
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(this.regionLayer, 0, 0);
+    ctx.restore();
+  }
+
+  strokeRegionPaths(ctx, paths, alpha, glow) {
     const baseWidth = this.distance > 42000 ? 3.4 : this.distance > 22000 ? 2.8 : 2.2;
     const strokePath = (path, count, {
       color,
@@ -2793,7 +2972,7 @@ export class GalaxyRenderer {
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
       ctx.shadowColor = shadowColor;
-      ctx.shadowBlur = this.isNavigating() ? 0 : shadowBlur;
+      ctx.shadowBlur = glow ? shadowBlur : 0;
       ctx.setLineDash(dash ?? []);
       ctx.stroke(path);
       ctx.restore();
