@@ -2823,6 +2823,11 @@ body {
     right: 398px;
   }
 
+  .app:not(.inspector-collapsed) .route-bar {
+    right: 398px;
+    max-width: min(860px, calc(100% - 534px));
+  }
+
   .search-wrap {
     width: min(520px, calc(100% - 326px));
   }
@@ -2872,6 +2877,177 @@ body {
   }
 
   .map-toolbar .icon-button:nth-child(-n + 2) {
+    display: none;
+  }
+}
+
+/* Colour-by map modes: the picker and a legend whose toggles edit the
+   matching System features filter. */
+.color-by-control {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 6px;
+}
+
+.color-by-control > span {
+  color: #8096a1;
+  font-size: 9px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.color-by-control select {
+  width: 100%;
+  height: 31px;
+  padding: 4px 24px 4px 7px;
+  border: 1px solid rgba(118, 148, 162, 0.28);
+  border-radius: 4px;
+  background: rgba(5, 13, 17, 0.9);
+  color: #c4d4db;
+  font-size: 11px;
+}
+
+.color-by-control select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.color-legend {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 10px;
+  margin: 0 0 10px;
+  padding: 8px;
+  border: 1px solid rgba(118, 148, 162, 0.2);
+  border-radius: 4px;
+  background: rgba(5, 13, 17, 0.6);
+}
+
+.color-legend[hidden] {
+  display: none;
+}
+
+.color-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: #c4d4db;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.color-legend-item span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.color-legend-item input:not(:checked) ~ span {
+  opacity: 0.4;
+}
+
+.color-legend-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* Route strip along the bottom of the map, after the in-game route bar. */
+/* Centred in the space between the movement pad and the right edge. */
+.route-bar {
+  position: absolute;
+  z-index: 10;
+  right: 16px;
+  bottom: 60px;
+  left: 136px;
+  display: flex;
+  align-items: stretch;
+  width: fit-content;
+  max-width: min(860px, calc(100% - 152px));
+  margin-inline: auto;
+  border: 1px solid rgba(var(--accent-rgb), 0.38);
+  border-radius: 6px;
+  background: rgba(5, 12, 16, 0.92);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+.route-bar[hidden] {
+  display: none;
+}
+
+.route-bar-cell {
+  display: grid;
+  min-width: 0;
+  align-content: center;
+  gap: 2px;
+  padding: 7px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+}
+
+button.route-bar-cell {
+  cursor: pointer;
+}
+
+button.route-bar-cell:hover,
+button.route-bar-cell:focus-visible {
+  background: rgba(var(--accent-rgb), 0.12);
+  outline: none;
+}
+
+.route-bar-cell small {
+  color: #8096a1;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.route-bar-cell strong {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.route-bar-cell span {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.route-bar-cell.next strong {
+  color: #8ff0f2;
+}
+
+.route-bar-cell.destination strong {
+  color: var(--accent);
+}
+
+.route-bar-arrow {
+  display: grid;
+  place-items: center;
+  padding: 0 2px;
+  color: rgba(var(--accent-rgb), 0.7);
+  font-size: 18px;
+}
+
+@media (max-width: 900px) {
+  .route-bar {
+    bottom: 56px;
+  }
+
+  .route-bar-cell span,
+  .route-bar .jumps {
     display: none;
   }
 }

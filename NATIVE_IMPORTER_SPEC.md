@@ -31,6 +31,17 @@ Flags:
 
 - `1`: permit required.
 - `2`: non-standard primary star.
+- bits 8..11: ID64 mass code plus one (0 = no ID64). LOD membership is
+  weighted by this mass code; see `docs/GALAXY_DATA_STORAGE.md`.
+
+Full imports accept either `systems.json.gz` or the full `galaxy.json.gz`
+(`npm run import:systems:galaxy`, or `npm run refresh:from-galaxy` for the
+whole rebuild). Galaxy rows have no system-level primary star, update time, or
+permit field: the primary comes from the body flagged `mainStar`, the update
+time from `date`, and anything still missing (permits, and primaries of
+systems without body data) is carried over from the previous `systems.bin` by
+ID64. Full imports write temporary files and only replace the dataset after
+the whole source has been read, so a truncated download fails without damage.
 
 ## Commands
 

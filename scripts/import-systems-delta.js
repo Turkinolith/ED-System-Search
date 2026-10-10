@@ -5,6 +5,7 @@ import { Readable, Transform } from 'node:stream';
 import { createGunzip } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { getHeapStatistics } from 'node:v8';
+import { massCode, withMassCode, weightedLodDivisor } from './mass-code.js';
 import { parseUpdateSeconds, secondsToIso, unknownUpdateSeconds } from './update-time.js';
 import { withImportActivity } from './import-activity.js';
 
@@ -312,10 +313,11 @@ async function writeOutputRecord(writers, system, index, bounds) {
   const x = Number(system.coords?.x ?? 0);
   const y = Number(system.coords?.y ?? 0);
   const z = Number(system.coords?.z ?? 0);
-  const flags = Number.isInteger(system.flags)
-    ? system.flags
-    : (system.needsPermit ? 1 : 0) | (nonStandard(star) ? 2 : 0);
   const id64 = system.id64 ?? 0;
+  const flags = withMassCode(Number.isInteger(system.flags)
+    ? system.flags
+    : (system.needsPermit ? 1 : 0) | (nonStandard(star) ? 2 : 0), id64);
+  const code64 = massCode(id64);
   const updateSeconds = Number.isInteger(system.updateSeconds)
     ? system.updateSeconds
     : parseUpdateSeconds(system.updateTime);
@@ -348,7 +350,7 @@ async function writeOutputRecord(writers, system, index, bounds) {
   point.writeUInt32LE(index, 16);
   const hash = hashIndex(id64, index);
   for (let i = 0; i < lodDefs.length; i += 1) {
-    if (hash % lodDefs[i].divisor === 0) {
+    if (hash % weightedLodDivisor(lodDefs[i].divisor, code64) === 0) {
       await writeAll(writers.lods[i], point);
       lodCounts[i] += 1;
     }
@@ -485,7 +487,9 @@ async function main() {
       typeNames,
       typeCounts: Object.fromEntries([...typeCounts.entries()].map(([k, v]) => [String(k), v])),
       baseTypes: Object.fromEntries(typeNames.map((name, code) => [String(code), baseType(name)])),
-      lodLevels: lodDefs.map((lod, i) => ({ level: lod.level, divisor: lod.divisor, file: lod.file, count: lodCounts[i] })),
+      pointFlags: { massCodeShift: 8, massCodeBits: 4 },
+      lodWeighting: 'mass-code-v1',
+    lodLevels: lodDefs.map((lod, i) => ({ level: lod.level, divisor: lod.divisor, file: lod.file, count: lodCounts[i] })),
       updateTimeRange: {
         available: minUpdateSeconds !== unknownUpdateSeconds,
         minUpdateTime: minUpdateSeconds === unknownUpdateSeconds ? null : secondsToIso(minUpdateSeconds),

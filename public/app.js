@@ -1,4 +1,6 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=grid-directions-3';
+import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=map-ui-1';
+import { decodeId64, massCodeTypicalStars } from './id64.js?v=mass-layers-1';
+import { colorModes, hexToRgb, noDataColor } from './color-modes.js?v=map-ui-1';
 
 const state = {
   meta: null,
@@ -89,6 +91,12 @@ const el = {
   dropLinesToggle: document.querySelector('#dropLinesToggle'),
   localDetailOnlyToggle: document.querySelector('#localDetailOnlyToggle'),
   sectorMapToggle: document.querySelector('#sectorMapToggle'),
+  galaxyGlowToggle: document.querySelector('#galaxyGlowToggle'),
+  boxelToggle: document.querySelector('#boxelToggle'),
+  nebulaToggle: document.querySelector('#nebulaToggle'),
+  colorBySelect: document.querySelector('#colorBySelect'),
+  colorLegend: document.querySelector('#colorLegend'),
+  routeBar: document.querySelector('#routeBar'),
   landmarksToggle: document.querySelector('#landmarksToggle'),
   carrierRangeToggle: document.querySelector('#carrierRangeToggle'),
   murderBinariesToggle: document.querySelector('#murderBinariesToggle'),
@@ -603,10 +611,14 @@ function configureRichFilters() {
   el.minBodyCount.value = available ? String(Math.max(0, Number(settings.richFilters?.minBodies ?? 0))) : '0';
   for (const [name, input] of richCategoryControls()) {
     input.disabled = !categoriesAvailable;
-    input.value = categoriesAvailable ? String(settings.richFilters?.[name] ?? '') : '';
+    setCategoryFilterValue(input, categoriesAvailable ? String(settings.richFilters?.[name] ?? '') : '');
     input.closest('label')?.toggleAttribute('aria-disabled', !categoriesAvailable);
     input.closest('label')?.setAttribute('title', categoriesAvailable ? '' : unavailableReason);
   }
+  el.colorBySelect.disabled = !categoriesAvailable;
+  el.colorBySelect.value = categoriesAvailable ? activeColorBy() : '';
+  renderColorLegend();
+  state.renderer?.setColorMode(colorModeFor(activeColorBy()));
   if (!available) {
     el.richFiltersSummary.textContent = unavailableReason;
     return;
@@ -624,8 +636,132 @@ function richFilterSettings() {
   return filters;
 }
 
+// A category <select> shows one value; several values (set from the colour
+// legend) live in an extra "Several" option so the filter keeps one source.
+function setCategoryFilterValue(input, value) {
+  input.querySelector('option[data-multi]')?.remove();
+  const values = String(value ?? '').split(',').filter(Boolean);
+  if (values.length > 1 || (values.length === 1 && !input.querySelector(`option[value="${CSS.escape(values[0])}"]`))) {
+    const option = document.createElement('option');
+    option.value = values.join(',');
+    option.dataset.multi = '';
+    option.textContent = `Several (${values.length})`;
+    input.append(option);
+  }
+  input.value = values.join(',');
+}
+
+function activeColorBy() {
+  const key = readViewSettings().colorBy ?? '';
+  return richCategoryFiltersAvailable() && Object.hasOwn(colorModes, key) ? key : '';
+}
+
+function colorModeFor(key) {
+  const mode = colorModes[key];
+  if (!mode) return null;
+  return {
+    key,
+    palette: [null, ...mode.values.map((entry) => hexToRgb(entry.color))],
+    noData: hexToRgb(noDataColor),
+  };
+}
+
+function colorLegendSelection(mode) {
+  const input = richCategoryControls().find(([name]) => name === mode.filter)?.[1];
+  const values = String(input?.value ?? '').split(',').filter(Boolean);
+  const all = [...mode.values.map((entry) => entry.value), 'none'];
+  return { input, selected: new Set(values.length ? values : all), all };
+}
+
+function renderColorLegend() {
+  const key = activeColorBy();
+  const mode = colorModes[key];
+  el.colorLegend.hidden = !mode;
+  el.colorLegend.replaceChildren();
+  if (!mode) return;
+  const { selected } = colorLegendSelection(mode);
+  const entries = [...mode.values, { value: 'none', label: 'No data', color: noDataColor }];
+  for (const entry of entries) {
+    const label = document.createElement('label');
+    label.className = 'color-legend-item';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = selected.has(entry.value);
+    input.addEventListener('change', () => toggleColorLegendValue(mode, entry.value, input.checked));
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.setProperty('--star-color', entry.color);
+    const text = document.createElement('span');
+    text.textContent = entry.label;
+    label.append(input, swatch, text);
+    el.colorLegend.append(label);
+  }
+  const actions = document.createElement('div');
+  actions.className = 'color-legend-actions';
+  const showAll = document.createElement('button');
+  showAll.type = 'button';
+  showAll.className = 'panel-button panel-button-tertiary';
+  showAll.textContent = 'Show all';
+  showAll.addEventListener('click', () => setColorLegendValues(mode, null));
+  actions.append(showAll);
+  if (mode.note) {
+    const note = document.createElement('small');
+    note.className = 'muted';
+    note.textContent = mode.note;
+    actions.append(note);
+  }
+  el.colorLegend.append(actions);
+}
+
+// Legend toggles edit the matching System features filter, so colouring and
+// filtering stay one system: all values checked means "Any".
+function toggleColorLegendValue(mode, value, checked) {
+  const { selected } = colorLegendSelection(mode);
+  if (checked) selected.add(value);
+  else selected.delete(value);
+  setColorLegendValues(mode, selected);
+}
+
+function setColorLegendValues(mode, selected) {
+  const { input, all } = colorLegendSelection(mode);
+  if (!input) return;
+  const values = selected && selected.size < all.length ? all.filter((value) => selected.has(value)) : [];
+  if (selected && selected.size === 0) values.push('none');
+  setCategoryFilterValue(input, values.join(','));
+  renderColorLegend();
+  saveAndApplyRichFilters();
+}
+
+// Like the in-game colour views, a colour mode starts by hiding systems that
+// have no data for it; switching back undoes that automatic filter unless
+// the user has changed it since.
+async function applyColorBy(key) {
+  const settings = readViewSettings();
+  const previousAuto = settings.colorAutoFilter;
+  writeViewSettings({ colorBy: key, colorAutoFilter: null });
+  const mode = colorModes[activeColorBy()];
+  state.renderer.setColorMode(colorModeFor(activeColorBy()));
+  const controls = new Map(richCategoryControls());
+  const previousInput = previousAuto ? controls.get(previousAuto.filter) : null;
+  if (previousInput && previousInput.value === previousAuto.value && previousAuto.filter !== mode?.filter) {
+    setCategoryFilterValue(previousInput, '');
+  }
+  const input = mode ? controls.get(mode.filter) : null;
+  if (input && !input.value) {
+    const value = mode.values.map((entry) => entry.value).join(',');
+    writeViewSettings({ colorAutoFilter: { filter: mode.filter, value } });
+    setCategoryFilterValue(input, value);
+  } else if (input && previousAuto?.filter === mode.filter && input.value === previousAuto.value) {
+    writeViewSettings({ colorAutoFilter: previousAuto });
+  }
+  renderColorLegend();
+  await saveAndApplyRichFilters();
+}
+
 function appendRichFilterParams(params) {
   if (!richFiltersAvailable()) return false;
+  const colorBy = activeColorBy();
+  if (colorBy) params.set('colorBy', colorBy);
   const rich = richFilterSettings();
   for (const name of ['hasStations', 'populated', 'landable', 'markets', 'shipyards', 'outfitting']) {
     if (rich[name]) params.set(name, '1');
@@ -644,6 +780,7 @@ function appendRichFilterParams(params) {
 async function saveAndApplyRichFilters() {
   const applyId = ++richFilterApplyId;
   writeViewSettings({ richFilters: richFilterSettings() });
+  renderColorLegend();
   cancelLocalPointsRefresh();
   state.localPointCount = 0;
   state.localAreaCount = null;
@@ -673,7 +810,7 @@ async function saveAndApplyRichFilters() {
 
 function clearRichFilters() {
   for (const [, input] of richFilterControls()) input.checked = false;
-  for (const [, input] of richCategoryControls()) input.value = '';
+  for (const [, input] of richCategoryControls()) setCategoryFilterValue(input, '');
   el.minBodyCount.value = '0';
   saveAndApplyRichFilters();
 }
@@ -877,6 +1014,7 @@ async function loadStatus() {
   state.meta = data.meta;
   state.visited = data.visited;
   state.latestJournal = data.visited?.latestSystem ?? null;
+  if (el.routeBar && state.routeOverlay) renderRouteBar();
   state.carrierLocation = data.visited?.carrierLocation ?? null;
   state.trackedCarrier = data.runtimeConfig?.trackedCarrier ?? null;
   state.llmSearchDefaults = data.runtimeConfig?.llmSearch ?? null;
@@ -1184,6 +1322,7 @@ function selectedHtml(system) {
     </div>
     <dl>
       <dt>ID64</dt><dd>${escapeHtml(system.id64)}</dd>
+      ${boxelRows(system)}
       <dt>Coords</dt><dd>${coordsText(system.coords)}</dd>
       <dt>Permit</dt><dd>${system.needsPermit ? 'Required' : 'No'}</dd>
       <dt>Visited</dt><dd>${system.visited ? 'Yes' : 'No'}</dd>
@@ -1194,6 +1333,22 @@ function selectedHtml(system) {
       ${note ? `<dt>Note</dt><dd class="note-inline">${note}</dd>` : ''}
     </dl>
   `;
+}
+
+// Mass code and boxel come straight from the ID64; for systems with an
+// unknown primary, the mass code is the best hint at what the star is.
+function boxelRows(system) {
+  const boxel = decodeId64(system.id64);
+  if (!boxel) return '';
+  const unknownPrimary = !system.mainStar || system.mainStar === 'Unknown';
+  const massText = unknownPrimary
+    ? `${boxel.letter} · likely ${massCodeTypicalStars[boxel.massCode]}`
+    : boxel.letter;
+  const min = boxel.min;
+  return [
+    detailRow('Mass code', massText),
+    detailRow('Boxel', `${boxel.cellEdge} ly cube from ${min.x.toLocaleString()}, ${min.y.toLocaleString()}, ${min.z.toLocaleString()}`),
+  ].join('');
 }
 
 function detailRow(label, value) {
@@ -1563,6 +1718,72 @@ function focusSystem(name, coords) {
   state.renderer.setTarget(coords.x, coords.y, coords.z);
 }
 
+// The in-game style route strip: where you are, the next jump, how many
+// jumps remain, and the destination. Progress follows the latest journal
+// system along NavRoute.json.
+function routeProgress(route, latestName) {
+  const name = String(latestName ?? '').toLowerCase();
+  const found = name ? route.findIndex((hop) => String(hop.name).toLowerCase() === name) : -1;
+  const current = Math.max(0, found);
+  const remainingLy = Number(route.at(-1)?.cumulativeDistanceLy ?? 0) - Number(route[current]?.cumulativeDistanceLy ?? 0);
+  return {
+    current,
+    next: route[current + 1] ?? null,
+    destination: route.at(-1) ?? null,
+    jumps: Math.max(0, route.length - 1 - current),
+    remainingLy: Math.max(0, remainingLy),
+  };
+}
+
+function renderRouteBar() {
+  const route = state.routeOverlay?.route ?? [];
+  const visible = el.routeToggle.checked && route.length >= 2;
+  el.routeBar.hidden = !visible;
+  el.routeBar.replaceChildren();
+  if (!visible) return;
+  const progress = routeProgress(route, state.latestJournal?.name);
+  const cell = (kicker, hop, detail, tone = '') => {
+    const element = document.createElement(hop ? 'button' : 'div');
+    element.className = `route-bar-cell ${tone}`.trim();
+    if (hop) {
+      element.type = 'button';
+      element.title = `Focus ${hop.name}`;
+      element.addEventListener('click', () => focusRouteHop(hop));
+    }
+    const label = document.createElement('small');
+    label.textContent = kicker;
+    const value = document.createElement('strong');
+    value.textContent = hop?.name ?? detail;
+    element.append(label, value);
+    if (hop && detail) {
+      const extra = document.createElement('span');
+      extra.textContent = detail;
+      element.append(extra);
+    }
+    return element;
+  };
+  const arrow = (extra = '') => {
+    const element = document.createElement('span');
+    element.className = `route-bar-arrow ${extra}`.trim();
+    element.textContent = '›';
+    element.setAttribute('aria-hidden', 'true');
+    return element;
+  };
+  const next = progress.next;
+  const nextDetail = next
+    ? `${Number(next.hopDistanceLy ?? 0).toFixed(2)} ly${next.starClass ? ` · ${next.starClass}${next.scoopable ? ' · scoopable' : ''}` : ''}`
+    : '';
+  el.routeBar.append(
+    cell('Current system', route[progress.current], ''),
+    arrow(),
+    next ? cell('Next jump', next, nextDetail, 'next') : cell('Next jump', null, 'Arrived'),
+    arrow('jumps'),
+    cell('Jumps left', null, `${progress.jumps} · ${progress.remainingLy.toLocaleString(undefined, { maximumFractionDigits: 1 })} ly`, 'jumps'),
+    arrow(),
+    cell('Destination', progress.destination, '', 'destination'),
+  );
+}
+
 function focusRouteHop(hop) {
   if (!hop?.coords) return;
   focusSystem(hop.name, hop.coords);
@@ -1616,6 +1837,7 @@ async function refreshRouteOverlay(options = {}) {
       state.routeOverlay = null;
       routeOverlaySignature = signature;
       state.renderer.setRouteOverlay(null);
+      renderRouteBar();
       if (manual || auto) setStatus(data.warnings?.[0] ?? 'No active route is available.');
       return changed;
     }
@@ -1625,6 +1847,7 @@ async function refreshRouteOverlay(options = {}) {
     el.routeToggle.checked = true;
     state.renderer.showRouteOverlay = true;
     state.renderer.setRouteOverlay(data);
+    renderRouteBar();
     writeViewSettings({ showRouteOverlay: true });
     setStatus(
       routeStatusMessage(data),
@@ -2480,6 +2703,23 @@ async function refreshLocalPointsNow(options = {}) {
   return state.localPointCount > 0;
 }
 
+// Backdrop clouds come from the Nebulae places whether or not that marker
+// category is shown, so they load once on their own.
+let nebulaBackdropLoaded = false;
+async function loadNebulaBackdrop() {
+  if (nebulaBackdropLoaded || !el.nebulaToggle.checked) return;
+  nebulaBackdropLoaded = true;
+  try {
+    const response = await fetch('/api/places?category=Nebulae');
+    if (!response.ok) throw new Error(response.statusText);
+    const data = await response.json();
+    state.renderer.setNebulae(data.places ?? []);
+  } catch (error) {
+    nebulaBackdropLoaded = false;
+    console.warn('Nebula backdrop unavailable:', error);
+  }
+}
+
 async function loadPlaces() {
   placesLoadController?.abort();
   const requestId = ++placesLoadRequestId;
@@ -2491,6 +2731,7 @@ async function loadPlaces() {
     const data = await response.json();
     if (requestId !== placesLoadRequestId) return;
     state.placesMeta = data.imported ? data : state.placesMeta;
+    if (data.imported) loadNebulaBackdrop();
     state.placeCategoryData.clear();
     state.places = [];
     renderPlaceFilters();
@@ -3043,6 +3284,23 @@ function bindControls() {
     state.renderer.requestRender();
     writeViewSettings({ showSectorMap: el.sectorMapToggle.checked });
   });
+  el.galaxyGlowToggle.addEventListener('change', () => {
+    state.renderer.showGalaxyGlow = el.galaxyGlowToggle.checked;
+    state.renderer.requestRender();
+    writeViewSettings({ showGalaxyGlow: el.galaxyGlowToggle.checked });
+  });
+  el.boxelToggle.addEventListener('change', () => {
+    state.renderer.showBoxel = el.boxelToggle.checked;
+    state.renderer.requestRender();
+    writeViewSettings({ showBoxel: el.boxelToggle.checked });
+  });
+  el.nebulaToggle.addEventListener('change', () => {
+    state.renderer.showNebulae = el.nebulaToggle.checked;
+    state.renderer.requestRender();
+    writeViewSettings({ showNebulae: el.nebulaToggle.checked });
+    if (el.nebulaToggle.checked) loadNebulaBackdrop();
+  });
+  el.colorBySelect.addEventListener('change', () => applyColorBy(el.colorBySelect.value));
   el.landmarksToggle.addEventListener('change', () => {
     state.renderer.showLandmarks = el.landmarksToggle.checked;
     state.renderer.requestRender();
@@ -3064,6 +3322,7 @@ function bindControls() {
   });
   el.routeToggle.addEventListener('change', () => {
     state.renderer.showRouteOverlay = el.routeToggle.checked;
+    renderRouteBar();
     state.renderer.requestRender();
     writeViewSettings({ showRouteOverlay: el.routeToggle.checked });
     if (el.routeToggle.checked) {
@@ -3203,6 +3462,9 @@ async function init() {
   el.dropLinesToggle.checked = viewSettings.showDropLines ?? true;
   el.localDetailOnlyToggle.checked = viewSettings.localDetailOnly ?? false;
   el.sectorMapToggle.checked = viewSettings.showSectorMap ?? false;
+  el.galaxyGlowToggle.checked = viewSettings.showGalaxyGlow ?? true;
+  el.boxelToggle.checked = viewSettings.showBoxel ?? true;
+  el.nebulaToggle.checked = viewSettings.showNebulae ?? true;
   el.landmarksToggle.checked = viewSettings.showLandmarks ?? true;
   el.carrierRangeToggle.checked = viewSettings.showCarrierRange ?? false;
   el.routeToggle.checked = viewSettings.showRouteOverlay ?? false;
@@ -3215,6 +3477,9 @@ async function init() {
   state.renderer.showDropLines = el.dropLinesToggle.checked;
   await state.renderer.setShowBasePoints(!el.localDetailOnlyToggle.checked);
   state.renderer.showSectorMap = el.sectorMapToggle.checked;
+  state.renderer.showGalaxyGlow = el.galaxyGlowToggle.checked;
+  state.renderer.showBoxel = el.boxelToggle.checked;
+  state.renderer.showNebulae = el.nebulaToggle.checked;
   state.renderer.showLandmarks = el.landmarksToggle.checked;
   state.renderer.showCarrierRange = el.carrierRangeToggle.checked;
   state.renderer.showRouteOverlay = el.routeToggle.checked;

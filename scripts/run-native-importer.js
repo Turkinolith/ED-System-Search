@@ -12,8 +12,8 @@ const dataDir = process.env.EDSS_DATA_DIR ? path.resolve(process.env.EDSS_DATA_D
 const mode = process.argv[2];
 const args = process.argv.slice(3);
 
-if (!['full', 'delta', 'galaxy', 'galaxy-delta', 'galaxy-repack', 'galaxy-filters', 'green-gas-giants', 'murder-binaries', 'murder-index', 'spatial-index'].includes(mode)) {
-  console.error('Usage: node scripts/run-native-importer.js <full|delta|galaxy|galaxy-delta|galaxy-repack|galaxy-filters|green-gas-giants|murder-binaries|murder-index|spatial-index> [--source <path-or-url>]');
+if (!['full', 'delta', 'galaxy', 'galaxy-delta', 'galaxy-repack', 'galaxy-filters', 'green-gas-giants', 'murder-binaries', 'murder-index', 'galaxy-density', 'spatial-index'].includes(mode)) {
+  console.error('Usage: node scripts/run-native-importer.js <full|delta|galaxy|galaxy-delta|galaxy-repack|galaxy-filters|green-gas-giants|murder-binaries|murder-index|galaxy-density|spatial-index> [--source <path-or-url>]');
   process.exit(1);
 }
 
@@ -52,7 +52,7 @@ async function main() {
     command = nativeExe;
     commandArgs = [mode, ...args];
   } else {
-    if (mode === 'galaxy' || mode === 'galaxy-delta' || mode === 'galaxy-repack' || mode === 'galaxy-filters' || mode === 'green-gas-giants' || mode === 'murder-binaries' || mode === 'murder-index' || mode === 'spatial-index') {
+    if (mode === 'galaxy' || mode === 'galaxy-delta' || mode === 'galaxy-repack' || mode === 'galaxy-filters' || mode === 'green-gas-giants' || mode === 'murder-binaries' || mode === 'murder-index' || mode === 'galaxy-density' || mode === 'spatial-index') {
       throw new Error('The rich galaxy importer requires the native Rust executable. Run npm run native:build first.');
     }
     console.warn(`Native importer not built at ${nativeExe}; falling back to JS importer.`);

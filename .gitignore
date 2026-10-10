@@ -8,6 +8,10 @@ data/*
 systemsWithCoordinates.json.gz
 *.crdownload
 
+# Local galaxy-map reverse-engineering notes and evidence (decompiled game code, exe string dumps, personal logs)
+research/
+docs/GALAXY_MAP_RESEARCH.md
+
 # Local region-map source inputs
 regionID_numsort.csv
 regionMAP.csv

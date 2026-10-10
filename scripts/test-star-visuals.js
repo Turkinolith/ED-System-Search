@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { GalaxyRenderer, densityPriorityFraction, dropLineAnchorRange, formatDistanceBadge, gridAxisCueLayout, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, specialKind, starViewVolumeContains, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
+import { colorCategoryForMask, colorModes, hexToRgb } from '../public/color-modes.js';
+import { GalaxyRenderer, buildCloudTexels, contextRank, flightDuration, flightPose, formatPlaneCoordinate, nebulaSprite, planeTextBasis, densityPriorityFraction, estimatedStarVisual, galaxyGlowAlpha, galaxyGlowQuad, parseGalaxyDensity, dropLineAnchorRange, formatDistanceBadge, gridAxisCueLayout, gridDepthEmphasis, isGiantStarType, prioritizeDrawCandidates, specialKind, starViewVolumeContains, starVisual, visitedBraceGeometry, zoomDrawBudget, zoomLocalPointLimit, zoomStarScalePercent } from '../public/renderer.js';
 
 const o = starVisual('O (Blue-White) Star');
 const a = starVisual('A (Blue-White) Star');
@@ -164,5 +165,78 @@ const contextRenderer = Object.assign(Object.create(GalaxyRenderer.prototype), {
 });
 contextRenderer.contextPick({ clientX: 12, clientY: 18 });
 assert.equal(contextPlace?.place?.systemName, 'Candidate System', 'Right-click should expose filtered places without selecting or refocusing them.');
+
+// Context fill favours heavy mass codes; nearest-first share is unchanged.
+const massCandidates = Array.from({ length: 40 }, (_, index) => {
+  const massCode = index < 20 ? 1 : 7;
+  return { point: { index, massCode, bucket: index, contextRank: contextRank(massCode, index) }, distanceSq: (1000 - index) ** 2 };
+});
+const massSample = prioritizeDrawCandidates(massCandidates, 10, 0.5);
+const contextPicks = massSample.filter((item) => item.point.index < 35);
+assert.ok(contextPicks.every((item) => item.point.massCode === 7), 'Context slots should go to the heaviest mass codes first.');
+assert.ok(contextRank(-1, 5) < contextRank(1, 5) && contextRank(-1, 5) > contextRank(4, 5), 'Unknown mass codes should rank like class d.');
+
+const estimatedHeavy = estimatedStarVisual(7);
+const estimatedDwarf = estimatedStarVisual(1);
+assert.ok(estimatedHeavy.color[2] > estimatedHeavy.color[0], 'Unknown heavy primaries should be estimated blue.');
+assert.ok(estimatedDwarf.color[0] > estimatedDwarf.color[2], 'Unknown light primaries should be estimated red.');
+assert.equal(estimatedHeavy.estimated, true);
+
+const densityBuffer = new ArrayBuffer(32 + 2 * 2 * 2);
+const densityView = new DataView(densityBuffer);
+'EDGDENS1'.split('').forEach((char, index) => densityView.setUint8(index, char.charCodeAt(0)));
+densityView.setUint32(8, 1, true);
+densityView.setUint32(12, 2, true);
+densityView.setUint32(16, 2, true);
+densityView.setFloat32(20, -100, true);
+densityView.setFloat32(24, 0, true);
+densityView.setFloat32(28, 50, true);
+const densityImage = parseGalaxyDensity(densityBuffer);
+assert.equal(densityImage.texels.length, 8);
+assert.equal(parseGalaxyDensity(new ArrayBuffer(16)), null);
+const glowQuad = galaxyGlowQuad(densityImage);
+assert.deepEqual([...glowQuad.positions.slice(0, 3)], [100, 0, 0], 'Glow quad corners use mirrored render x.');
+assert.deepEqual([...glowQuad.uvs], [0, 0, 1, 0, 0, 1, 1, 1]);
+assert.equal(galaxyGlowAlpha(500, -0.5), 0, 'The glow stays hidden at local zoom.');
+assert.ok(galaxyGlowAlpha(20000, -Math.PI / 2) > galaxyGlowAlpha(20000, -0.05), 'Edge-on views soften the flat glow.');
+
+// Camera fly-to: ends exactly on target, eases, and lifts on long jumps.
+const flightFrom = { target: [0, 0, 0], distance: 850 };
+const flightTo = { target: [20000, 0, 0], distance: 850 };
+assert.deepEqual(flightPose(flightFrom, flightTo, 0).target, [0, 0, 0]);
+assert.ok(Math.abs(flightPose(flightFrom, flightTo, 0).distance - 850) < 1e-6);
+assert.deepEqual(flightPose(flightFrom, flightTo, 1).target, [20000, 0, 0]);
+assert.ok(Math.abs(flightPose(flightFrom, flightTo, 1).distance - 850) < 1e-6);
+assert.ok(flightPose(flightFrom, flightTo, 0.5).distance > 5000, 'Long flights should pull the camera back mid-way.');
+assert.ok(flightPose(flightFrom, flightTo, 0.1).target[0] < 2000, 'Flights should ease in.');
+assert.ok(flightDuration(flightFrom, flightTo) <= 1.2 && flightDuration(flightFrom, { target: [1, 0, 0], distance: 850 }) >= 0.55);
+
+// In-plane text always reads left to right and is never mirrored.
+for (const [a, b] of [[{ x: 10, y: 2 }, { x: 1, y: 8 }], [{ x: -10, y: 2 }, { x: 1, y: 8 }], [{ x: 1, y: 8 }, { x: -10, y: -2 }]]) {
+  const basis = planeTextBasis({ x: 0, y: 0 }, a, b);
+  assert.ok(basis.right.x > 0, 'Plane labels should read left to right.');
+  assert.ok(basis.right.x * basis.down.y - basis.right.y * basis.down.x > 0, 'Plane labels must not be mirrored.');
+}
+assert.equal(planeTextBasis({ x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }), null);
+
+// Nebula clouds: soft-edged mask and stable per-nebula look.
+const cloud = buildCloudTexels(64);
+assert.equal(cloud[0], 0, 'Cloud corners should fade to nothing.');
+assert.ok(Math.max(...cloud) > 120, 'Cloud centres should be visible.');
+assert.deepEqual(nebulaSprite({ name: 'Orion Nebula' }), nebulaSprite({ name: 'Orion Nebula' }));
+assert.ok(nebulaSprite({ name: 'Orion Nebula' }).radius >= 60 && nebulaSprite({ name: 'Orion Nebula' }).radius <= 160);
+
+// Colour-by categories follow color-modes.js; 0 means no data.
+const economy = colorModes.economy;
+const bit = (mode, value) => mode.values.find((entry) => entry.value === value).bit;
+assert.equal(colorCategoryForMask(economy, 0), 0);
+assert.equal(colorCategoryForMask(economy, bit(economy, 'agriculture')), 4);
+assert.equal(colorCategoryForMask(economy, bit(economy, 'highTech') | bit(economy, 'service')), 5, 'The less common economy should win.');
+assert.equal(colorCategoryForMask(colorModes.security, bit(colorModes.security, 'high')), 4);
+for (const mode of Object.values(colorModes)) assert.ok(mode.values.length <= 15, 'Categories must fit flag bits 12..15.');
+assert.deepEqual(hexToRgb('#ff0000'), [1, 0, 0]);
+
+assert.equal(formatPlaneCoordinate(-10030, 10), '-10,030');
+assert.equal(formatPlaneCoordinate(25000, 2500), '25.0k');
 
 console.log('Star visual profile test passed.');

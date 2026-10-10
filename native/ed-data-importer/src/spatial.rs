@@ -103,6 +103,10 @@ pub(crate) fn run(config: SpatialConfig<'_>) -> Result<()> {
         config.threads
     );
     pool.install(|| points.par_sort_unstable_by_key(|point| point.key));
+    let mut density = crate::density::DensityGrid::new();
+    for point in &points {
+        density.add(&point.record);
+    }
 
     let data_path = config.data_dir.join("systems-spatial.bin");
     let index_path = config.data_dir.join("systems-spatial.idx");
@@ -168,6 +172,9 @@ pub(crate) fn run(config: SpatialConfig<'_>) -> Result<()> {
     replace_file(&data_temp, &data_path)?;
     replace_file(&index_temp, &index_path)?;
     replace_file(&meta_temp, &output_meta_path)?;
+    density
+        .write(config.data_dir)
+        .with_context(|| format!("Could not write {}", crate::density::FILE_NAME))?;
     println!(
         "Spatial index complete: {} points in {} cells, built in {} seconds.",
         format_count(source_level.count),

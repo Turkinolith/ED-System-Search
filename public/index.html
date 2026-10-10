@@ -111,6 +111,7 @@
             <button id="noteSave" type="button">Save</button>
           </div>
         </div>
+        <div id="routeBar" class="route-bar" hidden></div>
         <div id="status" class="status">Loading galaxy data...</div>
       </section>
 
@@ -199,6 +200,9 @@
                 <label class="toggle"><input id="dropLinesToggle" type="checkbox" checked><span>Drop lines</span></label>
                 <label class="toggle" title="Hide the sampled full-galaxy LOD layer and show only detailed systems near the current view"><input id="localDetailOnlyToggle" type="checkbox"><span>Local detail only</span></label>
                 <label class="toggle" title="Show Elite-style indexed region lines at galaxy-scale zoom"><input id="sectorMapToggle" type="checkbox"><span>Sector map</span></label>
+                <label class="toggle" title="Glow of known-system density on the galactic plane at wide zoom; blue tints mark regions rich in heavy stars"><input id="galaxyGlowToggle" type="checkbox" checked><span>Galaxy glow</span></label>
+                <label class="toggle" title="Outline the selected system's ID64 boxel, the octree cell the game files it in"><input id="boxelToggle" type="checkbox" checked><span>Boxel outline</span></label>
+                <label class="toggle" title="Soft cloud sprites at known nebulae, like the in-game map's backdrop"><input id="nebulaToggle" type="checkbox" checked><span>Nebula clouds</span></label>
                 <label class="toggle"><input id="landmarksToggle" type="checkbox" checked><span>Landmarks</span></label>
                 <label class="toggle"><input id="carrierRangeToggle" type="checkbox"><span>Carrier range</span></label>
                 <label class="toggle" title="Highlight systems with a secondary star 5-12 light-seconds from arrival"><input id="murderBinariesToggle" type="checkbox" disabled><span>Murder binaries</span></label>
@@ -225,6 +229,13 @@
               <summary><span>System features</span><small>Full galaxy data</small></summary>
               <div class="disclosure-body rich-filter-panel">
                 <div id="richFiltersSummary" class="muted">Import galaxy.json.gz to enable these filters.</div>
+                <label class="color-by-control"><span>Colour stars by</span><select id="colorBySelect">
+                  <option value="">Star class</option>
+                  <option value="economy">Economy</option>
+                  <option value="security">Security</option>
+                  <option value="government">Government</option>
+                </select></label>
+                <div id="colorLegend" class="color-legend" hidden></div>
                 <div class="rich-filter-grid">
                   <label class="toggle"><input id="stationFilter" type="checkbox"><span>Has stations</span></label>
                   <label class="toggle"><input id="populatedFilter" type="checkbox"><span>Populated</span></label>
@@ -452,6 +463,6 @@
         </div>
       </aside>
     </main>
-    <script type="module" src="/app.js?v=grid-directions-3"></script>
+    <script type="module" src="/app.js?v=map-ui-1"></script>
   </body>
 </html>

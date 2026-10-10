@@ -1,17 +1,22 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDate, Utc};
 use flate2::read::GzDecoder;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use rustc_hash::FxHashSet;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 mod rich;
 mod ggg;
+mod density;
 mod murder;
 mod spatial;
 
@@ -19,6 +24,10 @@ const RECORD_BYTES: u64 = 32;
 const LOD_BYTES: usize = 20;
 const UNKNOWN_UPDATE_SECONDS: u32 = u32::MAX;
 const EPOCH: &str = "2000-01-01T00:00:00.000Z";
+// Point flag bits 8..11 store the ID64 mass code plus one; zero means the
+// system had no ID64. Bits 0..2 are permit, non-standard, and visited.
+const MASS_CODE_SHIFT: u16 = 8;
+const MASS_CODE_MASK: u16 = 0x0f << MASS_CODE_SHIFT;
 
 const LODS: [LodDef; 7] = [
     LodDef {
@@ -72,6 +81,10 @@ struct Coords {
     z: f64,
 }
 
+// Accepts rows from both Spansh dumps. systems.json.gz has mainStar,
+// needsPermit, and updateTime on the system. galaxy.json.gz has none of those:
+// its primary is the body flagged mainStar, its update time is "date", and it
+// has no permit field, so permits carry over from the existing data.
 #[derive(Clone, Debug, Deserialize)]
 struct SystemRecord {
     id64: Option<Value>,
@@ -83,6 +96,35 @@ struct SystemRecord {
     needs_permit: Option<bool>,
     #[serde(rename = "updateTime")]
     update_time: Option<String>,
+    date: Option<String>,
+    bodies: Option<Vec<BodyStub>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BodyStub {
+    #[serde(rename = "mainStar")]
+    main_star: Option<bool>,
+    #[serde(rename = "subType")]
+    sub_type: Option<String>,
+}
+
+impl SystemRecord {
+    fn normalize(mut self) -> Self {
+        if self.update_time.is_none() {
+            self.update_time = self.date.take();
+        }
+        if self.main_star.is_none() {
+            self.main_star = self.bodies.as_ref().and_then(|bodies| {
+                bodies
+                    .iter()
+                    .find(|body| body.main_star == Some(true))
+                    .and_then(|body| body.sub_type.clone())
+            });
+        }
+        self.date = None;
+        self.bodies = None;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -251,6 +293,7 @@ struct ImportState {
     max_update_seconds: u32,
     max_valid_update_seconds: u32,
     ignored_future_update_times: u64,
+    carried: CarriedSystems,
 }
 
 impl ImportState {
@@ -266,6 +309,7 @@ impl ImportState {
             max_update_seconds: 0,
             max_valid_update_seconds,
             ignored_future_update_times: 0,
+            carried: CarriedSystems::default(),
         }
     }
 
@@ -349,12 +393,13 @@ fn main() -> Result<()> {
             batch_size: config.batch_size,
         }),
         "murder-index" => murder::build_index(&config.data_dir),
+        "galaxy-density" => density::run(&config.data_dir),
         "spatial-index" => spatial::run(spatial::SpatialConfig {
             data_dir: &config.data_dir,
             threads: config.threads,
         }),
         _ => bail!(
-            "Unknown mode '{}'. Use full, delta, galaxy, galaxy-delta, galaxy-repack, galaxy-filters, green-gas-giants, murder-binaries, murder-index, or spatial-index.",
+            "Unknown mode '{}'. Use full, delta, galaxy, galaxy-delta, galaxy-repack, galaxy-filters, green-gas-giants, murder-binaries, murder-index, galaxy-density, or spatial-index.",
             config.mode
         ),
     }
@@ -374,7 +419,7 @@ impl Config {
         let mut args = env::args().skip(1);
         let mode = args.next().ok_or_else(|| {
             anyhow!(
-                "Usage: ed-data-importer <full|delta|galaxy|galaxy-delta|galaxy-repack|galaxy-filters|green-gas-giants|murder-binaries|murder-index|spatial-index> [--source <path-or-url>] [--data-dir data] [--threads N] [--compression-level 1-19] [--batch-size N]"
+                "Usage: ed-data-importer <full|delta|galaxy|galaxy-delta|galaxy-repack|galaxy-filters|green-gas-giants|murder-binaries|murder-index|galaxy-density|spatial-index> [--source <path-or-url>] [--data-dir data] [--threads N] [--compression-level 1-19] [--batch-size N]"
             )
         })?;
         let mut source = None;
@@ -434,6 +479,7 @@ impl Config {
             || mode == "murder-binaries"
             || mode == "murder-index"
             || mode == "spatial-index"
+            || mode == "galaxy-density"
         {
             source.unwrap_or_default()
         } else {
@@ -455,25 +501,51 @@ fn run_full(config: &Config) -> Result<()> {
     let paths = Paths::new(config.data_dir.clone());
     let started = Instant::now();
     let mut state = ImportState::new(TypeState::new());
-    let mut writers = open_writers(&paths, None)?;
+    state.carried = CarriedSystems::read(&paths)?;
+    if !state.carried.is_empty() {
+        println!(
+            "Carrying over {} primary-star types and {} permit flags for rows that lack them.",
+            format_count(state.carried.type_count()),
+            format_count(state.carried.permits.len())
+        );
+    }
+    // Write beside the current dataset and swap in only after a complete read,
+    // so a failed or truncated source leaves the existing map untouched.
+    let temp_suffix = format!(".native-full-{}.tmp", Utc::now().timestamp_millis());
+    let mut writers = open_writers(&paths, Some(&temp_suffix))?;
     let mut bounds = Bounds::default();
-    let mut index = 0usize;
 
     println!("Importing {}", config.source);
-    for system in read_systems(&config.source)? {
-        let _ = write_output_system(
-            &mut writers,
-            &mut state,
-            &mut bounds,
-            OutputSystem::New(&system),
-            index,
-        )?;
-        index += 1;
-        if index % 1_000_000 == 0 {
-            println!("Imported {} systems...", format_count(index));
+    let result = (|| -> Result<usize> {
+        let mut index = 0usize;
+        for system in read_systems(&config.source)? {
+            let system = system?;
+            let _ = write_output_system(
+                &mut writers,
+                &mut state,
+                &mut bounds,
+                OutputSystem::New(&system),
+                index,
+            )?;
+            index += 1;
+            if index % 1_000_000 == 0 {
+                println!("Imported {} systems...", format_count(index));
+            }
         }
-    }
-    flush_writers(writers)?;
+        if index == 0 {
+            bail!("No systems were read from {}.", config.source);
+        }
+        flush_writers(writers)?;
+        Ok(index)
+    })();
+    let index = match result {
+        Ok(index) => index,
+        Err(error) => {
+            remove_temp_files(&paths, &temp_suffix);
+            return Err(error);
+        }
+    };
+    replace_temp_files(&paths, &temp_suffix)?;
     write_meta(
         &paths,
         None,
@@ -523,6 +595,7 @@ fn run_delta(config: &Config) -> Result<()> {
     let mut delta_by_name = HashMap::<String, SystemRecord>::new();
     let mut delta_count = 0usize;
     for system in read_systems(&config.source)? {
+        let system = system?;
         if let Some(name) = &system.name {
             delta_by_name.insert(system_key(name), system);
             delta_count += 1;
@@ -616,45 +689,168 @@ fn run_delta(config: &Config) -> Result<()> {
     }
 }
 
-fn read_systems(source: &str) -> Result<impl Iterator<Item = SystemRecord>> {
-    let reader = open_source(source)?;
-    Ok(SystemLineIterator {
-        reader,
-        line: String::new(),
+const READ_BATCH_LINES: usize = 4096;
+
+// Decompression runs on its own thread while rayon parses each batch of lines
+// in order; galaxy.json.gz rows carry whole body lists, so parsing on the
+// reading thread would roughly halve throughput. Read errors (such as a
+// truncated download) end the import with an error instead of a short dataset.
+fn read_systems(source: &str) -> Result<SystemBatchIterator> {
+    let mut reader = open_source(source)?;
+    let (sender, receiver) = sync_channel::<io::Result<Vec<String>>>(8);
+    let handle = std::thread::spawn(move || {
+        loop {
+            let mut batch = Vec::with_capacity(READ_BATCH_LINES);
+            while batch.len() < READ_BATCH_LINES {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => batch.push(line),
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                }
+            }
+            let done = batch.len() < READ_BATCH_LINES;
+            if !batch.is_empty() && sender.send(Ok(batch)).is_err() {
+                return;
+            }
+            if done {
+                return;
+            }
+        }
+    });
+    Ok(SystemBatchIterator {
+        receiver,
+        handle: Some(handle),
+        ready: VecDeque::new(),
     })
 }
 
-struct SystemLineIterator {
-    reader: Box<dyn BufRead>,
-    line: String,
+struct SystemBatchIterator {
+    receiver: Receiver<io::Result<Vec<String>>>,
+    handle: Option<JoinHandle<()>>,
+    ready: VecDeque<SystemRecord>,
 }
 
-impl Iterator for SystemLineIterator {
-    type Item = SystemRecord;
+impl Iterator for SystemBatchIterator {
+    type Item = Result<SystemRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            self.line.clear();
-            let read = self.reader.read_line(&mut self.line).ok()?;
-            if read == 0 {
-                return None;
+            if let Some(system) = self.ready.pop_front() {
+                return Some(Ok(system));
             }
-            let Some(cleaned) = clean_json_line(&self.line) else {
-                continue;
-            };
-            match serde_json::from_str::<SystemRecord>(cleaned) {
-                Ok(system) => return Some(system),
-                Err(error) => {
-                    eprintln!("Skipped malformed JSON row: {}", error);
-                    continue;
+            match self.receiver.recv() {
+                Ok(Ok(lines)) => {
+                    let parsed: Vec<Option<SystemRecord>> = lines
+                        .par_iter()
+                        .map(|line| parse_system_line(line))
+                        .collect();
+                    self.ready.extend(parsed.into_iter().flatten());
+                }
+                Ok(Err(error)) => {
+                    return Some(Err(anyhow!(error).context("Could not read the systems source")));
+                }
+                Err(_) => {
+                    if let Some(handle) = self.handle.take()
+                        && handle.join().is_err()
+                    {
+                        return Some(Err(anyhow!("The systems reader thread panicked")));
+                    }
+                    return None;
                 }
             }
         }
     }
 }
 
-fn open_source(source: &str) -> Result<Box<dyn BufRead>> {
-    let input: Box<dyn Read> = if is_url(source) {
+fn parse_system_line(line: &str) -> Option<SystemRecord> {
+    let cleaned = clean_json_line(line)?;
+    match serde_json::from_str::<SystemRecord>(cleaned) {
+        Ok(system) => Some(system.normalize()),
+        Err(error) => {
+            eprintln!("Skipped malformed JSON row: {}", error);
+            None
+        }
+    }
+}
+
+// What a full import keeps from the dataset it replaces. galaxy.json.gz has no
+// primary star for systems without body data (about half of them) and no
+// permit flags; a star's class never changes, so the previous import's values
+// fill those gaps by ID64.
+#[derive(Default)]
+struct CarriedSystems {
+    ids: Vec<u64>,
+    types: Vec<u16>,
+    type_names: Vec<String>,
+    permits: FxHashSet<u64>,
+}
+
+impl CarriedSystems {
+    fn read(paths: &Paths) -> Result<Self> {
+        let mut carried = Self::default();
+        let Ok(file) = File::open(&paths.records) else {
+            return Ok(carried);
+        };
+        if let Ok(meta_file) = File::open(&paths.meta) {
+            let meta: ExistingMeta = serde_json::from_reader(meta_file)
+                .context("Could not read the previous systems metadata")?;
+            carried.type_names = meta.type_names;
+        }
+        let unknown_code = carried.type_names.iter().position(|name| name == "Unknown");
+        let mut pairs = Vec::<(u64, u16)>::new();
+        let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+        let mut record = [0u8; RECORD_BYTES as usize];
+        loop {
+            match reader.read_exact(&mut record) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
+            }
+            let old = old_record_from_bytes(&record);
+            if old.id64 == 0 {
+                continue;
+            }
+            if old.flags & 1 != 0 {
+                carried.permits.insert(old.id64);
+            }
+            let known = (old.type_code as usize) < carried.type_names.len()
+                && Some(old.type_code as usize) != unknown_code;
+            if known {
+                pairs.push((old.id64, old.type_code));
+            }
+        }
+        pairs.par_sort_unstable_by_key(|pair| pair.0);
+        pairs.dedup_by_key(|pair| pair.0);
+        carried.ids = pairs.iter().map(|pair| pair.0).collect();
+        carried.types = pairs.iter().map(|pair| pair.1).collect();
+        Ok(carried)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty() && self.permits.is_empty()
+    }
+
+    fn type_count(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn type_name(&self, id64: u64) -> Option<&str> {
+        if id64 == 0 {
+            return None;
+        }
+        let position = self.ids.binary_search(&id64).ok()?;
+        self.type_names
+            .get(self.types[position] as usize)
+            .map(String::as_str)
+    }
+}
+
+fn open_source(source: &str) -> Result<Box<dyn BufRead + Send>> {
+    let input: Box<dyn Read + Send> = if is_url(source) {
         println!("Downloading {}", source);
         let response = reqwest::blocking::get(source)?.error_for_status()?;
         Box::new(response)
@@ -747,6 +943,16 @@ fn rebuild_existing(
             if next.id64.is_none() {
                 next.id64 = Some(Value::from(old.id64));
             }
+            if next.needs_permit.is_none() {
+                next.needs_permit = Some(old.flags & 1 != 0);
+            }
+            if next.main_star.is_none() {
+                next.main_star = meta
+                    .type_names
+                    .get(old.type_code as usize)
+                    .filter(|name| name.as_str() != "Unknown")
+                    .cloned();
+            }
             let lookup_row =
                 write_output_system(writers, state, bounds, OutputSystem::New(&next), index)?;
             lookup_overlay.insert(lookup_row.key.clone(), lookup_row.name_lookup_line);
@@ -791,20 +997,27 @@ fn write_output_system(
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("Unknown {}", index));
+            let carried_star = || {
+                state
+                    .carried
+                    .type_name(parse_id64(system.id64.as_ref()))
+                    .map(str::to_string)
+            };
             let star = system
                 .main_star
                 .clone()
+                .or_else(carried_star)
                 .unwrap_or_else(|| "Unknown".to_string());
             let coords = system.coords.clone().unwrap_or(Coords {
                 x: 0.0,
                 y: 0.0,
                 z: 0.0,
             });
-            let flags = (if system.needs_permit.unwrap_or(false) {
-                1
-            } else {
-                0
-            }) | if non_standard(&star) { 2 } else { 0 };
+            let id64 = parse_id64(system.id64.as_ref());
+            let needs_permit = system
+                .needs_permit
+                .unwrap_or_else(|| id64 != 0 && state.carried.permits.contains(&id64));
+            let flags = (if needs_permit { 1 } else { 0 }) | if non_standard(&star) { 2 } else { 0 };
             (
                 name,
                 star,
@@ -812,7 +1025,7 @@ fn write_output_system(
                 coords.y as f32,
                 coords.z as f32,
                 flags,
-                parse_id64(system.id64.as_ref()),
+                id64,
                 parse_update_seconds(system.update_time.as_deref()),
                 None,
             )
@@ -835,6 +1048,8 @@ fn write_output_system(
         ),
     };
 
+    let flags = with_mass_code(flags, id64);
+    let mass_code = mass_code(id64);
     let update_seconds = state.sanitize_update(raw_update_seconds);
     let type_code = maybe_type_code.unwrap_or_else(|| state.types.code_for(&star));
     state.types.observe(type_code);
@@ -881,7 +1096,7 @@ fn write_output_system(
     point[16..20].copy_from_slice(&(index as u32).to_le_bytes());
     let hash = hash_index(id64, index);
     for (lod_index, lod) in LODS.iter().enumerate() {
-        if hash % lod.divisor == 0 {
+        if hash % weighted_lod_divisor(lod.divisor, mass_code) == 0 {
             writers.lods[lod_index].write_all(&point)?;
             state.lod_counts[lod_index] += 1;
         }
@@ -1124,6 +1339,8 @@ fn write_meta(
         "typeNames": state.types.names,
         "typeCounts": type_counts,
         "baseTypes": base_types,
+        "pointFlags": { "massCodeShift": MASS_CODE_SHIFT, "massCodeBits": 4 },
+        "lodWeighting": "mass-code-v1",
         "lodLevels": LODS.iter().enumerate().map(|(i, lod)| json!({
             "level": lod.level,
             "divisor": lod.divisor,
@@ -1222,6 +1439,74 @@ fn seconds_to_iso(seconds: u32) -> Value {
 }
 
 #[cfg(test)]
+mod galaxy_source_tests {
+    use super::*;
+
+    #[test]
+    fn galaxy_dump_rows_map_to_system_fields() {
+        let row = r#"{"id64":10477373803,"name":"Sol","coords":{"x":0,"y":0,"z":0},"date":"2026-08-11 21:52:16+00","factions":[{"name":"x"}],"bodies":[{"id64":1,"name":"Earth","type":"Planet","subType":"Earth-like world"},{"name":"Sol","type":"Star","subType":"G (White-Yellow) Star","mainStar":true,"rings":[]}],"stations":[]},"#;
+        let system = parse_system_line(row).expect("galaxy row should parse");
+        assert_eq!(system.main_star.as_deref(), Some("G (White-Yellow) Star"));
+        assert_eq!(system.update_time.as_deref(), Some("2026-08-11 21:52:16+00"));
+        assert_eq!(system.needs_permit, None);
+        assert!(system.bodies.is_none() && system.date.is_none());
+    }
+
+    #[test]
+    fn carried_types_and_permits_fill_missing_fields() {
+        let mut carried = CarriedSystems {
+            ids: vec![5, 9],
+            types: vec![1, 0],
+            type_names: vec!["Black Hole".to_string(), "K (Yellow-Orange) Star".to_string()],
+            permits: FxHashSet::default(),
+        };
+        carried.permits.insert(9);
+        assert_eq!(carried.type_name(5), Some("K (Yellow-Orange) Star"));
+        assert_eq!(carried.type_name(7), None);
+        assert_eq!(carried.type_name(0), None);
+        assert!(carried.permits.contains(&9));
+    }
+
+    #[test]
+    fn systems_dump_rows_are_unchanged() {
+        let row = r#"{"id64":1,"name":"A","mainStar":"M (Red dwarf) Star","coords":{"x":1,"y":2,"z":3},"needsPermit":true,"updateTime":"2026-08-11 21:52:16+00"}"#;
+        let system = parse_system_line(row).expect("systems row should parse");
+        assert_eq!(system.main_star.as_deref(), Some("M (Red dwarf) Star"));
+        assert_eq!(system.needs_permit, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod mass_code_tests {
+    use super::*;
+
+    #[test]
+    fn mass_code_is_stored_in_flag_bits_without_touching_other_flags() {
+        // Sol's ID64 has mass code d (3); permit and non-standard bits survive.
+        let flags = with_mass_code(0b11, 10477373803);
+        assert_eq!(flags & 0b11, 0b11);
+        assert_eq!((flags & MASS_CODE_MASK) >> MASS_CODE_SHIFT, 4);
+        assert_eq!(with_mass_code(flags, 0) & MASS_CODE_MASK, 0);
+        assert_eq!(with_mass_code(flags | MASS_CODE_MASK, 8) >> MASS_CODE_SHIFT, 1);
+    }
+
+    #[test]
+    fn weighted_lods_stay_nested_and_full_lod_keeps_everything() {
+        for code in [None, Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7)] {
+            assert_eq!(weighted_lod_divisor(1, code), 1);
+            for pair in LODS.windows(2) {
+                let coarse = weighted_lod_divisor(pair[0].divisor, code);
+                let fine = weighted_lod_divisor(pair[1].divisor, code);
+                assert!(coarse.is_power_of_two() && fine.is_power_of_two());
+                assert_eq!(coarse % fine, 0, "LOD {} must contain LOD {}", pair[1].level, pair[0].level);
+            }
+        }
+        assert!(weighted_lod_divisor(1024, Some(7)) < weighted_lod_divisor(1024, Some(2)));
+        assert!(weighted_lod_divisor(1024, Some(1)) > weighted_lod_divisor(1024, Some(2)));
+    }
+}
+
+#[cfg(test)]
 mod update_time_tests {
     use super::*;
 
@@ -1307,6 +1592,34 @@ fn hash_index(id64: u64, index: usize) -> u32 {
     value *= 0xff51afd7ed558ccd_u128;
     value ^= value >> 33;
     (value & 0xffff_ffff) as u32
+}
+
+fn mass_code(id64: u64) -> Option<u8> {
+    (id64 != 0).then_some((id64 & 7) as u8)
+}
+
+fn with_mass_code(flags: u16, id64: u64) -> u16 {
+    let field = mass_code(id64).map_or(0, |code| u16::from(code) + 1);
+    (flags & !MASS_CODE_MASK) | (field << MASS_CODE_SHIFT)
+}
+
+// The game's galaxy map layers systems by mass code (a..h) and favours the
+// heavy layers when zoomed out. Coarse LODs here do the same: heavy systems
+// get a smaller divisor and the very common a/b dwarfs a larger one. Divisors
+// stay powers of two, so every LOD is still a subset of the next finer one,
+// and LOD 6 (divisor 1) keeps every system.
+fn weighted_lod_divisor(divisor: u32, mass_code: Option<u8>) -> u32 {
+    if divisor <= 1 {
+        return 1;
+    }
+    match mass_code {
+        Some(0) | Some(1) => divisor.saturating_mul(2),
+        Some(4) => (divisor >> 3).max(1),
+        Some(5) => (divisor >> 5).max(1),
+        Some(6) => (divisor >> 6).max(1),
+        Some(7) => (divisor >> 7).max(1),
+        _ => divisor,
+    }
 }
 
 fn system_key(name: &str) -> String {
