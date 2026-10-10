@@ -2564,8 +2564,13 @@ body {
   background: rgba(72, 200, 210, 0.025);
 }
 
-.current-ship-section {
+.current-ship-section,
+.carrier-section {
   gap: 10px;
+}
+
+.carrier-section .section-copy {
+  margin: 0;
 }
 
 .current-ship-stats {
@@ -2616,7 +2621,8 @@ body {
   font: inherit;
 }
 
-.ship-range-actions .panel-button {
+.ship-range-actions .panel-button,
+.carrier-actions .panel-button {
   width: 100%;
 }
 

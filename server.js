@@ -17,7 +17,8 @@ import {
 } from './scripts/update-time.js';
 import { suggestKey } from './scripts/suggest-key.js';
 import { buildPlaceIndex, readPlaceIndexCategories, readPlaceIndexMeta } from './scripts/place-index.js';
-import { loadLocalConfig } from './local-config.js';
+import { loadLocalConfig, saveTrackedCarrier } from './local-config.js';
+import { findCarrierIdentity, parseCarrierQuery } from './scripts/carrier-identity.js';
 import { createShutdownController } from './shutdown-guard.js';
 import { cleanupJunkFiles, DEFAULT_MIN_AGE_MS, describeCleanup } from './scripts/cleanup-junk.js';
 import { createCleanupScheduler } from './scripts/cleanup-scheduler.js';
@@ -59,7 +60,7 @@ const galaxyDir = path.join(dataDir, 'galaxy');
 const galaxyManifestPath = path.join(galaxyDir, 'manifest.json');
 const spatialMetaPath = path.join(dataDir, 'systems-spatial-meta.json');
 const spatialDataPath = path.join(dataDir, 'systems-spatial.bin');
-const localConfig = loadLocalConfig();
+let localConfig = loadLocalConfig();
 const spatialIndexPath = path.join(dataDir, 'systems-spatial.idx');
 const combinedPoiUrl = 'https://edastro.com/mapcharts/files/edsmPOI.csv';
 const appIdentity = 'ed-system-search';
@@ -411,6 +412,49 @@ async function writeNotes(notes) {
   await writeServerFileAtomic(notesPath, JSON.stringify(payload, null, 2), 'system notes write');
   notesCache = null;
   return payload;
+}
+
+function sameCarrierText(a, b) {
+  return Boolean(a && b) && String(a).toUpperCase() === String(b).toUpperCase();
+}
+
+async function saveTrackedCarrierConfig(req, res) {
+  // This endpoint rewrites a local file, so refuse cross-site form posts.
+  const origin = req.headers.origin;
+  if (origin) {
+    let originHost = null;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      originHost = null;
+    }
+    if (originHost !== req.headers.host) return sendJson(res, { error: 'Cross-origin request refused.' }, 403);
+  }
+  const payload = await readRequestJson(req);
+  const query = parseCarrierQuery(String(payload.carrier ?? '').slice(0, 120));
+  if (!query) {
+    localConfig = { ...localConfig, trackedCarrier: (await saveTrackedCarrier(null)).trackedCarrier };
+    return sendJson(res, { ok: true, trackedCarrier: null, found: false });
+  }
+  const found = await findCarrierIdentity(journalDir, query);
+  const name = found?.name ?? query.name;
+  const callsign = found?.callsign ?? query.callsign;
+  const previous = localConfig.trackedCarrier;
+  const sameCarrier = Boolean(previous) && (
+    (found?.id != null && previous.id === found.id)
+    || sameCarrierText(previous.callsign, callsign)
+    || sameCarrierText(previous.name, name)
+  );
+  const saved = await saveTrackedCarrier({
+    id: found?.id ?? (sameCarrier ? previous.id : null),
+    name,
+    callsign,
+    label: name && callsign ? `${name} [${callsign}]` : name ?? callsign,
+    // Fallback coordinates belong to whichever carrier they were set for.
+    fallbackCoords: sameCarrier ? previous.fallbackCoords : null,
+  });
+  localConfig = { ...localConfig, trackedCarrier: saved.trackedCarrier };
+  return sendJson(res, { ok: true, trackedCarrier: localConfig.trackedCarrier, found: Boolean(found) });
 }
 
 async function saveSystemNote(req, res) {
@@ -3721,6 +3765,7 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/system-rich') return await readRichSystem(reqUrl, res);
     if (reqUrl.pathname === '/api/notes' && req.method === 'GET') return await listSystemNotes(req, reqUrl, res);
     if (reqUrl.pathname === '/api/notes' && req.method === 'POST') return await saveSystemNote(req, res);
+    if (reqUrl.pathname === '/api/tracked-carrier' && req.method === 'POST') return await saveTrackedCarrierConfig(req, res);
     if (reqUrl.pathname === '/api/places-summary') {
       const summary = await indexedPlacesSummary();
       return sendJsonWithEtag(req, res, summary, `"places-summary-${summary.indexBuiltAt ?? summary.importedAt ?? 'empty'}-${summary.count ?? 0}"`);

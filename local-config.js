@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from 'node:fs';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { writeFileAtomic } from './scripts/atomic-file.js';
 
 const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 
@@ -56,14 +58,42 @@ export function normalizeLocalConfig(value = {}) {
   };
 }
 
-export function loadLocalConfig(configFile = process.env.EDSS_CONFIG) {
-  const resolved = configFile
+export function localConfigPath(configFile = process.env.EDSS_CONFIG) {
+  return configFile
     ? path.resolve(configFile)
     : path.join(projectRoot, 'config.local.json');
+}
+
+export function loadLocalConfig(configFile = process.env.EDSS_CONFIG) {
+  const resolved = localConfigPath(configFile);
   if (!existsSync(resolved)) return normalizeLocalConfig();
   try {
     return normalizeLocalConfig(JSON.parse(readFileSync(resolved, 'utf8')));
   } catch (error) {
     throw new Error(`Could not load local configuration: ${error.message}`);
   }
+}
+
+// Rewrites only the trackedCarrier block so other keys in the file (LLM
+// settings, anything hand-added) survive a save from the UI.
+export async function saveTrackedCarrier(trackedCarrier, configFile = process.env.EDSS_CONFIG) {
+  const resolved = localConfigPath(configFile);
+  let raw = {};
+  try {
+    raw = JSON.parse(await fs.readFile(resolved, 'utf8'));
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw new Error(`Could not read local configuration: ${error.message}`);
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
+  raw.trackedCarrier = trackedCarrier
+    ? {
+      id: trackedCarrier.id ?? null,
+      name: trackedCarrier.name ?? '',
+      callsign: trackedCarrier.callsign ?? '',
+      label: trackedCarrier.label ?? '',
+      fallbackCoords: trackedCarrier.fallbackCoords ?? null,
+    }
+    : null;
+  await writeFileAtomic(resolved, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
+  return normalizeLocalConfig(raw);
 }

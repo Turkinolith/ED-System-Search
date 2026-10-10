@@ -22,6 +22,16 @@ between sessions.
 | ![Local detail only mode: nearby full-resolution systems remain visible without the global LOD layer](docs/screenshots/local-detail-only.png) | ![Full galaxy mode: sampled global stars remain visible alongside nearby detail](docs/screenshots/full-galaxy-detail.png) |
 | Detailed systems near the current view, with the global LOD layer hidden. | Sampled galaxy-wide context, merged with the local detailed sphere. |
 
+Close up, the map borrows the in-game galaxy map's visual language. The
+selected system gets a focus ellipse and an outline of its ID64 **boxel**, the
+octree cell the game files it in, and the System panel lists its mass code and
+boxel bounds. Stars stand on stalks that end in flat footprint discs on the grid
+plane, coordinate labels lie on the grid itself, and **GALACTIC NORTH +Z** /
+**GALACTIC EAST +X** plates plus bearing tags for Sol, Sagittarius A*, and
+Colonia keep you oriented at any zoom.
+
+![Selected system with its 20 ly boxel outlined, footprint discs on stalks, grid-plane coordinate labels, and the galactic east direction cue](docs/screenshots/boxel-outline.webp)
+
 ## Highlights
 
 - Interactive 3D galaxy map with orbit, pan, vertical movement, rotation,
@@ -36,6 +46,11 @@ between sessions.
   footprint discs, coordinate labels lying on the grid plane, a focus ellipse,
   eased camera glides between targets, soft nebula clouds, and a route strip
   (current system, next jump, jumps left, destination).
+- **Boxel outline** for the selected system, with its ID64 mass code and boxel
+  bounds shown in the System panel.
+- Galactic direction cues on the grid (**GALACTIC NORTH +Z**, **GALACTIC EAST
+  +X**), an optional Elite-style **Sector map** of region lines at galaxy
+  scale, and drop-line anchors that pulse gently on the grid plane.
 - **Colour stars by** economy, security, or government, with a legend whose
   toggles drive the matching System features filter; visited braces stay on
   top of any colour mode.
@@ -50,8 +65,11 @@ between sessions.
 - Optional grid-relative depth emphasis that brightens grounded stars, fades
   off-plane context, strengthens drop-line footprints, and animates hovered
   depth guides.
-- Persistent visited-system braces, latest-journal focus, carrier tracking, and
-  incremental or full journal rescans.
+- Persistent visited-system braces, latest-journal focus, and incremental or
+  full journal rescans with a determinate progress bar.
+- Fleet carrier tracking set up from the app: enter your carrier's name or
+  callsign and its ID is found in your journals. The carrier marker and its
+  500 ly jump-range bubble each have their own toggle.
 - Current ship summary from journals, including a per-ship manual maximum-jump
   override that remains separate from the recorded Loadout value.
 - Optional live route overlay from Elite's `NavRoute.json`, refreshed about
@@ -73,6 +91,8 @@ between sessions.
   star between 5 and 12 light-seconds from arrival.
 - In-app controls for system deltas, full-data imports, places, discoveries,
   journals, and long-running update progress.
+- Crash-safe imports: full imports only replace live data once the whole
+  source has been read, and stranded temp files are cleaned up automatically.
 
 ## Requirements
 
@@ -137,14 +157,22 @@ Set `EDSS_DATA_DIR` to store generated data outside the project.
 
 ### Optional local carrier tracking
 
-Personal settings are kept outside the Git-tracked source. Copy
-`config.example.json` to `config.local.json`, then fill in only the values you
-want to use. The local file is ignored by Git.
+Carrier tracking shows your fleet carrier as a map landmark, keeps it in place
+between sessions, and can draw its 500 ly jump-range bubble.
 
-The `trackedCarrier` settings enable carrier journal matching, the persistent
-map landmark, and the optional 500 ly range bubble. `fallbackCoords` may be
-left as `null`. You can also point to a configuration file elsewhere by setting
-`EDSS_CONFIG` to its path before importing journals or starting the server.
+The easiest way to set it up is in the app: open **Data → Fleet carrier**, enter
+the carrier's name or callsign, and choose **Save carrier**. The app looks up
+the carrier ID, name, and callsign in your journals, saves them, and rescans so
+the map follows the new carrier. The ID matters because the `CarrierLocation`
+event the game writes at login contains only the ID. If it is not found yet,
+open carrier management in game once and save again. **Layers → Carrier
+marker** hides the marker and label without changing the setting.
+
+The setting is stored in `config.local.json`, which is ignored by Git. You can
+also write it by hand: copy `config.example.json` to `config.local.json` and fill
+in `trackedCarrier`. `fallbackCoords` is optional and may be left as `null`. To
+keep the file elsewhere, set `EDSS_CONFIG` to its path before importing journals
+or starting the server.
 
 ### 4. Start the application
 
@@ -207,10 +235,28 @@ downloads it again. Rich-data options build the native importer automatically
 when needed. The full-galaxy download remains a separately confirmed choice
 because it is a very large download.
 
-After a completed full-galaxy import, option **N** performs a source-free,
-dictionary-compression repack of the rich base pack. It does not download or
-parse `galaxy.json.gz` again, but it is long-running and needs substantial
-temporary disk space. The updater requires typing `REPACK` before it begins.
+After a completed full-galaxy import, option **N** (or `npm run repack:galaxy`)
+performs a source-free, dictionary-compression repack of the rich base pack. It
+does not download or parse `galaxy.json.gz` again, but it is long-running and
+needs substantial temporary disk space. The updater requires typing `REPACK`
+before it begins.
+
+### Rebuild everything from one galaxy dump
+
+`galaxy.json.gz` contains every system as well as its bodies, so it can replace
+`systems.json.gz` as the source for the base map. With `galaxy.json.gz` in the
+project root, choose updater option **O**, or run:
+
+```powershell
+npm run refresh:from-galaxy
+```
+
+This rebuilds the map, search indexes, spatial index, galaxy glow, rich data,
+journals, and places index from that one download. The primary star comes from
+each system's main-star body. Star types and permit flags the galaxy dump lacks
+are carried over from your previous dataset by ID64. Full imports write to temp
+files and only replace live data after the whole source has been read, so a
+truncated download fails without damaging the existing map.
 
 ```powershell
 npm run import:systems-delta:1day
@@ -310,6 +356,32 @@ node scripts/cleanup.js --include-dumps
 
 Note that `.git` can also grow unexpectedly if a large file is ever staged with
 `git add` without being committed; `git gc --prune=now` reclaims that space.
+
+## Map Layers
+
+The **Layers** tab switches map overlays on and off. Every choice is remembered
+between sessions.
+
+| Toggle | Default | Shows |
+| --- | --- | --- |
+| Visited braces | On | Brackets around systems found in your journals |
+| Depth emphasis | On | Brightens stars near the grid plane and fades distant ones |
+| Grid plane | On | The adaptive distance grid with coordinate labels and direction cues |
+| Drop lines | On | Stalks from nearby stars down to footprint discs on the grid |
+| Local detail only | Off | Hides the sampled whole-galaxy layer, keeping only nearby detail |
+| Sector map | Off | Elite-style region lines at galaxy-scale zoom (needs `npm run import:regions` with `regionID_numsort.csv` and `regionMAP.csv` in the project root) |
+| Galaxy glow | On | Known-system density on the galactic plane; blue tints mark regions rich in heavy stars |
+| Boxel outline | On | The selected system's ID64 boxel |
+| Nebula clouds | On | Soft cloud sprites at known nebulae |
+| Landmarks | On | Bearing tags for Sol, Sagittarius A*, Colonia, and your carrier |
+| Carrier marker | On | Your tracked fleet carrier's marker and label |
+| Carrier range | Off | A 500 ly bubble around your carrier |
+| Murder binaries | Off | Systems with a secondary star 5 to 12 light-seconds from arrival |
+| Route | Off | The current in-game route from `NavRoute.json` |
+
+The same tab holds **Colour stars by**, the star class filters and star size
+control, the full-galaxy **System features** filters, and the points-of-interest
+categories.
 
 ## Map Controls
 
