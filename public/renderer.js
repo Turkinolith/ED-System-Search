@@ -1,4 +1,4 @@
-import { decodeId64, massCodeFromFlags } from './id64.js?v=mass-layers-1';
+import { boxelAtMassCode, decodeId64, massCodeFromFlags, sharesBoxel } from './id64.js?v=mass-layers-1';
 
 const vertexShader = `
 attribute vec3 a_position;
@@ -788,6 +788,19 @@ export function boxelCorners(boxel) {
   return corners;
 }
 
+// One colour per mass code, so nested boxels and their member glows can be
+// told apart when several are shown at once.
+export const boxelColors = Object.freeze([
+  '255, 214, 102',
+  '242, 165, 65',
+  '255, 122, 92',
+  '236, 104, 170',
+  '178, 120, 255',
+  '110, 150, 255',
+  '84, 214, 236',
+  '120, 230, 160',
+]);
+
 // Index pairs into boxelCorners() that differ along exactly one axis.
 const boxelEdges = [
   [0, 1], [2, 3], [4, 5], [6, 7],
@@ -998,6 +1011,11 @@ export class GalaxyRenderer {
     this.showSectorMap = false;
     this.showGalaxyGlow = true;
     this.showBoxel = true;
+    this.parentBoxelCodes = new Set();
+    this.boxelGlow = false;
+    this.boxelMemberCache = new Map();
+    this.boxelMemberSource = null;
+    this.boxelGlowSprites = new Map();
     this.showNebulae = true;
     this.galaxyGlow = null;
     this.nebulae = null;
@@ -1013,6 +1031,7 @@ export class GalaxyRenderer {
     this.starScale = 4;
     this.autoStarScale = true;
     this.onStarScaleChange = null;
+    this.onSelectedBoxelChange = null;
     this.onDrawCountChange = null;
     this.lastReportedDrawCount = -1;
     this.onTargetChange = null;
@@ -1491,6 +1510,7 @@ export class GalaxyRenderer {
       : null;
     if (system) this.selectedPlace = null;
     this.pickCacheSerial = -1;
+    this.onSelectedBoxelChange?.(this.selectedSystem?.boxel ?? null);
     this.requestRender();
   }
 
@@ -3238,41 +3258,140 @@ export class GalaxyRenderer {
     ctx.restore();
   }
 
-  // Outlines the ID64 boxel (the octree cell the game files this system in)
-  // while it is large enough on screen to read as a cube.
-  drawSelectedBoxel() {
+  // The selected system's own boxel (when shown) plus any enabled parent
+  // boxels, i.e. the coarser cells that contain it.
+  displayedBoxels() {
     const boxel = this.selectedSystem?.boxel;
-    if (!this.showBoxel || !boxel) return;
-    const projected = boxelCorners(boxel).map((corner) => this.screen(toRenderCoords(corner)));
-    if (projected.some((point) => !point)) return;
-    const xs = projected.map((point) => point.x);
-    const span = Math.max(...xs) - Math.min(...xs);
-    const rect = this.frameRect ?? this.canvas.getBoundingClientRect();
-    if (span < 10 || span > rect.width * 3) return;
-    const alpha = clamp((span - 10) / 30, 0, 1) * 0.6;
-    const ctx = this.ctx;
-    ctx.save();
-    ctx.strokeStyle = `rgba(242, 165, 65, ${alpha})`;
-    ctx.lineWidth = 1.1;
-    ctx.setLineDash([5, 4]);
-    ctx.beginPath();
-    for (const [a, b] of boxelEdges) {
-      ctx.moveTo(projected[a].x, projected[a].y);
-      ctx.lineTo(projected[b].x, projected[b].y);
+    if (!boxel) return [];
+    const shown = this.showBoxel ? [boxel] : [];
+    for (let massCode = boxel.massCode + 1; massCode < boxelColors.length; massCode += 1) {
+      if (this.parentBoxelCodes.has(massCode)) shown.push(boxelAtMassCode(boxel, massCode));
     }
-    ctx.stroke();
-    ctx.setLineDash([]);
-    const top = projected.reduce((best, point) => (point.y < best.y ? point : best), projected[0]);
-    ctx.font = '600 11px Segoe UI, sans-serif';
-    ctx.fillStyle = `rgba(242, 165, 65, ${Math.min(1, alpha * 1.5)})`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'bottom';
-    ctx.fillText(`boxel ${boxel.letter} · ${boxel.cellEdge} ly`, top.x, top.y - 4);
-    ctx.restore();
+    return shown;
+  }
+
+  // Loaded systems filed in this boxel: same mass code and same cell. Only
+  // points already loaded on the map can be found, so a large parent boxel may
+  // have members outside the current detail sphere that are not listed.
+  boxelMembers(boxel) {
+    if (this.boxelMemberSource !== this.allPoints) {
+      this.boxelMemberCache.clear();
+      this.boxelMemberSource = this.allPoints;
+    }
+    const key = `${boxel.massCode}:${boxel.cell.x}:${boxel.cell.y}:${boxel.cell.z}`;
+    let members = this.boxelMemberCache.get(key);
+    if (!members) {
+      members = [];
+      // Render x is mirrored galactic x.
+      const minX = -boxel.max.x;
+      const maxX = -boxel.min.x;
+      for (const point of this.allPoints ?? []) {
+        if (point.massCode !== boxel.massCode) continue;
+        if (point.x < minX || point.x > maxX || point.y < boxel.min.y || point.y > boxel.max.y
+          || point.z < boxel.min.z || point.z > boxel.max.z) continue;
+        if (sharesBoxel(boxel, point.massCode, { x: -point.x, y: point.y, z: point.z })) members.push(point);
+      }
+      this.boxelMemberCache.set(key, members);
+    }
+    return members;
+  }
+
+  boxelGlowSprite(color) {
+    let sprite = this.boxelGlowSprites.get(color);
+    if (!sprite) {
+      sprite = document.createElement('canvas');
+      sprite.width = 48;
+      sprite.height = 48;
+      const spriteCtx = sprite.getContext('2d');
+      const gradient = spriteCtx.createRadialGradient(24, 24, 0, 24, 24, 24);
+      gradient.addColorStop(0, `rgba(${color}, 0.55)`);
+      gradient.addColorStop(0.3, `rgba(${color}, 0.2)`);
+      gradient.addColorStop(1, `rgba(${color}, 0)`);
+      spriteCtx.fillStyle = gradient;
+      spriteCtx.fillRect(0, 0, 48, 48);
+      this.boxelGlowSprites.set(color, sprite);
+    }
+    return sprite;
+  }
+
+  // Outlines each displayed boxel while it is large enough on screen to read
+  // as a cube. With glow on, the outline and the systems filed in that boxel
+  // glow in the boxel's colour.
+  drawBoxels() {
+    const boxels = this.displayedBoxels();
+    if (!boxels.length) return;
+    const rect = this.frameRect ?? this.canvas.getBoundingClientRect();
+    const ctx = this.ctx;
+    // Largest first, so the target's own boxel and its members stay on top.
+    for (const boxel of [...boxels].reverse()) {
+      const projected = boxelCorners(boxel).map((corner) => this.screen(toRenderCoords(corner)));
+      if (projected.some((point) => !point)) continue;
+      const xs = projected.map((point) => point.x);
+      const span = Math.max(...xs) - Math.min(...xs);
+      if (span < 10 || span > rect.width * 3) continue;
+      const fade = clamp((span - 10) / 30, 0, 1);
+      const color = boxelColors[boxel.massCode];
+      const glow = this.boxelGlow;
+      const members = glow ? this.boxelMembers(boxel) : null;
+
+      ctx.save();
+      if (members?.length) {
+        const sprite = this.boxelGlowSprite(color);
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = fade * 0.8;
+        for (const point of members) {
+          const screen = this.screen(point, rect);
+          if (!screen) continue;
+          ctx.drawImage(sprite, screen.x - 11, screen.y - 11, 22, 22);
+        }
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = `rgba(${color}, ${0.75 * fade})`;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (const point of members) {
+          const screen = this.screen(point, rect);
+          if (!screen) continue;
+          ctx.moveTo(screen.x + 5, screen.y);
+          ctx.arc(screen.x, screen.y, 5, 0, Math.PI * 2);
+        }
+        ctx.stroke();
+      }
+
+      const alpha = fade * (glow ? 0.9 : 0.6);
+      ctx.strokeStyle = `rgba(${color}, ${alpha})`;
+      ctx.lineWidth = glow ? 1.6 : 1.1;
+      if (glow) {
+        ctx.shadowColor = `rgba(${color}, ${0.8 * fade})`;
+        ctx.shadowBlur = this.isNavigating() ? 0 : 10;
+      }
+      ctx.setLineDash(glow ? [] : [5, 4]);
+      ctx.beginPath();
+      for (const [a, b] of boxelEdges) {
+        ctx.moveTo(projected[a].x, projected[a].y);
+        ctx.lineTo(projected[b].x, projected[b].y);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.shadowBlur = 0;
+      const top = projected.reduce((best, point) => (point.y < best.y ? point : best), projected[0]);
+      ctx.font = '600 11px Segoe UI, sans-serif';
+      ctx.fillStyle = `rgba(${color}, ${Math.min(1, alpha * 1.5)})`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      const memberText = members ? ` · ${members.length.toLocaleString()} loaded` : '';
+      const label = `boxel ${boxel.letter} · ${boxel.cellEdge.toLocaleString()} ly${memberText}`;
+      ctx.lineWidth = 3;
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = `rgba(0, 0, 0, ${Math.min(0.85, alpha * 1.4)})`;
+      ctx.strokeText(label, top.x, top.y - 4);
+      ctx.fillText(label, top.x, top.y - 4);
+      ctx.restore();
+    }
   }
 
   drawSelectedSystem() {
-    this.drawSelectedBoxel();
+    this.drawBoxels();
     const screen = this.screen(this.selectedSystem);
     if (!screen) return;
     const ctx = this.ctx;

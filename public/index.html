@@ -201,7 +201,6 @@
                 <label class="toggle" title="Hide the sampled full-galaxy LOD layer and show only detailed systems near the current view"><input id="localDetailOnlyToggle" type="checkbox"><span>Local detail only</span></label>
                 <label class="toggle" title="Show Elite-style indexed region lines at galaxy-scale zoom"><input id="sectorMapToggle" type="checkbox"><span>Sector map</span></label>
                 <label class="toggle" title="Glow of known-system density on the galactic plane at wide zoom; blue tints mark regions rich in heavy stars"><input id="galaxyGlowToggle" type="checkbox" checked><span>Galaxy glow</span></label>
-                <label class="toggle" title="Outline the selected system's ID64 boxel, the octree cell the game files it in"><input id="boxelToggle" type="checkbox" checked><span>Boxel outline</span></label>
                 <label class="toggle" title="Soft cloud sprites at known nebulae, like the in-game map's backdrop"><input id="nebulaToggle" type="checkbox" checked><span>Nebula clouds</span></label>
                 <label class="toggle"><input id="landmarksToggle" type="checkbox" checked><span>Landmarks</span></label>
                 <label class="toggle" title="Show the tracked fleet carrier's marker and label"><input id="carrierMarkerToggle" type="checkbox" checked><span>Carrier marker</span></label>
@@ -210,6 +209,25 @@
                 <label class="toggle" title="Show the current Elite nav route from NavRoute.json and refresh it about every 5 seconds"><input id="routeToggle" type="checkbox"><span>Route</span></label>
                 <button id="refreshRoute" class="route-refresh" type="button">Display route</button>
               </div>
+            </div>
+
+            <div class="section compact-section boxel-section">
+              <div class="section-heading"><span>Boxels</span><span class="section-rule"></span></div>
+              <div class="overlay-toggles compact-overlays">
+                <label class="toggle" title="Outline the selected system's ID64 boxel, the octree cell the game files it in"><input id="boxelToggle" type="checkbox" checked><span>Target boxel</span></label>
+                <label class="toggle" title="Glow the shown boxel outlines and the loaded systems filed in each of them"><input id="boxelGlowToggle" type="checkbox"><span>Glow members</span></label>
+              </div>
+              <div class="boxel-levels-heading">Parent boxels <small>ly</small></div>
+              <div id="parentBoxelLevels" class="segmented-control boxel-levels" role="group" aria-label="Parent boxels">
+                <label title="Show the 20 ly b boxel containing the target"><input type="checkbox" name="parentBoxel" value="1"><span>b<small>20</small></span></label>
+                <label title="Show the 40 ly c boxel containing the target"><input type="checkbox" name="parentBoxel" value="2"><span>c<small>40</small></span></label>
+                <label title="Show the 80 ly d boxel containing the target"><input type="checkbox" name="parentBoxel" value="3"><span>d<small>80</small></span></label>
+                <label title="Show the 160 ly e boxel containing the target"><input type="checkbox" name="parentBoxel" value="4"><span>e<small>160</small></span></label>
+                <label title="Show the 320 ly f boxel containing the target"><input type="checkbox" name="parentBoxel" value="5"><span>f<small>320</small></span></label>
+                <label title="Show the 640 ly g boxel containing the target"><input type="checkbox" name="parentBoxel" value="6"><span>g<small>640</small></span></label>
+                <label title="Show the 1,280 ly h boxel containing the target"><input type="checkbox" name="parentBoxel" value="7"><span>h<small>1280</small></span></label>
+              </div>
+              <p id="boxelHint" class="boxel-hint">Select a system to show its boxels.</p>
             </div>
 
             <details class="section sidebar-disclosure" open>

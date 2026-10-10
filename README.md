@@ -46,8 +46,10 @@ Colonia keep you oriented at any zoom.
   footprint discs, coordinate labels lying on the grid plane, a focus ellipse,
   eased camera glides between targets, soft nebula clouds, and a route strip
   (current system, next jump, jumps left, destination).
-- **Boxel outline** for the selected system, with its ID64 mass code and boxel
-  bounds shown in the System panel.
+- **Boxel outlines** for the selected system and, optionally, the larger parent
+  boxels that contain it, each in its own colour. **Glow members** lights up
+  the systems filed in each shown boxel. The System panel lists the mass code
+  and boxel bounds.
 - Galactic direction cues on the grid (**GALACTIC NORTH +Z**, **GALACTIC EAST
   +X**), an optional Elite-style **Sector map** of region lines at galaxy
   scale, and drop-line anchors that pulse gently on the grid plane.
@@ -93,6 +95,31 @@ Colonia keep you oriented at any zoom.
   journals, and long-running update progress.
 - Crash-safe imports: full imports only replace live data once the whole
   source has been read, and stranded temp files are cleaned up automatically.
+
+## Boxels
+
+Every procedurally named system is filed in a boxel, a cube in one of eight
+nested grids. Its mass code (the letter before the last number, as in the `b`
+of `Eol Prou XL-C b42-36`) sets the cube size, from 10 ly for `a` to 1,280 ly
+for `h`. The boxel code (`XL-C` plus `42`) says which cube it is. A 40 ly `c`
+boxel holds eight 20 ly `b` boxels, and so on up the scale. That is why
+systems with different name codes share space: an `Eol Prou WC-P c20` system
+can sit inside the 20 ly cube of `Eol Prou XL-C b42`, because it is filed in
+the 40 ly `c` boxel around it.
+
+![Target system's 20 ly b boxel nested inside its 40 ly c and 80 ly d parent boxels, with each boxel's member systems glowing in its colour](docs/screenshots/boxel-parents.webp)
+
+The **Boxels** section of the Layers tab controls these outlines:
+
+| Control | Default | Shows |
+| --- | --- | --- |
+| Target boxel | On | The selected system's own boxel |
+| Parent boxels (`b` to `h`) | Off | The larger boxels containing the target's boxel. Sizes at or below the target's own mass code are disabled. |
+| Glow members | Off | Makes each shown outline glow, along with the systems filed in that boxel (same mass code, same cube). Hidden boxels get no glow. |
+
+Each mass code has its own colour, and each outline's label gives the number of
+member systems currently loaded. Large parent boxels can extend beyond the
+loaded detail area, so that count may be lower than the full total.
 
 ## Requirements
 
@@ -371,7 +398,6 @@ between sessions.
 | Local detail only | Off | Hides the sampled whole-galaxy layer, keeping only nearby detail |
 | Sector map | Off | Elite-style region lines at galaxy-scale zoom (needs `npm run import:regions` with `regionID_numsort.csv` and `regionMAP.csv` in the project root) |
 | Galaxy glow | On | Known-system density on the galactic plane; blue tints mark regions rich in heavy stars |
-| Boxel outline | On | The selected system's ID64 boxel |
 | Nebula clouds | On | Soft cloud sprites at known nebulae |
 | Landmarks | On | Bearing tags for Sol, Sagittarius A*, Colonia, and your carrier |
 | Carrier marker | On | Your tracked fleet carrier's marker and label |
@@ -379,9 +405,9 @@ between sessions.
 | Murder binaries | Off | Systems with a secondary star 5 to 12 light-seconds from arrival |
 | Route | Off | The current in-game route from `NavRoute.json` |
 
-The same tab holds **Colour stars by**, the star class filters and star size
-control, the full-galaxy **System features** filters, and the points-of-interest
-categories.
+The same tab holds the **Boxels** controls (see [Boxels](#boxels)), **Colour
+stars by**, the star class filters and star size control, the full-galaxy
+**System features** filters, and the points-of-interest categories.
 
 ## Map Controls
 

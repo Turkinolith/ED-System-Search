@@ -93,6 +93,9 @@ const el = {
   sectorMapToggle: document.querySelector('#sectorMapToggle'),
   galaxyGlowToggle: document.querySelector('#galaxyGlowToggle'),
   boxelToggle: document.querySelector('#boxelToggle'),
+  boxelGlowToggle: document.querySelector('#boxelGlowToggle'),
+  parentBoxelInputs: [...document.querySelectorAll('input[name="parentBoxel"]')],
+  boxelHint: document.querySelector('#boxelHint'),
   nebulaToggle: document.querySelector('#nebulaToggle'),
   colorBySelect: document.querySelector('#colorBySelect'),
   colorLegend: document.querySelector('#colorLegend'),
@@ -2152,6 +2155,17 @@ function setNotesMode(mode, persist = false) {
   loadNotes(state.notesMode === 'search' ? el.noteSearch.value.trim() : '').catch((error) => console.warn(error));
 }
 
+// Parent boxels are the coarser cells holding the target's own boxel, so the
+// chips at or below the target's mass code have nothing to show.
+function updateBoxelControls(boxel) {
+  for (const input of el.parentBoxelInputs) {
+    input.disabled = Boolean(boxel) && Number(input.value) <= boxel.massCode;
+  }
+  el.boxelHint.textContent = boxel
+    ? `Target is filed in a ${boxel.cellEdge.toLocaleString()} ly ${boxel.letter} boxel. Larger boxels contain it.`
+    : 'Select a system to show its boxels.';
+}
+
 function renderCarrierConfig() {
   const carrier = state.trackedCarrier;
   if (document.activeElement !== el.carrierNameInput) el.carrierNameInput.value = carrier?.label ?? '';
@@ -3348,6 +3362,19 @@ function bindControls() {
     state.renderer.requestRender();
     writeViewSettings({ showBoxel: el.boxelToggle.checked });
   });
+  el.boxelGlowToggle.addEventListener('change', () => {
+    state.renderer.boxelGlow = el.boxelGlowToggle.checked;
+    state.renderer.requestRender();
+    writeViewSettings({ boxelGlow: el.boxelGlowToggle.checked });
+  });
+  for (const input of el.parentBoxelInputs) {
+    input.addEventListener('change', () => {
+      const codes = el.parentBoxelInputs.filter((item) => item.checked).map((item) => Number(item.value));
+      state.renderer.parentBoxelCodes = new Set(codes);
+      state.renderer.requestRender();
+      writeViewSettings({ parentBoxels: codes });
+    });
+  }
   el.nebulaToggle.addEventListener('change', () => {
     state.renderer.showNebulae = el.nebulaToggle.checked;
     state.renderer.requestRender();
@@ -3527,6 +3554,9 @@ async function init() {
   el.sectorMapToggle.checked = viewSettings.showSectorMap ?? false;
   el.galaxyGlowToggle.checked = viewSettings.showGalaxyGlow ?? true;
   el.boxelToggle.checked = viewSettings.showBoxel ?? true;
+  el.boxelGlowToggle.checked = viewSettings.boxelGlow ?? false;
+  const savedParentBoxels = new Set(Array.isArray(viewSettings.parentBoxels) ? viewSettings.parentBoxels : []);
+  for (const input of el.parentBoxelInputs) input.checked = savedParentBoxels.has(Number(input.value));
   el.nebulaToggle.checked = viewSettings.showNebulae ?? true;
   el.landmarksToggle.checked = viewSettings.showLandmarks ?? true;
   el.carrierMarkerToggle.checked = viewSettings.showCarrierMarker ?? true;
@@ -3543,6 +3573,9 @@ async function init() {
   state.renderer.showSectorMap = el.sectorMapToggle.checked;
   state.renderer.showGalaxyGlow = el.galaxyGlowToggle.checked;
   state.renderer.showBoxel = el.boxelToggle.checked;
+  state.renderer.boxelGlow = el.boxelGlowToggle.checked;
+  state.renderer.parentBoxelCodes = savedParentBoxels;
+  state.renderer.onSelectedBoxelChange = updateBoxelControls;
   state.renderer.showNebulae = el.nebulaToggle.checked;
   state.renderer.showLandmarks = el.landmarksToggle.checked;
   state.renderer.showCarrierRange = el.carrierRangeToggle.checked;

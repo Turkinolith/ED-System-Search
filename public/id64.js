@@ -59,6 +59,35 @@ export function decodeId64(value) {
   };
 }
 
+// The boxel at another mass code that contains this one. Every mass code's
+// grid starts at the galaxy corner, so a coarser cell holds whole finer cells.
+export function boxelAtMassCode(boxel, massCode) {
+  const cellEdge = 10 * 2 ** massCode;
+  const cell = {};
+  const min = {};
+  for (const axis of ['x', 'y', 'z']) {
+    cell[axis] = Math.floor((boxel.min[axis] + galaxyOrigin[axis]) / cellEdge);
+    min[axis] = cell[axis] * cellEdge - galaxyOrigin[axis];
+  }
+  return {
+    massCode,
+    letter: massCodeLetters[massCode],
+    cellEdge,
+    cell,
+    min,
+    max: { x: min.x + cellEdge, y: min.y + cellEdge, z: min.z + cellEdge },
+  };
+}
+
+// True when a system with this mass code and position is filed in the boxel,
+// i.e. its name carries the same boxel code.
+export function sharesBoxel(boxel, massCode, coords) {
+  if (!boxel || massCode !== boxel.massCode || !coords) return false;
+  return ['x', 'y', 'z'].every((axis) => (
+    Math.floor((Number(coords[axis]) + galaxyOrigin[axis]) / boxel.cellEdge) === boxel.cell[axis]
+  ));
+}
+
 export function boxelContains(boxel, coords, tolerance = 0.5) {
   if (!boxel || !coords) return false;
   return ['x', 'y', 'z'].every((axis) => Number(coords[axis]) >= boxel.min[axis] - tolerance
