@@ -55,6 +55,8 @@ export function normalizeLocalConfig(value = {}) {
   return {
     trackedCarrier,
     llmSearch: cleanLlmSearch(value.llmSearch),
+    // Following the journal live is on unless switched off.
+    liveJournal: value.liveJournal !== false,
   };
 }
 
@@ -101,6 +103,12 @@ export async function saveTrackedCarrier(trackedCarrier, configFile = process.en
         fallbackCoords: trackedCarrier.fallbackCoords ?? null,
       }
       : null;
+  }, configFile);
+}
+
+export async function saveLiveJournal(enabled, configFile = process.env.EDSS_CONFIG) {
+  return updateLocalConfigFile((raw) => {
+    raw.liveJournal = Boolean(enabled);
   }, configFile);
 }
 

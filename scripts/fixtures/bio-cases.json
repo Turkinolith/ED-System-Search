@@ -1,0 +1,556 @@
+{
+  "description": "Synthetic species model and Spansh-shaped bodies shared by scripts/test-bio-model.js and the Rust bio module tests. Counts and densities are made up; expected shares are worked out by hand.",
+  "model": {
+    "format": "ed-bio-model",
+    "version": 1,
+    "generatedAt": "2026-10-10T00:00:00.000Z",
+    "genera": [
+      {
+        "key": "$Codex_Ent_Stratum_Genus_Name;",
+        "name": "Stratum",
+        "species": [
+          {
+            "key": "$Codex_Ent_Stratum_07_Name;",
+            "name": "Stratum Tectonicas",
+            "value": 19010800,
+            "target": true,
+            "rulesets": [
+              {
+                "atmosphere": [
+                  "SulphurDioxide"
+                ],
+                "bodyTypes": [
+                  "High metal content body"
+                ],
+                "minGravity": 0.29,
+                "maxGravity": 0.62,
+                "minTemperature": 165,
+                "maxTemperature": 450
+              }
+            ],
+            "count": 1000,
+            "variantKind": "star",
+            "variants": {
+              "F": 300,
+              "K": 500,
+              "M": 200
+            },
+            "regions": null,
+            "hist": {}
+          },
+          {
+            "key": "$Codex_Ent_Stratum_02_Name;",
+            "name": "Stratum Paleas",
+            "value": 1362000,
+            "target": false,
+            "rulesets": [
+              {
+                "atmosphere": [
+                  "CarbonDioxide"
+                ],
+                "bodyTypes": [
+                  "Rocky body"
+                ],
+                "minGravity": 0.04,
+                "maxGravity": 0.585,
+                "minTemperature": 165,
+                "maxTemperature": 395,
+                "volcanism": {
+                  "mode": "none"
+                }
+              }
+            ],
+            "count": 500,
+            "variantKind": "star",
+            "variants": {
+              "F": 100,
+              "G": 400
+            },
+            "regions": null,
+            "hist": {}
+          },
+          {
+            "key": "$Codex_Ent_Stratum_06_Name;",
+            "name": "Stratum Cucumisis",
+            "value": 16202800,
+            "target": true,
+            "rulesets": [
+              {
+                "atmosphere": [
+                  "CarbonDioxide"
+                ],
+                "bodyTypes": [
+                  "Rocky body"
+                ],
+                "minGravity": 0.04,
+                "maxGravity": 0.6,
+                "minTemperature": 191,
+                "maxTemperature": 371,
+                "volcanism": {
+                  "mode": "none"
+                },
+                "regions": {
+                  "include": [
+                    9,
+                    18
+                  ],
+                  "exclude": []
+                }
+              }
+            ],
+            "count": 100,
+            "variantKind": "star",
+            "variants": {
+              "F": 50,
+              "K": 50
+            },
+            "regions": null,
+            "hist": {}
+          }
+        ]
+      },
+      {
+        "key": "$Codex_Ent_Clypeus_Genus_Name;",
+        "name": "Clypeus",
+        "species": [
+          {
+            "key": "$Codex_Ent_Clypeus_01_Name;",
+            "name": "Clypeus Lacrimam",
+            "value": 8418000,
+            "target": true,
+            "rulesets": [
+              {
+                "atmosphere": [
+                  "CarbonDioxide"
+                ],
+                "bodyTypes": [
+                  "Rocky body"
+                ],
+                "minGravity": 0.04,
+                "maxGravity": 0.276,
+                "minTemperature": 190,
+                "minPressure": 0.054,
+                "volcanism": {
+                  "mode": "none"
+                }
+              }
+            ],
+            "count": 200,
+            "variantKind": "star",
+            "variants": {
+              "F": 150,
+              "K": 50
+            },
+            "regions": null,
+            "hist": {
+              "temperature": {
+                "min": 190,
+                "step": 10,
+                "density": [
+                  0.02,
+                  0.06,
+                  0.02
+                ],
+                "floor": 0.002
+              }
+            }
+          },
+          {
+            "key": "$Codex_Ent_Clypeus_03_Name;",
+            "name": "Clypeus Speculumi",
+            "value": 16202800,
+            "target": true,
+            "rulesets": [
+              {
+                "atmosphere": [
+                  "CarbonDioxide"
+                ],
+                "bodyTypes": [
+                  "Rocky body"
+                ],
+                "minGravity": 0.04,
+                "maxGravity": 0.276,
+                "minTemperature": 190,
+                "maxTemperature": 197,
+                "minPressure": 0.055,
+                "volcanism": {
+                  "mode": "none"
+                },
+                "minDistance": 2000
+              }
+            ],
+            "count": 100,
+            "variantKind": "star",
+            "variants": {
+              "F": 50,
+              "K": 50
+            },
+            "regions": [
+              9,
+              18,
+              30
+            ],
+            "hist": {
+              "temperature": {
+                "min": 190,
+                "step": 2,
+                "density": [
+                  0.1,
+                  0.1,
+                  0.15,
+                  0.15
+                ],
+                "floor": 0.01
+              }
+            }
+          }
+        ]
+      },
+      {
+        "key": "$Codex_Ent_Bacterial_Genus_Name;",
+        "name": "Bacterium",
+        "species": [
+          {
+            "key": "$Codex_Ent_Bacterial_08_Name;",
+            "name": "Bacterium Informem",
+            "value": 8418000,
+            "target": true,
+            "rulesets": [
+              {
+                "atmosphere": [
+                  "Nitrogen"
+                ],
+                "bodyTypes": [
+                  "Rocky body",
+                  "High metal content body"
+                ],
+                "minGravity": 0.05,
+                "maxGravity": 0.6,
+                "minTemperature": 42.5,
+                "maxTemperature": 151,
+                "volcanism": {
+                  "mode": "none"
+                }
+              }
+            ],
+            "count": 30,
+            "variantKind": "material",
+            "variants": {
+              "Technetium": 10,
+              "Polonium": 20
+            },
+            "regions": null,
+            "hist": {}
+          }
+        ]
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "HMC with SO2 around a K star is all Tectonicas",
+      "system": {
+        "region": 18,
+        "bodies": [
+          {
+            "bodyId": 0,
+            "type": "Star",
+            "subType": "K (Yellow-Orange) Star",
+            "mainStar": true,
+            "distanceToArrival": 0
+          },
+          {
+            "bodyId": 3,
+            "type": "Planet",
+            "subType": "High metal content world",
+            "isLandable": true,
+            "gravity": 0.31,
+            "surfaceTemperature": 220,
+            "surfacePressure": 0.003,
+            "atmosphereType": "Thin Sulphur dioxide",
+            "volcanismType": "No volcanism",
+            "distanceToArrival": 900,
+            "parents": [
+              {
+                "Star": 0
+              }
+            ],
+            "materials": {
+              "Iron": 20
+            }
+          }
+        ]
+      },
+      "bodyIndex": 1,
+      "expected": [
+        [
+          "Stratum Tectonicas",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "Rocky CO2 in region 9 around an F star splits Stratum and Clypeus",
+      "system": {
+        "region": 9,
+        "bodies": [
+          {
+            "bodyId": 0,
+            "type": "Star",
+            "subType": "F (White) Star",
+            "mainStar": true,
+            "distanceToArrival": 0
+          },
+          {
+            "bodyId": 5,
+            "type": "Planet",
+            "subType": "Rocky body",
+            "isLandable": true,
+            "gravity": 0.1,
+            "surfaceTemperature": 195,
+            "surfacePressure": 0.06,
+            "atmosphereType": "Thin Carbon dioxide",
+            "volcanismType": "No volcanism",
+            "distanceToArrival": 3000,
+            "parents": [
+              {
+                "Null": 4
+              },
+              {
+                "Star": 0
+              }
+            ]
+          }
+        ]
+      },
+      "bodyIndex": 1,
+      "expected": [
+        [
+          "Clypeus Lacrimam",
+          0.2857142857142857
+        ],
+        [
+          "Clypeus Speculumi",
+          0.7142857142857143
+        ],
+        [
+          "Stratum Cucumisis",
+          0.3333333333333333
+        ],
+        [
+          "Stratum Paleas",
+          0.6666666666666666
+        ]
+      ]
+    },
+    {
+      "name": "Outside region 9/18 Cucumisis and Speculumi drop out",
+      "system": {
+        "region": 3,
+        "bodies": [
+          {
+            "bodyId": 0,
+            "type": "Star",
+            "subType": "F (White) Star",
+            "mainStar": true,
+            "distanceToArrival": 0
+          },
+          {
+            "bodyId": 5,
+            "type": "Planet",
+            "subType": "Rocky body",
+            "isLandable": true,
+            "gravity": 0.1,
+            "surfaceTemperature": 195,
+            "surfacePressure": 0.06,
+            "atmosphereType": "Thin Carbon dioxide",
+            "volcanismType": "No volcanism",
+            "distanceToArrival": 3000,
+            "parents": [
+              {
+                "Star": 0
+              }
+            ]
+          }
+        ]
+      },
+      "bodyIndex": 1,
+      "expected": [
+        [
+          "Clypeus Lacrimam",
+          1
+        ],
+        [
+          "Stratum Paleas",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "Close to the arrival star Speculumi is ruled out; a K parent changes the Stratum split",
+      "system": {
+        "region": 9,
+        "bodies": [
+          {
+            "bodyId": 0,
+            "type": "Star",
+            "subType": "M (Red dwarf) Star",
+            "mainStar": true,
+            "distanceToArrival": 0
+          },
+          {
+            "bodyId": 1,
+            "type": "Star",
+            "subType": "K (Yellow-Orange) Star",
+            "distanceToArrival": 800
+          },
+          {
+            "bodyId": 6,
+            "type": "Planet",
+            "subType": "Rocky body",
+            "isLandable": true,
+            "gravity": 0.1,
+            "surfaceTemperature": 205,
+            "surfacePressure": 0.06,
+            "atmosphereType": "Thin Carbon dioxide",
+            "volcanismType": "No volcanism",
+            "distanceToArrival": 1000,
+            "parents": [
+              {
+                "Star": 1
+              },
+              {
+                "Null": 2
+              }
+            ]
+          }
+        ]
+      },
+      "bodyIndex": 2,
+      "expected": [
+        [
+          "Clypeus Lacrimam",
+          1
+        ],
+        [
+          "Stratum Cucumisis",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "Material variants gate Bacterium Informem",
+      "system": {
+        "region": 18,
+        "bodies": [
+          {
+            "bodyId": 0,
+            "type": "Star",
+            "subType": "M (Red dwarf) Star",
+            "mainStar": true,
+            "distanceToArrival": 0
+          },
+          {
+            "bodyId": 2,
+            "type": "Planet",
+            "subType": "Rocky body",
+            "isLandable": true,
+            "gravity": 0.2,
+            "surfaceTemperature": 80,
+            "surfacePressure": 0.01,
+            "atmosphereType": "Thin Nitrogen",
+            "volcanismType": "No volcanism",
+            "distanceToArrival": 400,
+            "parents": [
+              {
+                "Star": 0
+              }
+            ],
+            "materials": {
+              "Iron": 20,
+              "polonium": 0.5
+            }
+          }
+        ]
+      },
+      "bodyIndex": 1,
+      "expected": [
+        [
+          "Bacterium Informem",
+          1
+        ]
+      ]
+    },
+    {
+      "name": "No matching material rules Bacterium Informem out",
+      "system": {
+        "region": 18,
+        "bodies": [
+          {
+            "bodyId": 0,
+            "type": "Star",
+            "subType": "M (Red dwarf) Star",
+            "mainStar": true,
+            "distanceToArrival": 0
+          },
+          {
+            "bodyId": 2,
+            "type": "Planet",
+            "subType": "Rocky body",
+            "isLandable": true,
+            "gravity": 0.2,
+            "surfaceTemperature": 80,
+            "surfacePressure": 0.01,
+            "atmosphereType": "Thin Nitrogen",
+            "volcanismType": "No volcanism",
+            "distanceToArrival": 400,
+            "parents": [
+              {
+                "Star": 0
+              }
+            ],
+            "materials": {
+              "Iron": 20,
+              "Tin": 1
+            }
+          }
+        ]
+      },
+      "bodyIndex": 1,
+      "expected": []
+    },
+    {
+      "name": "Bodies that are not landable get nothing",
+      "system": {
+        "region": 18,
+        "bodies": [
+          {
+            "bodyId": 0,
+            "type": "Star",
+            "subType": "K (Yellow-Orange) Star",
+            "mainStar": true,
+            "distanceToArrival": 0
+          },
+          {
+            "bodyId": 3,
+            "type": "Planet",
+            "subType": "High metal content world",
+            "isLandable": false,
+            "gravity": 0.31,
+            "surfaceTemperature": 220,
+            "surfacePressure": 0.003,
+            "atmosphereType": "Thin Sulphur dioxide",
+            "distanceToArrival": 900,
+            "parents": [
+              {
+                "Star": 0
+              }
+            ]
+          }
+        ]
+      },
+      "bodyIndex": 1,
+      "expected": []
+    }
+  ]
+}

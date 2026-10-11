@@ -98,6 +98,41 @@ void main() {
 }
 `;
 
+// High-value bio overlay, drawn on the grid plane: the quad's height comes
+// from u_planeY so it moves up and down with the grid.
+const bioVertexShader = `
+attribute vec3 a_position;
+attribute vec2 a_uv;
+uniform mat4 u_matrix;
+uniform float u_planeY;
+varying vec2 v_uv;
+void main() {
+  gl_Position = u_matrix * vec4(a_position.x, u_planeY, a_position.z, 1.0);
+  v_uv = a_uv;
+}
+`;
+
+// High-value bio overlay: one texel per boxel column, red channel the
+// log-scaled expected credits, alpha the confidence (mapped candidate bodies).
+const bioFragmentShader = `
+precision mediump float;
+uniform sampler2D u_cells;
+uniform float u_alpha;
+varying vec2 v_uv;
+vec3 ramp(float t) {
+  vec3 low = vec3(0.10, 0.28, 0.42);
+  vec3 mid = vec3(0.12, 0.78, 0.68);
+  vec3 high = vec3(1.0, 0.86, 0.28);
+  return t < 0.5 ? mix(low, mid, t * 2.0) : mix(mid, high, (t - 0.5) * 2.0);
+}
+void main() {
+  vec4 texel = texture2D(u_cells, v_uv);
+  if (texel.r < 0.5 / 255.0) discard;
+  float strength = u_alpha * (0.3 + 0.7 * texel.a);
+  gl_FragColor = vec4(ramp(texel.r) * strength, strength);
+}
+`;
+
 // Nebula clouds: soft billboards at known nebula positions, the counterpart
 // of the in-game map's background nebula impostors.
 const nebulaVertexShader = `
@@ -732,6 +767,26 @@ export function formatPlaneCoordinate(value, step) {
   return rounded.toLocaleString('en-US');
 }
 
+// Texture from /api/bio-targets (scripts/bio-targets.js overlayTexture).
+export function parseBioOverlay(buffer) {
+  if (!buffer || buffer.byteLength < 36) return null;
+  const view = new DataView(buffer);
+  const magic = String.fromCharCode(...new Uint8Array(buffer, 0, 8));
+  if (magic !== 'EDBIOX01' || view.getUint32(8, true) !== 1) return null;
+  const width = view.getUint32(12, true);
+  const height = view.getUint32(16, true);
+  if (!width || !height || buffer.byteLength < 36 + width * height * 2) return null;
+  return {
+    width,
+    height,
+    minX: view.getFloat32(20, true),
+    minZ: view.getFloat32(24, true),
+    cellSize: view.getFloat32(28, true),
+    topTenthCredits: view.getFloat32(32, true),
+    texels: new Uint8Array(buffer, 36, width * height * 2),
+  };
+}
+
 export function parseGalaxyDensity(buffer) {
   if (!buffer || buffer.byteLength < 32) return null;
   const view = new DataView(buffer);
@@ -1083,6 +1138,17 @@ export class GalaxyRenderer {
       position: this.gl.getAttribLocation(this.glowProgram, 'a_position'),
       uv: this.gl.getAttribLocation(this.glowProgram, 'a_uv'),
     };
+    this.bioProgram = program(this.gl, bioVertexShader, bioFragmentShader);
+    this.bioLocations = {
+      matrix: this.gl.getUniformLocation(this.bioProgram, 'u_matrix'),
+      planeY: this.gl.getUniformLocation(this.bioProgram, 'u_planeY'),
+      alpha: this.gl.getUniformLocation(this.bioProgram, 'u_alpha'),
+      cells: this.gl.getUniformLocation(this.bioProgram, 'u_cells'),
+      position: this.gl.getAttribLocation(this.bioProgram, 'a_position'),
+      uv: this.gl.getAttribLocation(this.bioProgram, 'a_uv'),
+    };
+    this.bioOverlay = null;
+    this.bioOverlayOpacity = 0.6;
     this.nebulaProgram = program(this.gl, nebulaVertexShader, nebulaFragmentShader);
     this.nebulaLocations = {
       matrix: this.gl.getUniformLocation(this.nebulaProgram, 'u_matrix'),
@@ -1236,6 +1302,58 @@ export class GalaxyRenderer {
     } catch (error) {
       console.warn('Galaxy glow unavailable:', error);
     }
+  }
+
+  // Replaces the bio overlay with a parsed texture, or removes it with null.
+  setBioOverlay(image) {
+    const gl = this.gl;
+    if (this.bioOverlay) {
+      gl.deleteTexture(this.bioOverlay.texture);
+      gl.deleteBuffer(this.bioOverlay.positionBuffer);
+      gl.deleteBuffer(this.bioOverlay.uvBuffer);
+      this.bioOverlay = null;
+    }
+    if (image) {
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE_ALPHA, image.width, image.height, 0, gl.LUMINANCE_ALPHA, gl.UNSIGNED_BYTE, image.texels);
+      // Nearest sampling keeps each boxel a crisp square.
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const quad = galaxyGlowQuad(image);
+      const positionBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, quad.positions, gl.STATIC_DRAW);
+      const uvBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, quad.uvs, gl.STATIC_DRAW);
+      this.bioOverlay = { texture, positionBuffer, uvBuffer, image };
+    }
+    this.requestRender();
+  }
+
+  drawBioOverlay(matrix) {
+    const overlay = this.bioOverlay;
+    if (!overlay || this.bioOverlayOpacity <= 0) return;
+    const gl = this.gl;
+    gl.useProgram(this.bioProgram);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.uniformMatrix4fv(this.bioLocations.matrix, false, matrix);
+    gl.uniform1f(this.bioLocations.planeY, this.target[1]);
+    // Faint up close, where one boxel fills the view; full strength at galaxy scale.
+    const zoom = 0.25 + 0.75 * smoothstep(800, 8000, Number(this.distance) || 0);
+    gl.uniform1f(this.bioLocations.alpha, this.bioOverlayOpacity * zoom);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, overlay.texture);
+    gl.uniform1i(this.bioLocations.cells, 0);
+    this.attrib(this.bioLocations.position, overlay.positionBuffer, 3);
+    this.attrib(this.bioLocations.uv, overlay.uvBuffer, 2);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.disableVertexAttribArray(this.bioLocations.position);
+    gl.disableVertexAttribArray(this.bioLocations.uv);
   }
 
   galaxyGlowAlpha() {
@@ -1958,6 +2076,7 @@ export class GalaxyRenderer {
     gl.enable(gl.BLEND);
     this.matrixData.set(matrix);
     this.drawGalaxyGlow(this.matrixData);
+    this.drawBioOverlay(this.matrixData);
     this.drawNebulae(this.matrixData);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
     gl.useProgram(this.program);
@@ -2033,6 +2152,7 @@ export class GalaxyRenderer {
       for (const result of this.searchResults) this.drawMarker({ ...result.coords, ...result, flags: 0 }, true);
     }
     if (this.isolatePlaces || this.showPlaces || this.showMurderBinaries) this.drawPlaceIndicators();
+    if (this.commanderLocation) this.drawCommanderLocation();
     if (this.selectedSystem) this.drawSelectedSystem();
     if (this.selectedPlace) this.drawSelectedPlace();
     if (!this.isolatePlaces) this.drawHoverMarker();
@@ -3419,6 +3539,42 @@ export class GalaxyRenderer {
     this.drawLabelPlate(24, -13, width + 16, 26, 'rgba(242, 165, 65, 0.72)');
     ctx.fillStyle = this.accentColor;
     ctx.fillText(this.selectedSystem.name, 31, 0);
+    ctx.restore();
+  }
+
+  // The commander's live position from the journal; null hides it.
+  setCommanderLocation(location) {
+    this.commanderLocation = location?.coords ? { ...location.coords, name: location.name ?? 'You' } : null;
+    this.requestRender();
+  }
+
+  drawCommanderLocation() {
+    const screen = this.screen(this.commanderLocation);
+    if (!screen) return;
+    const ctx = this.ctx;
+    const teal = 'rgb(85, 201, 193)';
+    ctx.save();
+    ctx.translate(screen.x, screen.y);
+    ctx.strokeStyle = teal;
+    ctx.fillStyle = 'rgba(85, 201, 193, 0.22)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, -11);
+    ctx.lineTo(11, 0);
+    ctx.lineTo(0, 11);
+    ctx.lineTo(-11, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    if (this.selectedSystem?.name !== this.commanderLocation.name) {
+      ctx.font = '600 12px Segoe UI, sans-serif';
+      ctx.textBaseline = 'middle';
+      const label = 'You are here';
+      const width = ctx.measureText(label).width;
+      this.drawLabelPlate(-width / 2 - 8, 15, width + 16, 22, 'rgba(85, 201, 193, 0.6)');
+      ctx.fillStyle = teal;
+      ctx.fillText(label, -width / 2, 26);
+    }
     ctx.restore();
   }
 

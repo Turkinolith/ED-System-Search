@@ -17,7 +17,7 @@ import {
 } from './scripts/update-time.js';
 import { suggestKey } from './scripts/suggest-key.js';
 import { buildPlaceIndex, readPlaceIndexCategories, readPlaceIndexMeta } from './scripts/place-index.js';
-import { loadLocalConfig, removeLocalConfigLlmApiKey, saveTrackedCarrier } from './local-config.js';
+import { loadLocalConfig, removeLocalConfigLlmApiKey, saveLiveJournal, saveTrackedCarrier } from './local-config.js';
 import { createSecretStore } from './secret-store.js';
 import { bodyMatchesType, compactText, knownKeywords, planSearchLocally } from './scripts/search-planner.js';
 import { findCarrierIdentity, parseCarrierQuery } from './scripts/carrier-identity.js';
@@ -27,6 +27,9 @@ import { createCleanupScheduler } from './scripts/cleanup-scheduler.js';
 import { writeFileAtomic } from './scripts/atomic-file.js';
 import { colorCategoryForMask, colorCategoryShift, colorModes } from './public/color-modes.js';
 import { withImportActivity } from './scripts/import-activity.js';
+import { bandLayers, BANDS as bioTargetBands, cellDetail, LEVELS as bioTargetLevels, loadBioTargets, overlayTexture, speciesRates } from './scripts/bio-targets.js';
+import { JournalLive } from './scripts/journal-live.js';
+import { parseRegionRaster, regionAt } from './public/bio-model.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
@@ -51,6 +54,10 @@ const greenGasGiantsPath = path.join(dataDir, 'green-gas-giants.json');
 const notesPath = path.join(dataDir, 'system-notes.json');
 const regionMapPath = path.join(dataDir, 'region-map-vectors.json');
 const galaxyDensityPath = path.join(dataDir, 'galaxy-density.bin');
+const bioModelPath = path.join(dataDir, 'bio-model.json');
+const bioTargetsPath = path.join(dataDir, 'bio-targets.bin');
+const bioTargetsMetaPath = path.join(dataDir, 'bio-targets-meta.json');
+const regionRasterPath = path.join(dataDir, 'region-raster.bin');
 const systemUpdateLogPath = path.join(dataDir, 'system-update-log.json');
 const updatesPath = path.join(dataDir, 'systems-updates.u32');
 const updatesMetaPath = path.join(dataDir, 'systems-updates-meta.json');
@@ -222,6 +229,8 @@ let updateMetaCache = null;
 let updateIndexCache = null;
 let suggestOverlayIndexCache = null;
 let galaxyManifestCache = null;
+let bioTargetsCache = null;
+let regionRasterCache = null;
 const richDictionaryCache = new Map();
 let journalBodiesCache = null;
 let carrierRefreshPromise = null;
@@ -996,8 +1005,12 @@ async function readRichSystem(reqUrl, res) {
     } : {}),
   };
   const entry = richResult?.entry;
+  // Journal-only systems carry no coordinates; the page passes the ones it knows.
+  const coords = system.coords ?? { x: Number(reqUrl.searchParams.get('x')), z: Number(reqUrl.searchParams.get('z')) };
+  const region = regionAt(await getRegionRaster().catch(() => null), Number(coords.x), Number(coords.z));
   return sendJson(res, {
     id64: id64?.toString() ?? String(journalSystem.id64),
+    region,
     segment: richResult ? {
       kind: journalSystem ? `${richResult.segment.kind} + journal` : richResult.segment.kind,
       importedAt: richResult.segment.importedAt,
@@ -3549,14 +3562,19 @@ async function readSystemDetail(reqUrl, res) {
 }
 
 async function runJournalRefresh(reqUrl, res) {
-  if (journalScanStatus.running) {
-    return sendJson(res, { started: false, scan: journalScanStatus });
-  }
   const mode = reqUrl.searchParams.get('mode') === 'all' ? 'all' : 'latest';
   const latestCount = Math.max(1, Math.min(Number(reqUrl.searchParams.get('count') ?? 20) || 20, 200));
+  const result = startJournalScan({ mode, count: latestCount, origin: 'manual' });
+  return sendJson(res, result, result.started ? 202 : 200);
+}
+
+// Starts an import-journals run. `origin` is 'live' when the journal follower
+// asks for it, so pages can refresh quietly instead of jumping to the new data.
+function startJournalScan({ mode, count, origin }) {
+  if (journalScanStatus.running) return { started: false, scan: journalScanStatus };
   const args = [path.join(__dirname, 'scripts', 'import-journals.js')];
   if (mode === 'all') args.push('--all');
-  else args.push('--latest', String(latestCount));
+  else args.push('--latest', String(count));
   const id = `${Date.now()}-${mode}`;
   const startedAt = new Date().toISOString();
 
@@ -3572,6 +3590,7 @@ async function runJournalRefresh(reqUrl, res) {
     running: true,
     id,
     mode,
+    origin,
     startedAt,
     finishedAt: null,
     message: mode === 'all' ? 'starting all scan' : 'starting latest scan',
@@ -3636,8 +3655,13 @@ async function runJournalRefresh(reqUrl, res) {
       stdout,
       stderr,
     };
+    // Live saves are often over before a page's 5 s busy check sees them.
+    if (origin === 'live') {
+      const { stdout: _out, stderr: _err, ...scan } = journalScanStatus;
+      broadcastLive('saved', scan);
+    }
   });
-  return sendJson(res, { started: true, scan: journalScanStatus }, 202);
+  return { started: true, scan: journalScanStatus };
 }
 
 function runChildStep(step, args) {
@@ -3710,6 +3734,7 @@ async function runSystemUpdate(reqUrl, res) {
   const discoveriesUpdate = mode === 'discoveries';
   const murderBinariesUpdate = mode === 'murder-binaries';
   const greenGasGiantsUpdate = mode === 'green-gas-giants';
+  const bioTargetsUpdate = mode === 'bio-targets';
   const galaxyUpdate = mode === 'galaxy';
   const localGalaxyPath = path.join(__dirname, 'galaxy.json.gz');
   const sourceInfo = placesUpdate
@@ -3720,6 +3745,8 @@ async function runSystemUpdate(reqUrl, res) {
         ? { label: 'Murder Binaries local analysis', url: path.join(dataDir, 'galaxy'), large: true, kind: 'murder-binaries' }
       : greenGasGiantsUpdate
         ? { label: 'Green Gas Giant local analysis', url: path.join(dataDir, 'galaxy'), large: true, kind: 'green-gas-giants' }
+      : bioTargetsUpdate
+        ? { label: 'High-value bio local analysis', url: path.join(dataDir, 'galaxy'), large: true, kind: 'bio-targets' }
       : galaxyUpdate
         ? { label: 'Local Spansh full galaxy data', url: localGalaxyPath, large: true, kind: 'galaxy' }
         : systemDeltaSources[mode];
@@ -3754,6 +3781,8 @@ async function runSystemUpdate(reqUrl, res) {
           ? 'queued Murder Binaries analysis'
         : greenGasGiantsUpdate
           ? 'queued Green Gas Giant analysis'
+        : bioTargetsUpdate
+          ? 'queued high-value bio analysis'
         : galaxyUpdate
           ? 'queued full galaxy import'
           : `queued ${mode} systems update`,
@@ -3770,6 +3799,11 @@ async function runSystemUpdate(reqUrl, res) {
         ? [{ step: 'analyze Murder Binaries', args: [path.join(__dirname, 'scripts', 'run-native-importer.js'), 'murder-binaries'] }]
       : greenGasGiantsUpdate
         ? [{ step: 'analyze Green Gas Giant candidates', args: [path.join(__dirname, 'scripts', 'run-native-importer.js'), 'green-gas-giants'] }]
+      : bioTargetsUpdate
+        ? [
+          { step: 'prepare species model', args: [path.join(__dirname, 'scripts', 'prepare-bio-model.js')] },
+          { step: 'analyze high-value bio', args: [path.join(__dirname, 'scripts', 'run-native-importer.js'), 'bio-targets'] },
+        ]
       : galaxyUpdate
         ? [{ step: 'import full galaxy data', args: [path.join(__dirname, 'scripts', 'run-native-importer.js'), 'galaxy', '--source', source] }]
       : [
@@ -3794,6 +3828,8 @@ async function runSystemUpdate(reqUrl, res) {
     discoveriesCache = null;
     murderBinariesIndexCache = null;
     greenGasGiantsCache = null;
+    bioTargetsCache = null;
+    regionRasterCache = null;
     closeCachedFd(spatialIndexCache);
     spatialIndexCache = null;
     closeCachedFd(localRichFilterCache);
@@ -3885,6 +3921,180 @@ function notModifiedSince(req, stat) {
 
 // Top-down density image written by the native spatial-index step; the client
 // draws it as the galaxy glow behind the capped star layer.
+// ---------- High-value bio ----------
+
+async function fileStamp(file) {
+  const stat = await fs.stat(file).catch(() => null);
+  return stat ? `${stat.mtimeMs}:${stat.size}` : null;
+}
+
+async function getBioTargets() {
+  const [dataStamp, metaStamp] = await Promise.all([fileStamp(bioTargetsPath), fileStamp(bioTargetsMetaPath)]);
+  if (!dataStamp || !metaStamp) return null;
+  const key = `${dataStamp}|${metaStamp}`;
+  if (bioTargetsCache?.key !== key) {
+    bioTargetsCache = { key, data: await loadBioTargets(bioTargetsPath, bioTargetsMetaPath), textures: new Map() };
+  }
+  return bioTargetsCache;
+}
+
+async function getRegionRaster() {
+  const stamp = await fileStamp(regionRasterPath);
+  if (!stamp) return null;
+  if (regionRasterCache?.key !== stamp) {
+    regionRasterCache = { key: stamp, raster: parseRegionRaster(await fs.readFile(regionRasterPath)) };
+  }
+  return regionRasterCache.raster;
+}
+
+async function bioTargetsSummary() {
+  const cache = await getBioTargets().catch(() => null);
+  const modelReady = existsSync(bioModelPath);
+  if (!cache) return { available: false, modelReady };
+  const { meta } = cache.data;
+  return {
+    available: true,
+    modelReady,
+    generatedAt: meta.generatedAt,
+    cellCount: meta.cellCount,
+    systems: meta.systems,
+    species: meta.species.map(({ key, name, genus, value }) => ({ key, name, genus, value })),
+  };
+}
+
+async function serveBioModel(req, res) {
+  const [modelStamp, metaStamp] = await Promise.all([fileStamp(bioModelPath), fileStamp(bioTargetsMetaPath)]);
+  if (!modelStamp) return sendJson(res, { error: 'The species model has not been built. Run the high-value bio analysis first.' }, 404);
+  const model = JSON.parse(await fs.readFile(bioModelPath, 'utf8'));
+  const meta = metaStamp ? JSON.parse(await fs.readFile(bioTargetsMetaPath, 'utf8')) : null;
+  const payload = { model, rates: meta ? speciesRates(meta) : null };
+  const etag = `"bio-model-${createHash('sha1').update(`${modelStamp}|${metaStamp}`).digest('hex').slice(0, 16)}"`;
+  return sendJsonWithEtag(req, res, payload, etag);
+}
+
+function speciesParam(reqUrl) {
+  return String(reqUrl.searchParams.get('species') ?? '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+async function serveBioTargets(req, reqUrl, res) {
+  const cache = await getBioTargets();
+  if (!cache) return sendJson(res, { error: 'The high-value bio map has not been built yet.' }, 404);
+  const level = Number(reqUrl.searchParams.get('level') ?? 640);
+  if (!bioTargetLevels.includes(level)) return badRequest(res, `level must be one of ${bioTargetLevels.join(', ')}`);
+  const species = speciesParam(reqUrl);
+  // Optional height band: `band` layers of 320 ly around height `y`.
+  let band = null;
+  if (reqUrl.searchParams.has('band')) {
+    const layers = Number(reqUrl.searchParams.get('band'));
+    const y = Number(reqUrl.searchParams.get('y'));
+    if (!bioTargetBands.includes(layers) || !Number.isFinite(y)) {
+      return badRequest(res, `band must be one of ${bioTargetBands.join(', ')}, with a numeric y`);
+    }
+    band = bandLayers(cache.data, y, layers);
+  }
+  const textureKey = `${level}|${band ? `${band.min}-${band.max}` : 'all'}|${[...species].sort().join(',')}`;
+  if (!cache.textures.has(textureKey)) {
+    if (cache.textures.size >= 24) cache.textures.delete(cache.textures.keys().next().value);
+    cache.textures.set(textureKey, overlayTexture(cache.data, level, species, band));
+  }
+  const body = cache.textures.get(textureKey);
+  const etag = `"bio-targets-${createHash('sha1').update(`${cache.key}|${textureKey}`).digest('hex').slice(0, 16)}"`;
+  if (req.headers['if-none-match'] === etag) {
+    res.writeHead(304, { ETag: etag });
+    return res.end();
+  }
+  res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': body.length, 'Cache-Control': 'no-cache', ETag: etag });
+  return res.end(body);
+}
+
+async function serveBioTargetCell(reqUrl, res) {
+  const coords = { x: Number(reqUrl.searchParams.get('x')), y: Number(reqUrl.searchParams.get('y')), z: Number(reqUrl.searchParams.get('z')) };
+  if (!Object.values(coords).every(Number.isFinite)) return badRequest(res, 'x, y and z are required.');
+  const cache = await getBioTargets();
+  if (!cache) return sendJson(res, { available: false });
+  return sendJson(res, {
+    available: true,
+    generatedAt: cache.data.meta.generatedAt,
+    levels: cellDetail(cache.data, coords, speciesParam(reqUrl)),
+  });
+}
+
+// ---------- Live journal ----------
+
+const liveClients = new Set();
+let liveJournal = null;
+
+function liveEnabled() {
+  return localConfig.liveJournal !== false && process.env.EDSS_LIVE_JOURNAL !== '0';
+}
+
+function liveStatus() {
+  return { enabled: liveEnabled(), ...(liveJournal?.status() ?? { running: false, file: null }) };
+}
+
+function broadcastLive(type, payload) {
+  const message = `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const client of liveClients) client.write(message);
+}
+
+// Called by the follower after a burst of journal events: persist them with the
+// regular incremental import, retrying later if another write is under way.
+function persistLiveJournal() {
+  if (systemUpdateStatus.running || journalScanStatus.running) {
+    liveJournal?.schedulePersist(10000);
+    return;
+  }
+  startJournalScan({ mode: 'latest', count: 2, origin: 'live' });
+}
+
+async function startLiveJournal() {
+  if (liveJournal || !liveEnabled() || !existsSync(journalDir)) return;
+  await getRegionRaster().catch(() => null);
+  const follower = new JournalLive({
+    journalDir,
+    regionAt: (x, z) => regionAt(regionRasterCache?.raster ?? null, x, z),
+    onChange: (change) => {
+      if (change.type === 'snapshot') broadcastLive('snapshot', change.snapshot);
+      else broadcastLive('change', change);
+    },
+    onPersist: persistLiveJournal,
+  });
+  liveJournal = follower;
+  await follower.start();
+  broadcastLive('status', liveStatus());
+}
+
+function stopLiveJournal() {
+  liveJournal?.stop();
+  liveJournal = null;
+}
+
+function serveLive(req, res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write(`event: status\ndata: ${JSON.stringify(liveStatus())}\n\n`);
+  if (liveJournal) res.write(`event: snapshot\ndata: ${JSON.stringify(liveJournal.state.snapshot())}\n\n`);
+  liveClients.add(res);
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 20000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    liveClients.delete(res);
+  });
+}
+
+async function updateLiveSetting(reqUrl, res) {
+  const enabled = reqUrl.searchParams.get('enabled') !== '0';
+  localConfig = { ...localConfig, liveJournal: (await saveLiveJournal(enabled)).liveJournal };
+  if (liveEnabled()) await startLiveJournal();
+  else stopLiveJournal();
+  broadcastLive('status', liveStatus());
+  if (liveJournal) broadcastLive('snapshot', liveJournal.state.snapshot());
+  return sendJson(res, liveStatus());
+}
+
 async function serveGalaxyDensity(req, res) {
   const stat = await fs.stat(galaxyDensityPath).catch(() => null);
   if (!stat?.isFile()) {
@@ -4019,6 +4229,8 @@ const server = http.createServer(async (req, res) => {
           } : null,
         },
         journalPath: journalDir,
+        bioTargets: await bioTargetsSummary(),
+        liveJournal: liveStatus(),
       });
     }
     if (reqUrl.pathname === '/api/points') return await readPoints(reqUrl, res);
@@ -4056,6 +4268,11 @@ const server = http.createServer(async (req, res) => {
     if (reqUrl.pathname === '/api/regions') return await serveRegionMap(req, res);
     if (reqUrl.pathname === '/api/galaxy-density') return await serveGalaxyDensity(req, res);
     if (reqUrl.pathname === '/api/murder-binaries') return queryMurderBinaries(reqUrl, res);
+    if (reqUrl.pathname === '/api/bio-model') return await serveBioModel(req, res);
+    if (reqUrl.pathname === '/api/bio-targets') return await serveBioTargets(req, reqUrl, res);
+    if (reqUrl.pathname === '/api/bio-targets/cell') return await serveBioTargetCell(reqUrl, res);
+    if (reqUrl.pathname === '/api/live' && req.method === 'POST') return await updateLiveSetting(reqUrl, res);
+    if (reqUrl.pathname === '/api/live') return serveLive(req, res);
     if (reqUrl.pathname === '/api/discoveries') return sendJson(res, await getDiscoveries() ?? { imported: false, places: [] });
     if (reqUrl.pathname === '/api/visited') return sendJson(res, await getVisited());
     if (reqUrl.pathname === '/api/journal-scan-status') return sendJson(res, journalScanStatus);
@@ -4305,9 +4522,13 @@ async function start() {
   // threshold so a hand-run CLI import in another terminal keeps its temps.
   runJunkCleanup('startup');
   scheduleJunkCleanup('startup-delayed');
+  startLiveJournal().catch((error) => console.warn(`Live journal follower could not start: ${error.message}`));
 }
 
 function gracefulExit(code) {
+  stopLiveJournal();
+  for (const client of liveClients) client.end();
+  liveClients.clear();
   let exited = false;
   const finish = () => {
     if (exited) return;

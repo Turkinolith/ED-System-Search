@@ -1,5 +1,6 @@
-import { GalaxyRenderer, colorsForType, isGiantStarType } from './renderer.js?v=map-ui-1';
-import { decodeId64, massCodeTypicalStars } from './id64.js?v=mass-layers-1';
+import { GalaxyRenderer, colorsForType, isGiantStarType, parseBioOverlay } from './renderer.js?v=bio-1';
+import { bodyPrediction, normaliseJournalBody, normaliseSpanshBody } from './bio-model.js?v=bio-1';
+import { decodeId64, galaxyOrigin, massCodeTypicalStars } from './id64.js?v=mass-layers-1';
 import { colorModes, hexToRgb, noDataColor } from './color-modes.js?v=map-ui-1';
 
 const state = {
@@ -42,6 +43,8 @@ const state = {
   localPointRequestKey: null,
   richPointFiltersActive: false,
   routeOverlay: null,
+  bio: { available: false, generatedAt: null, species: [], selected: null, level: 640, band: 0, bandLayer: null, model: null, rates: null, modelPromise: null },
+  live: { enabled: true, running: false, follow: false, snapshot: null, source: null, lastSavedId: null },
 };
 
 const el = {
@@ -101,6 +104,22 @@ const el = {
   parentBoxelInputs: [...document.querySelectorAll('input[name="parentBoxel"]')],
   boxelHint: document.querySelector('#boxelHint'),
   nebulaToggle: document.querySelector('#nebulaToggle'),
+  bioOverlayToggle: document.querySelector('#bioOverlayToggle'),
+  bioLevelInputs: [...document.querySelectorAll('input[name="bioLevel"]')],
+  bioBandInputs: [...document.querySelectorAll('input[name="bioBand"]')],
+  bioBandHint: document.querySelector('#bioBandHint'),
+  bioSpeciesList: document.querySelector('#bioSpeciesList'),
+  bioSpeciesCount: document.querySelector('#bioSpeciesCount'),
+  bioSpeciesAll: document.querySelector('#bioSpeciesAll'),
+  bioSpeciesTop: document.querySelector('#bioSpeciesTop'),
+  bioLegend: document.querySelector('#bioLegend'),
+  bioLegendMax: document.querySelector('#bioLegendMax'),
+  bioHint: document.querySelector('#bioHint'),
+  liveIndicator: document.querySelector('#liveIndicator'),
+  liveJournalToggle: document.querySelector('#liveJournalToggle'),
+  liveFollowToggle: document.querySelector('#liveFollowToggle'),
+  liveAutoTarget: document.querySelector('#liveAutoTarget'),
+  liveJournalStatus: document.querySelector('#liveJournalStatus'),
   colorBySelect: document.querySelector('#colorBySelect'),
   colorLegend: document.querySelector('#colorLegend'),
   routeBar: document.querySelector('#routeBar'),
@@ -1008,7 +1027,7 @@ function elapsedText(startedAt) {
 }
 
 function setScanStatus(scan) {
-  const label = scan.mode === 'all' ? 'All scan' : 'Latest scan';
+  const label = scan.origin === 'live' ? 'Saving live journal' : scan.mode === 'all' ? 'All scan' : 'Latest scan';
   const elapsed = scan.startedAt ? elapsedText(scan.startedAt) : '0:00';
   setWriteActivity('scan', Boolean(scan.running));
   const message = `${label} ${elapsed} · ${scan.message ?? 'working'}`;
@@ -1025,6 +1044,8 @@ function setSystemUpdateStatus(update) {
         ? 'Murder Binaries analysis'
       : update?.mode === 'green-gas-giants'
         ? 'Green Gas Giant analysis'
+      : update?.mode === 'bio-targets'
+        ? 'High-value bio analysis'
       : update?.mode === 'galaxy'
         ? 'Full galaxy import'
     : update?.mode
@@ -1160,7 +1181,7 @@ async function loadStatus() {
   const data = await response.json();
   state.meta = data.meta;
   state.visited = data.visited;
-  state.latestJournal = data.visited?.latestSystem ?? null;
+  state.latestJournal = newerLatestSystem(data.visited?.latestSystem ?? null, liveLatestSystem());
   if (el.routeBar && state.routeOverlay) renderRouteBar();
   state.carrierLocation = data.visited?.carrierLocation ?? null;
   state.trackedCarrier = data.runtimeConfig?.trackedCarrier ?? null;
@@ -1169,6 +1190,8 @@ async function loadStatus() {
   state.systemUpdates = data.systemUpdates ?? null;
   state.galaxyDetails = data.galaxyDetails ?? null;
   state.spatialIndex = data.spatialIndex ?? null;
+  updateBioAvailability(data.bioTargets);
+  updateLiveStatus(data.liveJournal);
 
   if (!data.imported) {
     el.datasetSummary.textContent = 'Run npm run import:systems to build map indexes.';
@@ -1471,6 +1494,7 @@ function selectedHtml(system) {
     <dl>
       <dt>ID64</dt><dd>${escapeHtml(system.id64)}</dd>
       ${boxelRows(system)}
+      ${state.bio.available ? '<dt>High-value bio</dt><dd id="bioCellDetail" class="bio-cell">Loading…</dd>' : ''}
       <dt>Coords</dt><dd>${coordsText(system.coords)}</dd>
       <dt>Permit</dt><dd>${system.needsPermit ? 'Required' : 'No'}</dd>
       <dt>Visited</dt><dd>${system.visited ? 'Yes' : 'No'}</dd>
@@ -1480,6 +1504,7 @@ function selectedHtml(system) {
       ${system.lastVisited ? `<dt>Last visit</dt><dd>${new Date(system.lastVisited).toLocaleString()}</dd>` : ''}
       ${note ? `<dt>Note</dt><dd class="note-inline">${note}</dd>` : ''}
     </dl>
+    <div id="bioBodyCallout" class="bio-callout" hidden></div>
   `;
 }
 
@@ -1514,8 +1539,10 @@ function bodyStations(body) {
   return Array.isArray(body?.stations) ? body.stations : [];
 }
 
-function bodyBadges(body) {
+function bodyBadges(body, prediction = null) {
   const badges = [];
+  if (prediction?.some((item) => item.basis === 'confirmed')) badges.push('High-value bio');
+  else if (prediction?.some((item) => (item.probability ?? 0) >= 0.25)) badges.push('Likely high-value bio');
   if (body.type) badges.push(body.type);
   if (body.isLandable) badges.push('Landable');
   if (Array.isArray(body.rings) && body.rings.length) badges.push(`${body.rings.length} ring${body.rings.length === 1 ? '' : 's'}`);
@@ -1547,9 +1574,9 @@ function stationHtml(station) {
   `;
 }
 
-function bodyHtml(body, index) {
+function bodyHtml(body, index, prediction = null) {
   const subtype = body.subType ?? body.type ?? 'Unknown body';
-  const badges = bodyBadges(body);
+  const badges = bodyBadges(body, prediction);
   const materials = body.materials && typeof body.materials === 'object' ? Object.keys(body.materials).length : 0;
   const signals = body.signals && typeof body.signals === 'object' ? Object.keys(body.signals).length : 0;
   const stations = bodyStations(body);
@@ -1588,6 +1615,12 @@ function bodyHtml(body, index) {
       </summary>
       <div class="body-detail">
         <dl>${details || '<dt>Details</dt><dd>No additional fields recorded</dd>'}</dl>
+        ${prediction?.length ? `
+          <div class="body-subsection">
+            <span>High-value bio</span>
+            <div class="bio-prediction">${prediction.map(bioPredictionRow).join('')}</div>
+          </div>
+        ` : ''}
         ${Array.isArray(body.rings) && body.rings.length ? `
           <div class="body-subsection">
             <span>Rings</span>
@@ -1613,7 +1646,8 @@ function renderBodiesError(message) {
 
 function renderRichSystem(data) {
   const system = data.system;
-  const bodies = Array.isArray(system.bodies) ? system.bodies : [];
+  const bodies = withLiveBodies(data, Array.isArray(system.bodies) ? system.bodies : []);
+  const predictions = richBodyPredictions(data, bodies);
   const stations = Array.isArray(system.stations) ? system.stations : [];
   const totalStations = data.summary?.stationCount ?? stations.length + bodies.reduce((sum, body) => sum + bodyStations(body).length, 0);
   el.bodiesState.textContent = `${fmt(bodies.length)} recorded bodies · ${fmt(totalStations)} stations · ${data.segment?.kind ?? 'base'} data`;
@@ -1632,8 +1666,515 @@ function renderRichSystem(data) {
     ${stations.length ? `<div class="system-stations"><span>System stations</span>${stations.map(stationHtml).join('')}</div>` : ''}
   `;
   el.bodyList.innerHTML = bodies.length
-    ? bodies.map(bodyHtml).join('')
+    ? bodies.map((body, index) => bodyHtml(body, index, predictions.get(body)?.prediction)).join('')
     : '<div class="section muted">No body records are available for this system.</div>';
+}
+
+// ---------- High-value bio ----------
+
+function creditsText(value) {
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M cr`;
+  if (value >= 1e3) return `${Math.round(value / 1e3)}k cr`;
+  return `${Math.round(value)} cr`;
+}
+
+function percentText(value) {
+  if (value >= 0.995) return '100%';
+  if (value < 0.01) return '<1%';
+  return `${Math.round(value * 100)}%`;
+}
+
+function updateBioAvailability(info) {
+  const generatedAt = info?.generatedAt ?? null;
+  if (generatedAt !== state.bio.generatedAt) {
+    // A rebuilt map comes with new galaxy-wide rates for the body predictions.
+    state.bio.model = null;
+    state.bio.rates = null;
+    state.bio.modelPromise = null;
+  }
+  state.bio.available = Boolean(info?.available);
+  state.bio.generatedAt = generatedAt;
+  state.bio.species = info?.species ?? [];
+  el.bioOverlayToggle.disabled = !state.bio.available;
+  el.bioHint.textContent = state.bio.available
+    ? `Built ${localDateTime(generatedAt)} from ${fmt(info.systems)} systems with scanned bodies.`
+    : 'Build the map once from Data > Build high-value bio map.';
+  renderBioSpeciesList();
+  loadBioOverlay();
+}
+
+function bioSpeciesSelected(species) {
+  return state.bio.selected === null || state.bio.selected.has(species.key);
+}
+
+function renderBioSpeciesList() {
+  const selectedCount = state.bio.species.filter(bioSpeciesSelected).length;
+  el.bioSpeciesCount.textContent = state.bio.species.length ? `${selectedCount} of ${state.bio.species.length}` : '';
+  el.bioSpeciesList.replaceChildren(...[...state.bio.species]
+    .sort((a, b) => b.value - a.value || a.name.localeCompare(b.name))
+    .map((species) => {
+      const label = document.createElement('label');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = bioSpeciesSelected(species);
+      input.addEventListener('change', () => {
+        const next = new Set(state.bio.species.filter(bioSpeciesSelected).map((item) => item.key));
+        if (input.checked) next.add(species.key);
+        else next.delete(species.key);
+        setBioSpecies(next.size === state.bio.species.length ? null : next);
+      });
+      const name = document.createElement('span');
+      name.textContent = species.name;
+      const value = document.createElement('small');
+      value.textContent = `${(species.value / 1e6).toFixed(1)}M`;
+      label.append(input, name, value);
+      return label;
+    }));
+}
+
+function setBioSpecies(selected) {
+  state.bio.selected = selected;
+  writeViewSettings({ bioSpecies: selected ? [...selected] : null });
+  renderBioSpeciesList();
+  loadBioOverlay();
+  if (state.selectedSystem) loadBioCellDetail(state.selectedSystem);
+}
+
+// Comma-separated species keys for the API; empty means all of them.
+function bioSpeciesQuery() {
+  if (state.bio.selected === null) return '';
+  return [...state.bio.selected].join(',');
+}
+
+let bioOverlayRequestId = 0;
+let bioBandTimer = null;
+const bioLayerLy = 320;
+
+// The 320 ly layer (the bio map's cell row) holding height y.
+function bioLayerOf(y) {
+  return Math.floor((y + galaxyOrigin.y) / bioLayerLy);
+}
+
+function bioBandRange(layer, layers) {
+  const half = (layers - 1) / 2;
+  const min = (layer - half) * bioLayerLy - galaxyOrigin.y;
+  return { min, max: min + layers * bioLayerLy };
+}
+
+// With a height band on, reload the map when the map target moves into
+// another 320 ly layer.
+function scheduleBioBandRefresh() {
+  if (!state.bio.band || !el.bioOverlayToggle.checked || !state.renderer) return;
+  if (bioLayerOf(state.renderer.targetCoords().y) === state.bio.bandLayer) return;
+  clearTimeout(bioBandTimer);
+  bioBandTimer = setTimeout(loadBioOverlay, 250);
+}
+
+async function loadBioOverlay() {
+  const requestId = ++bioOverlayRequestId;
+  const renderer = state.renderer;
+  const nothingSelected = state.bio.selected !== null && state.bio.selected.size === 0;
+  if (!renderer || !el.bioOverlayToggle.checked || !state.bio.available || nothingSelected) {
+    renderer?.setBioOverlay(null);
+    el.bioLegend.hidden = true;
+    return;
+  }
+  const params = new URLSearchParams({ level: String(state.bio.level) });
+  const species = bioSpeciesQuery();
+  if (species) params.set('species', species);
+  let bandText = 'Each square averages every height in its column.';
+  if (state.bio.band) {
+    const y = renderer.targetCoords().y;
+    state.bio.bandLayer = bioLayerOf(y);
+    const range = bioBandRange(state.bio.bandLayer, state.bio.band);
+    params.set('band', String(state.bio.band));
+    params.set('y', String(y));
+    bandText = `Heights ${fmt(range.min)} to ${fmt(range.max)} ly, around the map target. Moves with the grid plane.`;
+  }
+  try {
+    const response = await fetch(`/api/bio-targets?${params.toString()}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const image = parseBioOverlay(await response.arrayBuffer());
+    if (requestId !== bioOverlayRequestId) return;
+    renderer.setBioOverlay(image);
+    el.bioBandHint.textContent = image ? bandText : `${bandText} No scanned systems at these heights.`;
+    el.bioLegend.hidden = !image;
+    if (image) el.bioLegendMax.textContent = `Top 10%: ${creditsText(image.topTenthCredits)}+ / system`;
+  } catch (error) {
+    console.warn(error);
+    setStatus(`High-value bio map unavailable: ${error.message}`);
+  }
+}
+
+let bioCellRequestId = 0;
+
+async function loadBioCellDetail(system) {
+  const target = () => el.selected.querySelector('#bioCellDetail');
+  if (!state.bio.available || !system?.coords || !target()) return;
+  const requestId = ++bioCellRequestId;
+  const params = new URLSearchParams({ x: String(system.coords.x), y: String(system.coords.y), z: String(system.coords.z) });
+  const species = bioSpeciesQuery();
+  if (species) params.set('species', species);
+  try {
+    const response = await api(`/api/bio-targets/cell?${params.toString()}`);
+    const data = await response.json();
+    if (requestId !== bioCellRequestId || !target()) return;
+    target().innerHTML = bioCellHtml(data);
+  } catch (error) {
+    if (requestId === bioCellRequestId && target()) target().textContent = `Unavailable: ${error.message}`;
+  }
+}
+
+// The 320 ly boxel when it has enough fully scanned systems to judge by,
+// otherwise its 1,280 ly sector.
+function bioCellHtml(data) {
+  if (!data.available) return 'Not built yet';
+  const boxel = data.levels[320];
+  const sector = data.levels[1280];
+  const pick = boxel.basis === 'complete' || !sector.systems ? boxel : sector;
+  if (!pick.systems) return 'No scanned systems here yet';
+  const area = pick === boxel ? '320 ly boxel' : '1,280 ly sector';
+  const sample = pick.basis === 'complete'
+    ? `${fmt(pick.completeSystems)} fully scanned systems`
+    : `${fmt(pick.systems)} partly scanned systems, rough`;
+  const summary = `≈${creditsText(pick.creditsPerSystem)} per scanned system · ${percentText(pick.chancePerSystem)} hold one (${area}, ${sample})`;
+  const top = pick.species.filter((item) => item.finds >= 0.05).slice(0, 3);
+  const rows = top.map((item) => {
+    const candidates = Math.round(item.mapped + item.unmapped);
+    const title = `${fmt(candidates)} candidate bodies (${fmt(Math.round(item.mapped))} DSS-mapped). The chance is how often a candidate body has it.`;
+    return `<div title="${escapeHtml(title)}"><span>${escapeHtml(item.name)}</span><span>${escapeHtml(percentText(item.rate))}</span><span>${escapeHtml(creditsText(item.value))}</span></div>`;
+  }).join('');
+  return `<span>${escapeHtml(summary)}</span>${rows ? `<div class="bio-prediction">${rows}</div>` : ''}`;
+}
+
+async function ensureBioModel() {
+  if (state.bio.model) return state.bio.model;
+  state.bio.modelPromise ??= fetch('/api/bio-model')
+    .then(async (response) => {
+      if (!response.ok) return null;
+      const payload = await response.json();
+      state.bio.model = payload.model;
+      state.bio.rates = payload.rates;
+      return payload.model;
+    })
+    .catch(() => null);
+  return state.bio.modelPromise;
+}
+
+const bioBasisText = {
+  confirmed: 'Scanned',
+  genus: 'Genus found by DSS',
+  signals: 'Bio signals, genus unknown',
+  conditions: 'Conditions only',
+};
+
+function bioPredictionRow(item) {
+  const chance = item.probability === null ? 'possible' : item.basis === 'confirmed' ? 'found' : percentText(item.probability);
+  const title = `${bioBasisText[item.basis] ?? item.basis}; ${percentText(item.share)} of this genus's possible species here`;
+  return `<div title="${escapeHtml(title)}"><span class="${item.basis === 'confirmed' ? 'confirmed' : ''}">${escapeHtml(item.name)}</span><span>${escapeHtml(chance)}</span><span>${escapeHtml(creditsText(item.value))}</span></div>`;
+}
+
+function liveSystemFor(data) {
+  const snapshot = state.live.snapshot;
+  if (!snapshot?.current) return null;
+  const sameAddress = data.id64 !== undefined && String(data.id64) === snapshot.current.systemAddress;
+  const sameName = systemKey(data.system?.name) === systemKey(snapshot.current.systemName);
+  return sameAddress || sameName ? snapshot : null;
+}
+
+// Planets the live journal has scanned that the saved data does not hold yet.
+function withLiveBodies(data, bodies) {
+  const live = liveSystemFor(data);
+  if (!live) return bodies;
+  const known = new Set(bodies.map((body) => body.bodyId));
+  const extra = live.bodies
+    .filter((body) => body.scan && !known.has(body.bodyId))
+    .map(({ scan }) => ({
+      bodyId: scan.BodyID,
+      name: scan.BodyName,
+      type: 'Planet',
+      subType: scan.PlanetClass,
+      isLandable: scan.Landable === true,
+      gravity: Number.isFinite(scan.SurfaceGravity) ? scan.SurfaceGravity / 9.80665 : undefined,
+      surfaceTemperature: scan.SurfaceTemperature,
+      atmosphereType: scan.Atmosphere || scan.AtmosphereType,
+      volcanismType: scan.Volcanism,
+      distanceToArrival: scan.DistanceFromArrivalLS,
+      source: 'Live journal',
+    }));
+  return extra.length ? [...bodies, ...extra].sort((a, b) => (a.bodyId ?? 0) - (b.bodyId ?? 0)) : bodies;
+}
+
+function richBodyPredictions(data, bodies) {
+  const out = new Map();
+  const model = state.bio.model;
+  if (!model) return out;
+  const live = liveSystemFor(data);
+  const system = { bodies, region: data.region ?? live?.current?.region ?? null };
+  for (const body of bodies) {
+    if (body.type === 'Star') continue;
+    const liveBody = live?.bodies.find((item) => item.bodyId === body.bodyId);
+    let normalised;
+    if (liveBody?.scan) {
+      normalised = normaliseJournalBody(liveBody.scan, {
+        stars: live.stars,
+        region: system.region,
+        genuses: liveBody.genuses,
+        bioCount: liveBody.bioCount,
+        speciesFound: liveBody.speciesFound,
+      });
+    } else {
+      normalised = normaliseSpanshBody(body, system);
+      if (liveBody) {
+        normalised.genuses = liveBody.genuses ?? normalised.genuses;
+        normalised.bioCount = liveBody.bioCount ?? normalised.bioCount;
+        normalised.speciesFound = liveBody.speciesFound ?? [];
+      }
+    }
+    const prediction = bodyPrediction(model, normalised, state.bio.rates);
+    if (prediction.length) out.set(body, { prediction, bioCount: normalised.bioCount, genuses: normalised.genuses });
+  }
+  return out;
+}
+
+// Bodies with biological signals that could be one of the tracked species,
+// for the system details.
+function bioBodyCalloutHtml(data) {
+  const bodies = withLiveBodies(data, Array.isArray(data.system?.bodies) ? data.system.bodies : []);
+  const predictions = richBodyPredictions(data, bodies);
+  const systemName = String(data.system?.name ?? '');
+  const rows = [];
+  for (const body of bodies) {
+    const entry = predictions.get(body);
+    if (!entry || !(entry.bioCount > 0 || entry.genuses?.length)) continue;
+    const best = Math.max(...entry.prediction.map((item) => (item.probability ?? 0) * item.value));
+    rows.push({ body, entry, best });
+  }
+  if (!rows.length) return '';
+  rows.sort((a, b) => b.best - a.best);
+  const items = rows.map(({ body, entry }) => {
+    const name = String(body.name ?? `Body ${body.bodyId}`);
+    const shortName = systemName && name.startsWith(systemName) ? name.slice(systemName.length).trim() || name : name;
+    const facts = [
+      entry.bioCount > 0 ? `${entry.bioCount} bio signal${entry.bioCount === 1 ? '' : 's'}` : 'genus mapped',
+      Number.isFinite(body.distanceToArrival) ? `${Math.round(body.distanceToArrival).toLocaleString()} ls` : null,
+    ].filter(Boolean).join(' · ');
+    return `
+      <div class="bio-callout-body">
+        <div class="bio-callout-name"><strong title="${escapeHtml(name)}">${escapeHtml(shortName)}</strong><small>${escapeHtml(facts)}</small></div>
+        <div class="bio-prediction">${entry.prediction.map(bioPredictionRow).join('')}</div>
+      </div>`;
+  }).join('');
+  return `<div class="bio-callout-title">High-value bio signals</div>${items}`;
+}
+
+function renderBioBodyCallout(data) {
+  const target = el.selected.querySelector('#bioBodyCallout');
+  if (!target) return;
+  const html = data && state.bio.model ? bioBodyCalloutHtml(data) : '';
+  target.innerHTML = html;
+  target.hidden = !html;
+}
+
+let bioCalloutRequestId = 0;
+
+async function loadBioBodyCallout(system) {
+  const requestId = ++bioCalloutRequestId;
+  try {
+    const [data] = await Promise.all([fetchRichSystem(system), ensureBioModel()]);
+    if (requestId !== bioCalloutRequestId || state.selectedSystem !== system) return;
+    state.richSystem ??= data;
+    renderBioBodyCallout(data);
+  } catch {
+    // No body records for this system: nothing to call out.
+  }
+}
+
+// ---------- Live journal ----------
+
+function connectLive() {
+  if (!('EventSource' in window) || state.live.source) return;
+  const source = new EventSource('/api/live');
+  state.live.source = source;
+  source.addEventListener('status', (event) => updateLiveStatus(JSON.parse(event.data)));
+  source.addEventListener('snapshot', (event) => {
+    state.live.snapshot = JSON.parse(event.data);
+    onLiveUpdate({ type: 'snapshot' });
+  });
+  source.addEventListener('change', (event) => applyLiveChange(JSON.parse(event.data)));
+  source.addEventListener('saved', (event) => finishLiveJournalScan(JSON.parse(event.data)));
+  // EventSource reconnects on its own; show the indicator as idle meanwhile.
+  source.addEventListener('error', () => el.liveIndicator.classList.add('idle'));
+}
+
+function updateLiveStatus(status) {
+  if (!status) return;
+  state.live.enabled = Boolean(status.enabled);
+  state.live.running = Boolean(status.running);
+  el.liveJournalToggle.checked = state.live.enabled;
+  el.liveIndicator.hidden = !state.live.enabled;
+  el.liveAutoTarget.hidden = !state.live.enabled;
+  el.liveIndicator.classList.toggle('idle', !state.live.running);
+  el.liveJournalStatus.textContent = !state.live.enabled
+    ? 'Off: use Scan latest journals to refresh by hand.'
+    : state.live.running
+      ? `Following ${status.file ?? 'the newest journal'}.`
+      : 'Waiting for a journal file.';
+}
+
+function upsertBy(list, item, matches) {
+  const index = list.findIndex(matches);
+  if (index >= 0) list[index] = item;
+  else list.push(item);
+}
+
+function applyLiveChange(change) {
+  state.live.snapshot ??= { current: null, fss: null, stars: [], bodies: [] };
+  const snapshot = state.live.snapshot;
+  if (change.type === 'location') {
+    change.systemChanged = snapshot.current?.systemAddress !== change.current.systemAddress;
+    if (change.systemChanged) {
+      snapshot.stars = [];
+      snapshot.bodies = [];
+      snapshot.fss = null;
+    }
+    snapshot.current = change.current;
+  } else if (change.type === 'star') {
+    upsertBy(snapshot.stars, change.star, (star) => star.BodyID === change.star.BodyID);
+  } else if (change.type === 'body') {
+    upsertBy(snapshot.bodies, change.body, (body) => body.bodyId === change.body.bodyId);
+  } else if (change.type === 'status') {
+    snapshot.fss = change.fss;
+  }
+  onLiveUpdate(change);
+}
+
+// Auto targeting: move the target and selection to the system the journal
+// says you are in.
+function targetLiveSystem() {
+  const current = state.live.snapshot?.current;
+  if (!current?.systemName || !current.starPos) return;
+  const coords = { x: current.starPos[0], y: current.starPos[1], z: current.starPos[2] };
+  searchLatestSystem(current.systemName, true).then((found) => {
+    if (found) return;
+    focusSystem(current.systemName, coords);
+    state.renderer.setSelectedSystem({ name: current.systemName, coords, mainStar: 'Unknown', visited: true });
+  });
+}
+
+function setAutoTarget(enabled) {
+  state.live.follow = enabled;
+  el.liveFollowToggle.checked = enabled;
+  el.liveAutoTarget.setAttribute('aria-pressed', String(enabled));
+  el.liveAutoTarget.title = enabled
+    ? 'Auto targeting on: the target moves to each new journal system'
+    : 'Auto targeting off: the target stays where you put it';
+}
+
+function isSelectedLiveSystem() {
+  const current = state.live.snapshot?.current;
+  const selected = state.selectedSystem;
+  if (!current || !selected) return false;
+  return String(selected.id64) === current.systemAddress || systemKey(selected.name) === systemKey(current.systemName);
+}
+
+let liveBodiesTimer = null;
+
+// The live journal's current system in the shape of the saved latest system.
+function liveLatestSystem() {
+  const current = state.live.snapshot?.current;
+  if (!current?.systemName || !current.starPos) return null;
+  return {
+    name: current.systemName,
+    key: systemKey(current.systemName),
+    timestamp: current.arrivedAt,
+    systemAddress: current.systemAddress,
+    coords: { x: current.starPos[0], y: current.starPos[1], z: current.starPos[2] },
+  };
+}
+
+// Whichever of two latest-system records is more recent.
+function newerLatestSystem(saved, live) {
+  if (!live) return saved;
+  if (!saved) return live;
+  if (systemKey(saved.name) === systemKey(live.name)) return { ...live, ...saved, coords: saved.coords ?? live.coords };
+  return String(live.timestamp ?? '') >= String(saved.timestamp ?? '') ? live : saved;
+}
+
+function onLiveUpdate(change) {
+  const current = state.live.snapshot?.current;
+  if (change.type === 'location' || change.type === 'snapshot') {
+    state.latestJournal = newerLatestSystem(state.latestJournal, liveLatestSystem());
+    if (el.routeBar && state.routeOverlay) renderRouteBar();
+  }
+  if (current?.starPos) {
+    const coords = { x: current.starPos[0], y: current.starPos[1], z: current.starPos[2] };
+    state.renderer?.setCommanderLocation({ name: current.systemName, coords });
+    el.liveIndicator.title = `Following your journal live · ${current.systemName}`;
+    if (change.type === 'location' && change.systemChanged && state.live.follow) targetLiveSystem();
+  }
+  if (change.type === 'body' && change.organic?.species) {
+    setStatus(`Logged ${change.organic.species} on ${change.body.name ?? 'a body'}.`);
+  }
+  if (isSelectedLiveSystem() && state.richSystem) {
+    clearTimeout(liveBodiesTimer);
+    liveBodiesTimer = setTimeout(() => {
+      if (!isSelectedLiveSystem() || !state.richSystem) return;
+      renderRichSystem(state.richSystem);
+      renderBioBodyCallout(state.richSystem);
+    }, 300);
+  }
+}
+
+// A save triggered by the live follower: refresh what changed without moving
+// the map or the selection.
+async function finishLiveJournalScan(scan) {
+  if (scan.id && scan.id === state.live.lastSavedId) return;
+  state.live.lastSavedId = scan.id;
+  setWriteActivity('scan', false);
+  setJournalButtonsDisabled(false);
+  if (!scan.ok) {
+    setJournalScanPanel(scan, { message: `Live save failed: ${scan.message ?? 'see the server log'}`, failed: true });
+    return;
+  }
+  const priorSupplementalCount = state.visited?.supplementalCount ?? 0;
+  await loadStatus();
+  systemCache.clear();
+  richSystemCache.clear();
+  const supplementalChanged = (state.visited?.supplementalCount ?? 0) !== priorSupplementalCount;
+  await (supplementalChanged ? loadPoints({ background: true }) : applyVisitedIndexUpdate()).catch((error) => {
+    if (!isAbortError(error)) console.warn(error);
+  });
+  setJournalScanPanel(scan, { message: scan.message || 'Live journal saved.', processing: false });
+}
+
+// Full body data for a system, from the cache or /api/system-rich. The system
+// you are in now may not be saved anywhere yet; then it is an empty record that
+// the live journal's bodies fill in.
+async function fetchRichSystem(selected) {
+  const key = `${selected.id64 ?? ''}:${selected.name ?? ''}`;
+  const cached = richSystemCache.get(key);
+  if (cached) return cached;
+  try {
+    const params = new URLSearchParams();
+    if (selected.id64) params.set('id64', String(selected.id64));
+    if (selected.name) params.set('name', selected.name);
+    if (selected.coords) {
+      params.set('x', String(selected.coords.x));
+      params.set('z', String(selected.coords.z));
+    }
+    const response = await api(`/api/system-rich?${params.toString()}`);
+    const data = await response.json();
+    richSystemCache.set(key, data);
+    if (richSystemCache.size > 24) richSystemCache.delete(richSystemCache.keys().next().value);
+    return data;
+  } catch (error) {
+    const current = state.live.snapshot?.current;
+    if (current && systemKey(current.systemName) === systemKey(selected.name)) {
+      return { id64: current.systemAddress, region: current.region, segment: { kind: 'live journal' }, system: { name: current.systemName, bodies: [] } };
+    }
+    throw error;
+  }
 }
 
 async function loadSelectedBodies() {
@@ -1642,26 +2183,13 @@ async function loadSelectedBodies() {
     renderBodiesError('Select a system to view its body data.');
     return;
   }
-  const key = `${selected.id64 ?? ''}:${selected.name ?? ''}`;
-  const cached = richSystemCache.get(key);
-  if (cached) {
-    state.richSystem = cached;
-    renderRichSystem(cached);
-    return;
-  }
   const requestId = ++richSystemRequestId;
   el.bodiesState.textContent = `Loading full data for ${selected.name}...`;
   el.bodySystemSummary.hidden = true;
   el.bodyList.replaceChildren();
   try {
-    const params = new URLSearchParams();
-    if (selected.id64) params.set('id64', String(selected.id64));
-    if (selected.name) params.set('name', selected.name);
-    const response = await api(`/api/system-rich?${params.toString()}`);
-    const data = await response.json();
+    const [data] = await Promise.all([fetchRichSystem(selected), ensureBioModel()]);
     if (requestId !== richSystemRequestId) return;
-    richSystemCache.set(key, data);
-    if (richSystemCache.size > 24) richSystemCache.delete(richSystemCache.keys().next().value);
     state.richSystem = data;
     renderRichSystem(data);
   } catch (error) {
@@ -1735,6 +2263,8 @@ async function selectSystem(index, focus = true) {
   renderBodiesError('Open the Bodies tab to load full system data.');
   el.selected.classList.remove('empty');
   el.selected.innerHTML = selectedHtml(system);
+  loadBioCellDetail(system);
+  loadBioBodyCallout(system);
   state.renderer.setSelectedSystem(system);
   if (focus) focusSystem(system.name, system.coords);
   setInspectorTab('system');
@@ -2482,6 +3012,10 @@ async function refreshJournals(mode = 'latest') {
 
 async function pollJournalScan(scan) {
   if (scan) setScanStatus(scan);
+  if (scan && !scan.running && scan.origin === 'live') {
+    await finishLiveJournalScan(scan);
+    return;
+  }
   if (scan && !scan.running) {
     if (!scan.ok) {
       const detail = (scan.stderr || scan.stdout || '').trim();
@@ -2588,6 +3122,8 @@ async function runSystemUpdate(mode, confirmedLarge = false) {
         ? 'Murder Binaries analysis'
       : mode === 'green-gas-giants'
         ? 'Green Gas Giant analysis'
+      : mode === 'bio-targets'
+        ? 'High-value bio analysis'
       : mode === 'galaxy'
         ? 'Full galaxy import'
         : `Systems ${mode}`;
@@ -3609,6 +4145,45 @@ function bindControls() {
       writeViewSettings({ parentBoxels: codes });
     });
   }
+  el.bioOverlayToggle.addEventListener('change', () => {
+    writeViewSettings({ bioOverlay: el.bioOverlayToggle.checked });
+    loadBioOverlay();
+  });
+  for (const input of el.bioLevelInputs) {
+    input.addEventListener('change', () => {
+      if (!input.checked) return;
+      state.bio.level = Number(input.value);
+      writeViewSettings({ bioLevel: state.bio.level });
+      loadBioOverlay();
+    });
+  }
+  for (const input of el.bioBandInputs) {
+    input.addEventListener('change', () => {
+      if (!input.checked) return;
+      state.bio.band = Number(input.value);
+      writeViewSettings({ bioBand: state.bio.band });
+      loadBioOverlay();
+    });
+  }
+  el.bioSpeciesAll.addEventListener('click', () => setBioSpecies(null));
+  el.bioSpeciesTop.addEventListener('click', () => {
+    setBioSpecies(new Set(state.bio.species.filter((species) => species.value >= 10_000_000).map((species) => species.key)));
+  });
+  el.liveJournalToggle.addEventListener('change', async () => {
+    try {
+      const response = await api(`/api/live?enabled=${el.liveJournalToggle.checked ? 1 : 0}`, { method: 'POST' });
+      updateLiveStatus(await response.json());
+    } catch (error) {
+      setStatus(`Could not change live journal following: ${error.message}`);
+    }
+  });
+  const changeAutoTarget = (enabled) => {
+    setAutoTarget(enabled);
+    writeViewSettings({ liveFollow: enabled });
+    if (enabled) targetLiveSystem();
+  };
+  el.liveFollowToggle.addEventListener('change', () => changeAutoTarget(el.liveFollowToggle.checked));
+  el.liveAutoTarget.addEventListener('click', () => changeAutoTarget(!state.live.follow));
   el.nebulaToggle.addEventListener('change', () => {
     state.renderer.showNebulae = el.nebulaToggle.checked;
     state.renderer.requestRender();
@@ -3750,6 +4325,7 @@ function bindControls() {
   state.renderer.onTargetChange = () => {
     scheduleMurderBinariesRefresh();
     scheduleLocalPointsRefresh();
+    scheduleBioBandRefresh();
   };
 }
 
@@ -3792,6 +4368,13 @@ async function init() {
   const savedParentBoxels = new Set(Array.isArray(viewSettings.parentBoxels) ? viewSettings.parentBoxels : []);
   for (const input of el.parentBoxelInputs) input.checked = savedParentBoxels.has(Number(input.value));
   el.nebulaToggle.checked = viewSettings.showNebulae ?? true;
+  el.bioOverlayToggle.checked = viewSettings.bioOverlay ?? false;
+  state.bio.level = [320, 640, 1280].includes(viewSettings.bioLevel) ? viewSettings.bioLevel : 640;
+  for (const input of el.bioLevelInputs) input.checked = Number(input.value) === state.bio.level;
+  state.bio.band = [0, 1, 3].includes(viewSettings.bioBand) ? viewSettings.bioBand : 0;
+  for (const input of el.bioBandInputs) input.checked = Number(input.value) === state.bio.band;
+  state.bio.selected = Array.isArray(viewSettings.bioSpecies) ? new Set(viewSettings.bioSpecies) : null;
+  setAutoTarget(viewSettings.liveFollow ?? false);
   el.landmarksToggle.checked = viewSettings.showLandmarks ?? true;
   el.carrierMarkerToggle.checked = viewSettings.showCarrierMarker ?? true;
   el.carrierRangeToggle.checked = viewSettings.showCarrierRange ?? false;
@@ -3837,6 +4420,7 @@ async function init() {
   resumeJournalScanIfRunning();
   resumeSystemUpdateIfRunning();
   startServerBusyWatch();
+  connectLive();
   renderFilters();
 
   // Aim the camera straight from status data and start rendering now: the

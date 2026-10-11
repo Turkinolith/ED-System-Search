@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 mod rich;
+mod bio;
 mod ggg;
 mod density;
 mod murder;
@@ -393,13 +394,18 @@ fn main() -> Result<()> {
             batch_size: config.batch_size,
         }),
         "murder-index" => murder::build_index(&config.data_dir),
+        "bio-targets" => bio::run(bio::BioImportConfig {
+            data_dir: &config.data_dir,
+            threads: config.threads,
+            batch_size: config.batch_size,
+        }),
         "galaxy-density" => density::run(&config.data_dir),
         "spatial-index" => spatial::run(spatial::SpatialConfig {
             data_dir: &config.data_dir,
             threads: config.threads,
         }),
         _ => bail!(
-            "Unknown mode '{}'. Use full, delta, galaxy, galaxy-delta, galaxy-repack, galaxy-filters, green-gas-giants, murder-binaries, murder-index, galaxy-density, or spatial-index.",
+            "Unknown mode '{}'. Use full, delta, galaxy, galaxy-delta, galaxy-repack, galaxy-filters, green-gas-giants, murder-binaries, murder-index, bio-targets, galaxy-density, or spatial-index.",
             config.mode
         ),
     }
@@ -419,7 +425,7 @@ impl Config {
         let mut args = env::args().skip(1);
         let mode = args.next().ok_or_else(|| {
             anyhow!(
-                "Usage: ed-data-importer <full|delta|galaxy|galaxy-delta|galaxy-repack|galaxy-filters|green-gas-giants|murder-binaries|murder-index|galaxy-density|spatial-index> [--source <path-or-url>] [--data-dir data] [--threads N] [--compression-level 1-19] [--batch-size N]"
+                "Usage: ed-data-importer <full|delta|galaxy|galaxy-delta|galaxy-repack|galaxy-filters|green-gas-giants|murder-binaries|murder-index|bio-targets|galaxy-density|spatial-index> [--source <path-or-url>] [--data-dir data] [--threads N] [--compression-level 1-19] [--batch-size N]"
             )
         })?;
         let mut source = None;
@@ -478,6 +484,7 @@ impl Config {
             || mode == "green-gas-giants"
             || mode == "murder-binaries"
             || mode == "murder-index"
+            || mode == "bio-targets"
             || mode == "spatial-index"
             || mode == "galaxy-density"
         {

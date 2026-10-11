@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { gzipSync } from 'node:zlib';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSuggestOverlayIndex } from './import-suggest-overlay-index.js';
 import { buildPlaceIndex } from './place-index.js';
+import { encodeRaster } from './build-region-raster.js';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const fixtureRoot = path.join(root, '.tmp-galaxy-integration');
@@ -19,6 +20,7 @@ const importer = path.join(
   'release',
   process.platform === 'win32' ? 'ed-data-importer.exe' : 'ed-data-importer'
 );
+const journalDir = path.join(fixtureRoot, 'journals');
 const port = 5191;
 const keepFixture = process.env.EDSS_KEEP_GALAXY_FIXTURE === '1';
 
@@ -121,6 +123,30 @@ const systems = [
     stations: [],
   },
 ];
+// High-value bio: one DSS-mapped HMC with Stratum, one never mapped. It gets
+// its own small rich import so the shared fixture's filter counts stay put.
+const bioSystem = {
+  id64: 900,
+  name: 'Fixture Bio',
+  coords: { x: 20, y: 0, z: 20 },
+  date: '2026-06-10T12:00:00Z',
+  bodyCount: 3,
+  bodies: [
+    { id64: 501, bodyId: 0, name: 'Fixture Bio A', type: 'Star', subType: 'K (Yellow-Orange) Star', mainStar: true, distanceToArrival: 0 },
+    {
+      id64: 502, bodyId: 1, name: 'Fixture Bio A 1', type: 'Planet', subType: 'High metal content world', isLandable: true,
+      gravity: 0.31, surfaceTemperature: 220, surfacePressure: 0.003, atmosphereType: 'Thin Sulphur dioxide',
+      volcanismType: 'No volcanism', distanceToArrival: 900, parents: [{ Star: 0 }],
+      signals: { signals: { '$SAA_SignalType_Biological;': 1 }, genuses: ['$Codex_Ent_Stratum_Genus_Name;'] },
+    },
+    {
+      id64: 503, bodyId: 2, name: 'Fixture Bio A 2', type: 'Planet', subType: 'High metal content world', isLandable: true,
+      gravity: 0.35, surfaceTemperature: 240, surfacePressure: 0.004, atmosphereType: 'Thin Sulphur dioxide',
+      volcanismType: 'No volcanism', distanceToArrival: 1400, parents: [{ Star: 0 }],
+    },
+  ],
+  stations: [],
+};
 writeFileSync(sourcePath, gzipSync(`[\n${systems.map((system) => JSON.stringify(system)).join(',\n')}\n]\n`));
 
 const systemRecords = Buffer.alloc(32 * systems.length);
@@ -234,6 +260,43 @@ assert.equal(murderData.subarray(0, 8).toString('ascii'), 'EDMBIN01');
 assert.equal(murderData.byteLength, 64);
 assert.equal(murderNames, 'Fixture Murder Binary');
 
+const bioDataDir = path.join(fixtureRoot, 'bio-data');
+const bioSourcePath = path.join(fixtureRoot, 'bio-galaxy.json.gz');
+mkdirSync(bioDataDir, { recursive: true });
+writeFileSync(bioSourcePath, gzipSync(`[\n${JSON.stringify(bioSystem)}\n]\n`));
+const bioImported = spawnSync(importer, ['galaxy', '--source', bioSourcePath, '--data-dir', bioDataDir, '--threads', '2', '--batch-size', '2'], { cwd: root, encoding: 'utf8' });
+assert.equal(bioImported.status, 0, `${bioImported.stdout}\n${bioImported.stderr}`);
+const bioFixture = JSON.parse(readFileSync(path.join(root, 'scripts', 'fixtures', 'bio-cases.json'), 'utf8'));
+// One raster cell covering the fixtures: every system is in region 18.
+const bioRaster = encodeRaster({ labels: new Uint8Array([18]), width: 1, height: 1, x0: 0, z0: 0, cell: 1e6 }, 1);
+for (const dir of [bioDataDir, dataDir]) {
+  writeFileSync(path.join(dir, 'bio-model.json'), JSON.stringify(bioFixture.model));
+  writeFileSync(path.join(dir, 'region-raster.bin'), bioRaster);
+}
+const bioRun = spawnSync(importer, [
+  'bio-targets',
+  '--data-dir', bioDataDir,
+  '--threads', '2',
+  '--batch-size', '2',
+], { cwd: root, encoding: 'utf8' });
+assert.equal(bioRun.status, 0, `${bioRun.stdout}\n${bioRun.stderr}`);
+for (const file of ['bio-targets.bin', 'bio-targets-meta.json']) copyFileSync(path.join(bioDataDir, file), path.join(dataDir, file));
+const bioMeta = JSON.parse(readFileSync(path.join(dataDir, 'bio-targets-meta.json'), 'utf8'));
+assert.equal(bioMeta.version, 3);
+assert.equal(bioMeta.completeSystems, 1, 'the fixture records all three of its counted bodies');
+assert.equal(bioMeta.cellCount, 1);
+assert.equal(bioMeta.eligibleBodies, 2);
+assert.equal(bioMeta.mappedBodies, 1);
+const tectonicas = bioMeta.species.find((item) => item.name === 'Stratum Tectonicas');
+assert.deepEqual([tectonicas.found, tectonicas.mapped, tectonicas.unmapped, tectonicas.rate], [1, 1, 1, 1]);
+assert.equal(readFileSync(path.join(dataDir, 'bio-targets.bin')).subarray(0, 8).toString('ascii'), 'EDBIOT01');
+
+mkdirSync(journalDir, { recursive: true });
+writeFileSync(path.join(journalDir, 'Journal.2026-10-10T120000.01.log'), [
+  { timestamp: '2026-10-10T12:00:00Z', event: 'Fileheader' },
+  { timestamp: '2026-10-10T12:00:01Z', event: 'Location', SystemAddress: 900, StarSystem: 'Fixture Bio', StarPos: [20, 0, 20] },
+].map((event) => JSON.stringify(event)).join('\n') + '\n');
+
 const manifestPath = path.join(dataDir, 'galaxy', 'manifest.json');
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 assert.equal(manifest.mapFilters.recordBytes, 40);
@@ -287,7 +350,7 @@ assert.equal(placeIndex.summary.categoryDetails.some((entry) => entry.category =
 
 const server = spawn(process.execPath, ['server.js'], {
   cwd: root,
-  env: { ...process.env, EDSS_DATA_DIR: dataDir, PORT: String(port) },
+  env: { ...process.env, EDSS_DATA_DIR: dataDir, EDSS_JOURNAL_DIR: journalDir, EDSS_CONFIG: path.join(fixtureRoot, 'config.local.json'), PORT: String(port) },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let serverOutput = '';
@@ -421,6 +484,48 @@ try {
   assert.equal(localResponse.headers.get('x-local-radius'), '1000');
   assert.equal(localResponse.headers.get('x-local-area-count'), String(systems.length));
   assert.equal(localResponse.headers.get('x-local-area-complete'), '1');
+  const bioTextureResponse = await fetch(`http://localhost:${port}/api/bio-targets?level=640`);
+  assert.equal(bioTextureResponse.status, 200);
+  const bioTexture = Buffer.from(await bioTextureResponse.arrayBuffer());
+  assert.equal(bioTexture.subarray(0, 8).toString('ascii'), 'EDBIOX01');
+  assert.equal(bioTexture.readUInt32LE(12) * bioTexture.readUInt32LE(16), 1);
+  assert.ok(bioTexture[36] > 0, 'the fixture boxel has a value');
+  const bandTexture = async (query) => Buffer.from(await (await fetch(`http://localhost:${port}/api/bio-targets?level=640&${query}`)).arrayBuffer());
+  assert.ok((await bandTexture('band=1&y=0'))[36] > 0, 'the fixture system sits in the 320 ly layer at y = 0');
+  assert.equal((await bandTexture('band=3&y=5000')).readUInt32LE(12), 0, 'no scanned systems that high');
+  assert.equal((await fetch(`http://localhost:${port}/api/bio-targets?level=640&band=2&y=0`)).status, 400);
+
+  const bioCellResponse = await fetch(`http://localhost:${port}/api/bio-targets/cell?x=20&y=0&z=20`);
+  const bioCell = await bioCellResponse.json();
+  assert.equal(bioCell.available, true);
+  const boxelTop = bioCell.levels[320].species[0];
+  assert.equal(boxelTop.name, 'Stratum Tectonicas');
+  assert.equal(boxelTop.finds, 2, 'one mapped find plus the unmapped twin at the full rate');
+  assert.equal(bioCell.levels[320].systems, 1);
+  assert.equal(bioCell.levels[320].completeSystems, 1);
+  assert.equal(bioCell.levels[320].basis, 'all', 'one complete system is too few to judge by');
+
+  const bioModelResponse = await fetch(`http://localhost:${port}/api/bio-model`);
+  const bioModel = await bioModelResponse.json();
+  assert.equal(bioModel.model.genera.length, 3);
+  assert.equal(bioModel.rates['$Codex_Ent_Stratum_07_Name;'], 1);
+
+  const richRegion = await (await fetch(`http://localhost:${port}/api/system-rich?id64=100`)).json();
+  assert.equal(richRegion.region, 18);
+
+  const liveController = new AbortController();
+  const liveResponse = await fetch(`http://localhost:${port}/api/live`, { signal: liveController.signal });
+  assert.equal(liveResponse.headers.get('content-type'), 'text/event-stream; charset=utf-8');
+  const liveReader = liveResponse.body.getReader();
+  let liveText = '';
+  while (!liveText.includes('event: snapshot')) {
+    const { value, done } = await liveReader.read();
+    if (done) break;
+    liveText += Buffer.from(value).toString('utf8');
+  }
+  liveController.abort();
+  assert.ok(liveText.includes('"systemName":"Fixture Bio"'), liveText);
+  assert.ok(liveText.includes('"region":18'), liveText);
 } finally {
   server.kill();
   await new Promise((resolve) => server.once('exit', resolve));

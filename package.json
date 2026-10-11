@@ -27,6 +27,10 @@
     "import:galaxy-delta:1month": "node scripts/run-native-importer.js galaxy-delta --source https://downloads.spansh.co.uk/galaxy_1month.json.gz && npm run import:galaxy-filters",
     "import:murder-binaries": "node scripts/run-native-importer.js murder-binaries",
     "import:murder-binaries:index": "node scripts/run-native-importer.js murder-index",
+    "import:bioforge": "node scripts/fetch-bioforge.js",
+    "build:bio-model": "node scripts/prepare-bio-model.js",
+    "import:bio-targets": "node scripts/prepare-bio-model.js && node scripts/run-native-importer.js bio-targets",
+    "check:bio": "node scripts/check-bio-model.js",
     "import:spatial-index": "node scripts/run-native-importer.js spatial-index",
     "import:galaxy-density": "node scripts/run-native-importer.js galaxy-density",
     "inspect:galaxy": "node scripts/inspect-galaxy.js galaxy.json.gz",
@@ -40,6 +44,8 @@
     "test:shutdown": "node scripts/test-shutdown-guard.js",
     "test:updates": "node scripts/test-update-time.js",
     "test:cleanup": "node scripts/test-cleanup-junk.js",
+    "test:bio": "node scripts/test-bio-model.js",
+    "test:live": "node scripts/test-journal-live.js",
     "cleanup": "node scripts/cleanup.js",
     "cleanup:dry-run": "node scripts/cleanup.js --dry-run",
     "import:journals": "node scripts/import-journals.js",
@@ -50,7 +56,7 @@
     "build:places-index": "node scripts/build-place-index.js",
     "import:places": "node scripts/import-places.js && npm run build:places-index",
     "import:discoveries": "node scripts/import-discoveries.js && npm run build:places-index",
-    "import:regions": "node scripts/import-region-vectors.js",
+    "import:regions": "node scripts/import-region-vectors.js && node scripts/build-region-raster.js",
     "refresh:journals": "node scripts/import-journals.js"
   }
 }

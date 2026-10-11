@@ -26,6 +26,10 @@
             <span>Smart</span>
           </button>
           <div class="map-toolbar" aria-label="Map tools">
+            <span id="liveIndicator" class="live-indicator" title="Following your journal live" hidden><i></i>Live</span>
+            <button id="liveAutoTarget" class="icon-button live-autotarget" type="button" aria-pressed="false" title="Auto targeting off: the target stays where you put it" aria-label="Auto targeting" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6"></circle><path d="M12 2v4M12 18v4M2 12h4M18 12h4"></path><circle cx="12" cy="12" r="1.5"></circle></svg>
+            </button>
             <button id="refreshJournals" class="icon-button" title="Scan latest journal files" aria-label="Scan latest journal files">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"></path><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"></path></svg>
             </button>
@@ -217,6 +221,40 @@
                 <label class="toggle" title="Show the current Elite nav route from NavRoute.json and refresh it about every 5 seconds"><input id="routeToggle" type="checkbox"><span>Route</span></label>
                 <button id="refreshRoute" class="route-refresh" type="button">Display route</button>
               </div>
+            </div>
+
+            <div class="section compact-section bio-section">
+              <div class="section-heading"><span>High-value bio</span><span class="section-rule"></span></div>
+              <div class="overlay-toggles compact-overlays">
+                <label class="toggle" title="Colour boxels by the expected value of high-value exobiology per scanned system. Build it once from Data &gt; Build high-value bio map."><input id="bioOverlayToggle" type="checkbox" disabled><span>Bio value map</span></label>
+              </div>
+              <div class="boxel-levels-heading">Boxel size <small>ly</small></div>
+              <div id="bioLevels" class="segmented-control bio-levels" role="radiogroup" aria-label="Bio map boxel size">
+                <label title="320 ly f boxels"><input type="radio" name="bioLevel" value="320"><span>f<small>320</small></span></label>
+                <label title="640 ly g boxels"><input type="radio" name="bioLevel" value="640" checked><span>g<small>640</small></span></label>
+                <label title="1,280 ly h boxels (sectors)"><input type="radio" name="bioLevel" value="1280"><span>h<small>1280</small></span></label>
+              </div>
+              <div class="boxel-levels-heading">Heights</div>
+              <div id="bioBands" class="segmented-control bio-levels" role="radiogroup" aria-label="Bio map heights">
+                <label title="Average every height in each column"><input type="radio" name="bioBand" value="0" checked><span>All</span></label>
+                <label title="Only the 320 ly layer at the map target's height"><input type="radio" name="bioBand" value="1"><span>320<small>ly band</small></span></label>
+                <label title="The 320 ly layer at the map target's height and the layers above and below it"><input type="radio" name="bioBand" value="3"><span>960<small>ly band</small></span></label>
+              </div>
+              <p id="bioBandHint" class="boxel-hint">Each square averages every height in its column.</p>
+              <details class="bio-species">
+                <summary>Species <small id="bioSpeciesCount"></small></summary>
+                <div class="bio-species-actions">
+                  <button id="bioSpeciesAll" class="route-refresh" type="button">All</button>
+                  <button id="bioSpeciesTop" class="route-refresh" type="button">10M+</button>
+                </div>
+                <div id="bioSpeciesList" class="bio-species-list"></div>
+              </details>
+              <div id="bioLegend" class="bio-legend" hidden>
+                <div class="bio-ramp"></div>
+                <div class="bio-ramp-labels"><span>Lower</span><span id="bioLegendMax"></span></div>
+                <small>Expected base value per scanned system, ranked against every other column. Faint columns rest on few DSS-mapped bodies.</small>
+              </div>
+              <p id="bioHint" class="boxel-hint">Build the map once from Data &gt; Build high-value bio map.</p>
             </div>
 
             <div class="section compact-section boxel-section">
@@ -454,6 +492,7 @@
                 <button class="panel-button system-update panel-button-tertiary" data-system-update="discoveries" type="button">Update discoveries</button>
                 <button class="panel-button system-update panel-button-tertiary" data-system-update="murder-binaries" data-large-update="true" data-large-update-label="the installed full-galaxy rich-data packs" type="button">Build murder binaries</button>
                 <button class="panel-button system-update panel-button-tertiary" data-system-update="green-gas-giants" data-large-update="true" data-large-update-label="the installed full-galaxy rich-data packs" type="button">Build green gas giant candidates</button>
+                <button class="panel-button system-update panel-button-tertiary" data-system-update="bio-targets" data-large-update="true" data-large-update-label="the installed full-galaxy rich-data packs (and a one-time 6 MB download of Canonn Bioforge statistics)" type="button">Build high-value bio map</button>
                 <button class="panel-button system-update panel-button-tertiary" data-system-update="galaxy" data-large-update="true" data-large-update-label="local galaxy.json.gz full-data import" type="button">Import full data</button>
               </div>
               <div id="systemUpdateLog" class="update-log"></div>
@@ -466,6 +505,9 @@
               <button id="scanAllJournals" class="panel-button panel-button-tertiary" type="button">Scan all journals</button>
               <div id="journalScanStatus" class="data-state journal-scan-state"><i></i><span>Idle</span></div>
               <div id="journalScanProgress" class="update-progress journal-scan-progress" role="progressbar" aria-label="Journal scan progress" aria-valuemin="0" aria-valuemax="100" hidden><span></span></div>
+              <label class="toggle live-toggle" title="Watch the newest journal file while you play: your location, scans and bio signals appear straight away, and are saved a few seconds after each burst of activity"><input id="liveJournalToggle" type="checkbox" checked><span>Follow journals live</span></label>
+              <label class="toggle live-toggle" title="Move the target to each new system the journal reports, as you jump or log in. Off: the journal is still followed but the target stays put."><input id="liveFollowToggle" type="checkbox"><span>Auto targeting</span></label>
+              <div id="liveJournalStatus" class="muted live-status"></div>
             </div>
 
             <div class="section carrier-section">
@@ -503,6 +545,6 @@
         </div>
       </aside>
     </main>
-    <script type="module" src="/app.js?v=map-ui-1"></script>
+    <script type="module" src="/app.js?v=bio-1"></script>
   </body>
 </html>

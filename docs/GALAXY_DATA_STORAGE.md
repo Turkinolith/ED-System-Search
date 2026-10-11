@@ -222,6 +222,98 @@ rescanning the galaxy pack:
 npm run import:murder-binaries:index
 ```
 
+## High-value bio map
+
+`npm run import:bio-targets` (or **Data > Build high-value bio map**) first
+runs `scripts/prepare-bio-model.js`:
+
+- `data/bioforge/`: Canonn Bioforge statistics, downloaded once
+- `data/region-raster.bin`: a 20 ly top-down raster of codex region IDs,
+  rebuilt from `region-map-vectors.json`. Each region's cell count must match
+  the vectors exactly.
+- `data/bio-model.json`: the species model. It combines `scripts/bio-rules.json`
+  with the Bioforge counts, star-class and material variants, regions, and
+  temperature, gravity and pressure densities.
+
+The native `bio-targets` mode then reads the rich pack once and evaluates every
+landable planet with an atmosphere, using the same rules as
+`public/bio-model.js`. The shared fixture `scripts/fixtures/bio-cases.json`
+keeps the two implementations in step.
+
+The scan groups results into 320 ly cells on the ID64 `f` boxel grid. For each
+cell and target species it adds up each species' share of its genus over three
+kinds of body:
+
+- **E**: DSS-mapped bodies where the genus was found
+- **M**: all DSS-mapped bodies
+- **U**: bodies that were never mapped
+
+A body whose FSS signal list has no biological entry counts nowhere. The same
+sums are kept a second time for complete systems only, meaning every body the
+FSS counted has a record (`bodyCount`). Elsewhere the dump tends to hold just
+the bodies someone found worth scanning, which would inflate per-system values.
+
+`data/bio-targets.bin` (all integers little-endian):
+
+| Offset | Type | Meaning |
+| --- | --- | --- |
+| 0 | 8 bytes | ASCII `EDBIOT01` |
+| 8 | u32 | Format version (3) |
+| 12 | u32 | Target species count |
+| 16 | u64 | Cell count |
+| 24 | f32 | Cell size in ly (320) |
+
+Each cell is a 24-byte record:
+
+- x, y and z cell indexes (u16 each)
+- the number of entries that follow (u16)
+- systems with bodies (u32)
+- complete systems (u32)
+- eligible bodies (u32)
+- mapped bodies (u32)
+
+Each entry is 28 bytes: species index (u16), padding (u16), E, M and U over all
+systems, then E, M and U over complete systems (f32 each). Only species with
+data in the cell get an entry.
+`bio-targets-meta.json` lists the species in index order with their totals and
+the galaxy-wide rate `E / M`.
+
+`scripts/bio-targets.js` turns the counts into estimates. For each cell and
+species it shrinks the cell's rate toward the galaxy rate r:
+
+```
+p = (E + 10 r) / (M + 10)
+expected finds = E + p * U
+```
+
+Per-system figures use the complete-system sums when an area has at least 10
+complete systems, and all systems otherwise. The texture is coloured by each
+column's rank, so it shows where the chosen species are richer than elsewhere.
+
+`GET /api/bio-targets?level=320|640|1280&species=&band=1|3&y=` returns a top-down texture
+of expected base credits per scanned system. It has a 36-byte `EDBIOX01`
+header, then two bytes per column: the column's rank and a confidence value.
+Without `band` each column covers every height. With `band`, it covers only
+the 320 ly layer holding `y` (band 1) or that layer and its neighbours
+(band 3).
+
+`GET /api/bio-targets/cell?x=&y=&z=` returns the breakdown for the boxel at
+each level. `GET /api/bio-model` returns the model and rates for the per-body
+predictions in the browser.
+
+## Live journal
+
+`scripts/journal-live.js` follows the newest `Journal.*.log`. It reads appended
+bytes every second, and a folder watch (with a 5-second poll as backup)
+switches to a new journal. `GET /api/live` streams the current system, its
+stars and bodies, and every change as Server-Sent Events.
+
+After a jump, or 15 seconds after the last scan event, the server runs the
+regular incremental journal import with `origin: 'live'`. Pages then refresh
+visited markers and caches without moving the map. `POST /api/live?enabled=0|1`
+or the `liveJournal` key in `config.local.json` turns following off.
+`EDSS_LIVE_JOURNAL=0` disables it for one run.
+
 ## Server API
 
 `GET /api/status` reports the installed rich-data segments.

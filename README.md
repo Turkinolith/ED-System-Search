@@ -69,6 +69,16 @@ Colonia keep you oriented at any zoom.
   depth guides.
 - Persistent visited-system braces, latest-journal focus, and incremental or
   full journal rescans with a determinate progress bar.
+- **Live journal following**: while you play, your position, scans, bio
+  signals and organic scans show up within a second or two, and are saved a few
+  seconds after each burst of activity. No refresh button needed. **Follow
+  journals live** is under Data > Journal import. **Auto targeting** (the
+  crosshair next to the Live pill, or the same option under Data) moves the
+  target to each new system you jump to; off, the journal is still followed
+  but the target stays where you put it.
+- **High-value exobiology**: a boxel map of the expected value of 10M+ credit
+  species, and per-body species predictions in the Bodies tab (see
+  [High-value exobiology](#high-value-exobiology)).
 - Fleet carrier tracking set up from the app: enter your carrier's name or
   callsign and its ID is found in your journals. The carrier marker and its
   500 ly jump-range bubble each have their own toggle.
@@ -124,6 +134,63 @@ The **Boxels** section of the Layers tab controls these outlines:
 Each mass code has its own colour, and each outline's label gives the number of
 member systems currently loaded. Large parent boxels can extend beyond the
 loaded detail area, so that count may be lower than the full total.
+
+## High-value exobiology
+
+The **High-value bio** section of the Layers tab colours boxels by how much
+high-value exobiology a scanned system there tends to hold. It covers 18
+species worth about 8 to 19 million credits each, such as Stratum Tectonicas,
+Tussock Stigmasis, Fonticulua Segmentatus and Concha Biconcavis, and you can
+narrow it to any of them.
+
+The galaxy dump only says which genus was found on a body, never the species,
+so the species comes from the body's conditions:
+
+1. **Hard rules** for each species (atmosphere, body type, gravity,
+   temperature, pressure, volcanism, distance from arrival, galactic arm), from
+   the EDMC-BioScan rulesets.
+2. **Logged finds** per colour variant from Canonn Bioforge. Colour variants
+   follow the local star class or a rare surface material, and their counts
+   weight species that share the same conditions.
+3. **Observed genus rates**: every DSS-mapped body in the galaxy dump that
+   could hold a species says whether its genus was there. Per boxel, that rate
+   is pulled toward the galaxy-wide rate when few bodies were mapped, and
+   applied to the boxel's bodies that were never mapped.
+4. **Fully scanned systems**: per-system values come from systems where every
+   body the FSS counted has a record. In thinly explored areas the dump often
+   holds just the bodies someone found worth scanning, which would make those
+   areas look richer than they are.
+
+Checked against the species analysed in the author's own journals, the right
+species was allowed on 100% of high-value finds and ranked first on 97%. The
+absolute chances run high, because players mostly DSS-map bodies that already
+show bio signals, so read the map as a comparison between areas.
+
+| Control | Shows |
+| --- | --- |
+| Bio value map | Each boxel column's expected base value per scanned system, ranked against all other columns (brighter is better); faint where few systems were fully scanned. It is drawn on the grid plane and moves up and down with it |
+| Boxel size | 320, 640 or 1,280 ly columns |
+| Heights | **All** averages every height in a column. **320** or **960 ly band** counts only the 320 ly layer at the map target's height (plus the layers above and below it for 960), and follows the grid plane as you move |
+| Species | Which species count; **10M+** keeps those worth at least 10 million |
+
+Selecting a system adds a **High-value bio** row to its details, with the
+estimate for its 320 ly boxel (or its 1,280 ly sector when the boxel has too
+little data) and the most likely species. The **Bodies** tab shows, for each
+landable body with an atmosphere, which high-value species it could hold and
+how likely each is: confirmed once you have scanned it, split by species once a
+DSS scan has found the genus, otherwise estimated from its conditions.
+
+Build the map once, and again after a large galaxy update, from
+**Data > Build high-value bio map**, or with:
+
+```powershell
+npm run import:bio-targets
+```
+
+The first build downloads about 6 MB of Bioforge statistics into
+`data/bioforge/`. The scan then reads the full-galaxy pack once and writes
+`data/bio-targets.bin`. `npm run check:bio` compares the species model with
+the organic scans in your journals.
 
 ## Requirements
 
@@ -468,6 +535,7 @@ between sessions.
 | Carrier marker | On | Your tracked fleet carrier's marker and label |
 | Carrier range | Off | A 500 ly bubble around your carrier |
 | Murder binaries | Off | Systems with a secondary star 5 to 12 light-seconds from arrival |
+| Bio value map | Off | Expected high-value exobiology per scanned system, by boxel (see [High-value exobiology](#high-value-exobiology)) |
 | Route | Off | The current in-game route from `NavRoute.json` |
 
 The same tab holds the **Boxels** controls (see [Boxels](#boxels)), **Colour
@@ -498,6 +566,15 @@ map; stored and displayed coordinates are not modified.
   exploration overlays
 - [Explorarium](https://github.com/CMDRRegza/Explorarium): public discovery
   categories
+- [EDMC-BioScan](https://github.com/Silarn/EDMC-BioScan) (GPL-2.0): species
+  requirement rulesets, converted to `scripts/bio-rules.json` by
+  `scripts/generate-bio-rules.js`
+- [Canonn Bioforge](https://bioforge.canonn.tech/) statistics, as packaged by
+  [EliteDangerousWarboard](https://github.com/Mirooz/EliteDangerousWarboard)
+  (MIT): logged finds per species variant, downloaded at setup and not
+  redistributed
+- [Elite Cheat Sheet](https://elitecheatsheet.com/exploration-and-exobiology):
+  species base values
 - Local Elite Dangerous player journal files
 
 Third-party data remains subject to its source's terms and attribution
